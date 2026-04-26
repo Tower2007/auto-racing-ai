@@ -8,7 +8,7 @@
 ## 技術スタック
 
 - Python 3.13
-- DB: Supabase (ap-northeast-1)
+- DB: ローカル CSV（data/ 配下）
 - データ取得: autorace.jp JSON API（HTML スクレイピング不要）
 - ML: LightGBM（将来）
 
@@ -17,14 +17,25 @@
 ```
 src/
   client.py      # autorace.jp API クライアント
-  ingest.py      # DB 投入（将来）
-smoke_test.py    # 1日分スモークテスト
+  parser.py      # JSON → CSV 用フラット dict 変換
+  storage.py     # CSV 読み書き (data/ 配下)
+smoke_test.py    # 1日分スモークテスト (JSON 保存)
+ingest_day.py    # 1日分データ取得 → CSV 保存
 backfill.py      # 過去データ一括取得（将来）
-daily_ingest.py  # 日次バッチ（将来）
-schema.sql       # DB スキーマ（将来）
-data/            # ローカルデータ (.gitignore)
+data/            # CSV + スモーク JSON (.gitignore)
 docs/            # 調査結果
 ```
+
+## CSV ファイル構成 (data/)
+
+| ファイル | 内容 | キー |
+|---------|------|------|
+| race_entries.csv | 出走表 | race_date + place_code + race_no + car_no |
+| race_stats.csv | 選手集計成績 (90d/180d/通算) | 同上 |
+| race_results.csv | レース結果 | 同上 |
+| race_laps.csv | 周回ランク変動 | race_date + place_code + race_no + lap_no + car_no |
+| payouts.csv | 払戻金 (7券種) | race_date + place_code + race_no + bet_type |
+| odds_summary.csv | 単勝/複勝オッズ + 平均値 | race_date + place_code + race_no + car_no |
 
 ## autorace.jp API メモ
 
