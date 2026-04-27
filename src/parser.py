@@ -42,6 +42,17 @@ def _clean_int(v: Any) -> int | None:
         return None
 
 
+def _clean_odds(v: Any) -> float | None:
+    """オッズを float に。0.0 は API のセンチネル(市場なし)なので NULL に。
+
+    オッズは数学的に >= 1.0 が必須なので、0.0 は無効値。
+    """
+    f = _clean_float(v)
+    if f is None or f == 0.0:
+        return None
+    return f
+
+
 # ─── Program (出走表) ──────────────────────────────────
 
 def parse_program_entries(
@@ -245,9 +256,9 @@ def parse_odds_summary(
             "race_no": race_no,
             "car_no": p["carNo"],
             "player_code": _clean_str(p.get("playerCode")),
-            "win_odds": _clean_float(tns.get(car_str)),
-            "place_odds_min": _clean_float(fns_entry.get("min") if isinstance(fns_entry, dict) else None),
-            "place_odds_max": _clean_float(fns_entry.get("max") if isinstance(fns_entry, dict) else None),
+            "win_odds": _clean_odds(tns.get(car_str)),
+            "place_odds_min": _clean_odds(fns_entry.get("min") if isinstance(fns_entry, dict) else None),
+            "place_odds_max": _clean_odds(fns_entry.get("max") if isinstance(fns_entry, dict) else None),
             "st_ave": _clean_float(p.get("stAve")),
             "good_track_trial_ave": _clean_float(p.get("goodTrackTraialAve")),
             "good_track_race_ave": _clean_float(p.get("goodTrackRaceAve")),
