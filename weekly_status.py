@@ -160,75 +160,104 @@ def render_text(summary: dict, days: list[dict], errors: list[str]) -> str:
 
 
 def render_html(summary: dict, days: list[dict], errors: list[str]) -> str:
+    """Email クライアント(Gmail 等)で剥がされない inline-style 版。"""
     today = dt.date.today().isoformat()
-    css = """
-    <style>
-      body { font-family: sans-serif; font-size: 14px; color: #222; line-height: 1.55; }
-      h2 { color: #c62828; border-left: 4px solid #c62828; padding-left: 8px; }
-      table { border-collapse: collapse; margin: 8px 0; }
-      th, td { border: 1px solid #ccc; padding: 4px 10px; font-size: 13px; text-align: right; }
-      th { background: #eee; }
-      td.left { text-align: left; }
-      .ok { color: #388e3c; font-weight: bold; }
-      .ng { color: #888; }
-      .summary-card { background: #f5f5f5; padding: 10px 14px; border-radius: 6px; margin: 8px 0; }
-      .error-box { background: #fff3e0; padding: 8px 12px; border-left: 4px solid #ff9800; font-family: monospace; font-size: 12px; white-space: pre-wrap; }
-    </style>
-    """
     ok_count = sum(1 for d in days if d["status"] == "OK")
     fail_count = len(days) - ok_count
-    overall_ok = (fail_count <= 1 and not errors)  # autorace は開催が無い日が頻繁
+    overall_ok = (fail_count <= 1 and not errors)
     status_badge = ("🟢 正常" if overall_ok else "🟡 要確認" if fail_count <= 3 else "🔴 異常")
 
-    parts = [css]
-    parts.append(f"<h1>📊 auto-racing-ai 週次ステータス {today} &nbsp; <span>{status_badge}</span></h1>")
+    # 共通スタイル(全部インライン)
+    TBL = ('border="1" cellpadding="6" cellspacing="0" '
+           'style="border-collapse:collapse; border-color:#bbb; '
+           'font-family:Arial,sans-serif; font-size:13px;"')
+    TH = ('style="background:#e8e8e8; text-align:left; padding:6px 10px; '
+          'font-weight:bold; border:1px solid #bbb;"')
+    TH_R = ('style="background:#e8e8e8; text-align:right; padding:6px 10px; '
+            'font-weight:bold; border:1px solid #bbb;"')
+    TD_L = 'style="text-align:left; padding:6px 10px; border:1px solid #ddd;"'
+    TD_R = 'style="text-align:right; padding:6px 10px; border:1px solid #ddd;"'
+    ROW_ALT = 'style="background:#fafafa;"'
+
+    parts = []
+    parts.append(
+        '<div style="font-family:Arial,sans-serif; font-size:14px; color:#222; line-height:1.55; max-width:720px;">'
+    )
+    parts.append(
+        f'<h2 style="color:#c62828; margin:0 0 12px 0; padding-bottom:6px; border-bottom:2px solid #c62828;">'
+        f'📊 auto-racing-ai 週次ステータス &nbsp; <span style="color:#222; font-weight:normal;">{today}</span> '
+        f'&nbsp; <span style="font-weight:normal;">{status_badge}</span></h2>'
+    )
 
     # データサマリー
-    rows_summary = "".join(
-        f"<tr><td class='left'>{f}</td><td>{c:,}</td></tr>"
-        for f, c in summary["counts"].items()
+    parts.append('<h3 style="color:#444; margin:18px 0 8px 0;">データサマリー</h3>')
+    parts.append(f'<table {TBL}>')
+    parts.append(f'<tr><th {TH}>ファイル</th><th {TH_R}>行数</th></tr>')
+    for i, (f, c) in enumerate(summary["counts"].items()):
+        alt = ROW_ALT if i % 2 == 1 else ""
+        parts.append(f'<tr {alt}><td {TD_L}>{f}</td><td {TD_R}>{c:,}</td></tr>')
+    parts.append(
+        f'<tr {ROW_ALT}><td {TD_L}><b>合計サイズ</b></td>'
+        f'<td {TD_R}><b>{summary["total_size_mb"]:.1f} MB</b></td></tr>'
     )
-    parts.append(f"""
-    <div class="summary-card">
-      <h2 style="margin-top:0">データサマリー</h2>
-      <table>
-        <tr><th class='left'>ファイル</th><th>行数</th></tr>
-        {rows_summary}
-        <tr><td class='left'>合計サイズ</td><td>{summary['total_size_mb']:.1f} MB</td></tr>
-        <tr><td class='left'>期間</td><td>{summary['oldest_date']} 〜 {summary['latest_date']}</td></tr>
-      </table>
-    </div>
-    """)
+    parts.append(
+        f'<tr><td {TD_L}><b>期間</b></td>'
+        f'<td {TD_R}><b>{summary["oldest_date"]} 〜 {summary["latest_date"]}</b></td></tr>'
+    )
+    parts.append('</table>')
 
-    # 直近 N 日 場別
-    parts.append(f"<h2>直近{len(days)}日の収集状況(OK {ok_count} / NO_DATA {fail_count})</h2>")
-    venue_th = "".join(f"<th>{n}</th>" for n in VENUE_NAMES.values())
-    rows_html = []
-    for d in days:
-        cls = "ok" if d["status"] == "OK" else "ng"
-        per_venue = "".join(f"<td>{d['per_venue'][n] or '—'}</td>" for n in VENUE_NAMES.values())
-        rows_html.append(
-            f"<tr><td class='left'>{d['date']}</td>{per_venue}"
-            f"<td class='{cls}'>{d['race_count']}</td></tr>"
+    # 直近 N 日 場別マトリクス
+    parts.append(
+        f'<h3 style="color:#444; margin:18px 0 8px 0;">'
+        f'直近{len(days)}日の収集状況 '
+        f'<span style="font-weight:normal; color:#666; font-size:13px;">'
+        f'(OK {ok_count} / NO_DATA {fail_count})</span></h3>'
+    )
+    parts.append(f'<table {TBL}>')
+    venue_th = "".join(f'<th {TH_R}>{n}</th>' for n in VENUE_NAMES.values())
+    parts.append(f'<tr><th {TH}>日付</th>{venue_th}<th {TH_R}>合計</th><th {TH}></th></tr>')
+    for i, d in enumerate(days):
+        alt = ROW_ALT if i % 2 == 1 else ""
+        venue_cells = "".join(
+            f'<td {TD_R}>{d["per_venue"][n]}</td>' if d["per_venue"][n] > 0
+            else f'<td {TD_R} style="text-align:right; padding:6px 10px; border:1px solid #ddd; color:#bbb;">—</td>'
+            for n in VENUE_NAMES.values()
         )
-    parts.append(f"""
-    <table>
-      <tr><th class='left'>日付</th>{venue_th}<th>合計</th></tr>
-      {''.join(rows_html)}
-    </table>
-    """)
+        if d["status"] == "OK":
+            total_cell = f'<td {TD_R} style="text-align:right; padding:6px 10px; border:1px solid #ddd; color:#2e7d32; font-weight:bold;">{d["race_count"]}</td>'
+            flag = '<td {} style="text-align:center; padding:6px 10px; border:1px solid #ddd;">✅</td>'.format(TD_L.replace('style="', 'style="text-align:center; '))
+        else:
+            total_cell = f'<td {TD_R} style="text-align:right; padding:6px 10px; border:1px solid #ddd; color:#999;">0</td>'
+            flag = f'<td {TD_L} style="text-align:center; padding:6px 10px; border:1px solid #ddd; color:#999;">—</td>'
+        parts.append(f'<tr {alt}><td {TD_L}>{d["date"]}</td>{venue_cells}{total_cell}{flag}</tr>')
+    parts.append('</table>')
 
+    # エラー
     if errors:
-        parts.append(f"<h2>⚠️ daily_ingest エラー(直近 {min(len(errors), 10)} 件)</h2>")
-        parts.append("<div class='error-box'>")
+        parts.append(f'<h3 style="color:#e65100; margin:18px 0 8px 0;">⚠️ daily_ingest エラー(直近 {min(len(errors), 10)} 件)</h3>')
+        parts.append(
+            '<pre style="background:#fff3e0; padding:10px 12px; border-left:4px solid #ff9800; '
+            'font-family:Consolas,monospace; font-size:12px; white-space:pre-wrap; overflow-x:auto;">'
+        )
         for e in errors[-10:]:
-            parts.append(e + "<br>")
-        parts.append("</div>")
+            parts.append(_html_escape(e))
+        parts.append('</pre>')
     else:
-        parts.append("<h2>✅ エラーなし</h2><p>直近のログにエラーは記録されていません。</p>")
+        parts.append(
+            '<h3 style="color:#2e7d32; margin:18px 0 8px 0;">✅ エラーなし</h3>'
+            '<p style="margin:0 0 8px 0; color:#555;">直近のログにエラーは記録されていません。</p>'
+        )
 
-    parts.append("<hr><p style='color:#999;font-size:11px'>auto-racing-ai daily ingest watchdog</p>")
+    parts.append(
+        '<hr style="border:none; border-top:1px solid #ddd; margin:18px 0 8px 0;">'
+        '<p style="color:#999; font-size:11px; margin:0;">auto-racing-ai daily ingest watchdog</p>'
+    )
+    parts.append('</div>')
     return "\n".join(parts)
+
+
+def _html_escape(s: str) -> str:
+    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") + "<br>")
 
 
 def main() -> None:
