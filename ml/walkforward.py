@@ -39,7 +39,9 @@ def _inner_val_split(X: pd.DataFrame, y: pd.Series, dates: pd.Series, frac: floa
     )
 
 
-def walk_forward(target: str, min_train_months: int) -> pd.DataFrame:
+def walk_forward(
+    target: str, min_train_months: int, save_predictions: bool = False,
+) -> pd.DataFrame:
     target_col = f"target_{target}"
     df = load()
     X, y, df_kept = prepare(df, target_col)
@@ -55,6 +57,7 @@ def walk_forward(target: str, min_train_months: int) -> pd.DataFrame:
     )
 
     rows = []
+    pred_frames = []
     for i, tm in enumerate(test_months, 1):
         is_train_full = df_kept["year_month"] < tm
         is_test = df_kept["year_month"] == tm
@@ -86,6 +89,18 @@ def walk_forward(target: str, min_train_months: int) -> pd.DataFrame:
             "[%2d/%d] %s | n_test=%5d auc=%.3f win_roi=%.3f place_roi=%.3f",
             i, len(test_months), tm, m["n"], m["auc"], m["win_roi"], m["place_roi"],
         )
+
+        if save_predictions:
+            pf = df_te.copy()
+            pf["pred"] = p_te
+            pf["test_month"] = tm
+            pred_frames.append(pf)
+
+    if save_predictions and pred_frames:
+        pred_df = pd.concat(pred_frames, ignore_index=True)
+        pred_path = DATA / f"walkforward_predictions_{target}.parquet"
+        pred_df.to_parquet(pred_path, index=False)
+        logger.info("Predictions saved: %s (%s rows)", pred_path, f"{len(pred_df):,}")
 
     return pd.DataFrame(rows)
 
@@ -175,9 +190,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--target", choices=["top3", "win"], default="top3")
     parser.add_argument("--min-train-months", type=int, default=12)
+    parser.add_argument("--save-predictions", action="store_true",
+                        help="per-race の予測を data/walkforward_predictions_<target>.parquet に保存")
     args = parser.parse_args()
 
-    df = walk_forward(args.target, args.min_train_months)
+    df = walk_forward(args.target, args.min_train_months, save_predictions=args.save_predictions)
     csv_out = DATA / f"walkforward_{args.target}.csv"
     df.to_csv(csv_out, index=False)
     logger.info("CSV saved: %s", csv_out)
