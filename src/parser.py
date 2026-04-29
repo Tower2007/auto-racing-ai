@@ -245,6 +245,11 @@ def parse_odds_summary(
     rows = []
     tns = body.get("tnsOddsList", {})
     fns = body.get("fnsOddsList", {})
+    # オッズ未発表の早朝は API が dict ではなく list (空) で返す
+    if not isinstance(tns, dict):
+        tns = {}
+    if not isinstance(fns, dict):
+        fns = {}
 
     for p in body.get("playerList", []):
         car_str = str(p["carNo"])
