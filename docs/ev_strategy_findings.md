@@ -92,6 +92,45 @@ def select_bets(predictions, odds, threshold=1.30):
 - ベット額を 10 倍にしても利益も 10 倍だが、ROI は変わらない(歪みは買えるだけしかない)
 - 大金を投じてもプロにはなれない
 
+## 3点BUY 戦略の場別探索 (2026-04-29)
+
+boat-racing-ai 移植の 3点BUY (複勝+3連単+3連複) を auto に適用、場別に分解して検証。
+ロジックは boat の night_report 内 EV合致レース 3点BUY と等価(検算済)。
+
+### 場別 thr=1.45 の合算 ROI
+
+| 場 | races | 複勝 | 3連単 | 3連複 | 合算 | 利益 |
+|---|---:|---:|---:|---:|---:|---:|
+| 川口 | 357 | 122% | 168% | 110% | 133% | +¥35,710 |
+| 伊勢崎 | 363 | 125% | 67% | 231% | 141% | +¥44,350 |
+| 浜松 | 278 | 153% | 267% | 196% | 205% | +¥87,770 |
+| **飯塚** | 565 | 118% | **61%** | 94% | **91%** | **-¥15,130** |
+| 山陽 | 541 | 126% | 99% | 123% | 116% | +¥26,540 |
+
+### 月次安定性(thr=1.45 月次 ≥100% 達成率)
+
+| 場 | rt3 | rf3 | rt3 median | rf3 median |
+|---|---:|---:|---:|---:|
+| 川口 | 25% | 21% | 36% | 68% |
+| 伊勢崎 | 16% | 32% | 36% | 65% |
+| 浜松 | 20% | 30% | 30% | 57% |
+| 飯塚 | 14% | 19% | 43% | 69% |
+| **山陽** | **32%** | **40%** | **47%** | **84%** |
+
+### 結論
+
+1. **3連単(rt3)は全場で月次ノイジー** — median 30〜47%、外れ値 1〜2 レースで mean が押し上がっているだけ。期待値ベースでは黒字だが運用安定性なし。
+2. **3連複(rf3)は山陽のみ構造的に強い** — median 84%、≥100% 月 40%、min 22%(他場は全て 0%)。他場は外れ値依存。
+3. **飯塚は 3連系 edge 薄い** — rt3 の max がたった 238%(他場 397〜2795%)、上振れすら出ない。市場効率化(売上規模大)と整合。
+4. **山陽が rt3/rf3 両方で月次安定性最高** — Phase A 除外(ミッドナイト運用都合)はロジック面では損失。通知タイミング設計の見直し余地。
+5. **複勝(fns)は依然全場で edge あり** — Phase A 主軸(複勝 top-1, thr=1.45)維持でよい。
+
+### 実用提案
+
+- 3連系を Phase A に乗せるなら **山陽のみ**(rt3/rf3 両方で edge)
+- 飯塚は 3連系から除外推奨(複勝のみ継続 — 複勝 ROI 117.9% は健在)
+- rt3 単体は全場で「お遊び枠」
+
 ## 関連ファイル
 
 - 予測: `data/walkforward_predictions_top3.parquet`
@@ -102,12 +141,17 @@ def select_bets(predictions, odds, threshold=1.30):
   - `scripts/ev_audit.py` — leakage / random baseline / 直近検証
   - `scripts/ev_calibrated.py` — isotonic 校正 + 真 ROI
   - `scripts/ev_threshold_sweep.py` — thr スイープ + 利益最大点探索
+  - `scripts/ev_3point_buy.py` — 3点BUY 戦略 thr スイープ
+  - `scripts/ev_3point_monthly.py` — 3点BUY 月次安定性
+  - `scripts/ev_3point_by_place.py` — 3点BUY 場別 × thr マトリクス
+  - `scripts/ev_3point_iizuka_diag.py` — 場別 月次 rt3/rf3 統計
 - レポート(reports/):
   - ev_selection_2026-04-28.md
   - ev_verify_2026-04-28.md
   - ev_audit_2026-04-28.md
   - ev_calibrated_2026-04-28.md
   - ev_threshold_sweep_2026-04-28.md
+  - ev_3point_by_place_2026-04-29.md
 
 ## 結論判断
 
