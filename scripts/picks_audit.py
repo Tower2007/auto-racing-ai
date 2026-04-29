@@ -35,6 +35,10 @@ def load_picks() -> pd.DataFrame:
         return df
     df["race_date"] = pd.to_datetime(df["race_date"])
     df["sent_at"] = pd.to_datetime(df["sent_at"])
+    # 同レース・同車番・同バッチでの重複 append(再実行 / 手動 dry-run)を除去。
+    # 最初に通知された行を採用(後続はオッズ更新後の再記録扱い)。
+    key = ["race_date", "place_code", "race_no", "car_no", "batch"]
+    df = df.sort_values("sent_at").drop_duplicates(subset=key, keep="first").reset_index(drop=True)
     return df
 
 
