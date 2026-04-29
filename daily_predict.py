@@ -309,6 +309,24 @@ def append_picks_log(picks: pd.DataFrame, time_label: str):
 
 # ─── メイン ───────────────────────────────────────────────────
 
+def _notify_fatal(target_date: str, time_label: str, err: Exception) -> None:
+    """fatal error を即時メール通知。送信失敗してもログだけ出して諦める。"""
+    try:
+        from gmail_notify import send_email
+        subject = f"[autorace] 🚨 daily_predict fatal error {target_date} {time_label}"
+        body = (
+            f"daily_predict が異常終了しました。\n\n"
+            f"対象日: {target_date}\n"
+            f"バッチ: {time_label}\n\n"
+            f"【エラー】\n{err!r}\n\n"
+            f"【スタックトレース】\n{traceback.format_exc()}\n\n"
+            f"対処: data/daily_predict.log を確認。"
+        )
+        send_email(subject=subject, body=body)
+    except Exception as e:
+        logging.error("fatal 通知メール送信も失敗: %s", e)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--venues", type=int, nargs="+", required=True)
@@ -335,54 +353,61 @@ def main():
     logger.info("=== daily_predict start: date=%s venues=%s time=%s thr=%.2f ===",
                 target_date, args.venues, time_label, args.thr)
 
-    model, iso, meta = load_production()
-    client = AutoraceClient()
-
-    all_picks = []
-    for pc in args.venues:
-        venue = VENUE_CODES.get(pc, str(pc))
-        logger.info("--- %s (pc=%d) ---", venue, pc)
-        for race_no in range(1, 13):
-            df = predict_race(client, model, iso, meta, pc, target_date, race_no)
-            if df.empty:
-                continue
-            top1 = df[df["pred_rank"] == 1].copy()
-            cands = top1[top1["ev_avg_calib"] >= args.thr].copy()
-            if cands.empty:
-                continue
-            cands["venue"] = venue
-            all_picks.append(cands)
-            for _, r in cands.iterrows():
-                logger.info("  R%d 車%d pred=%.3f EV=%.2f min=%.1f max=%.1f",
-                            int(r["race_no"]), int(r["car_no"]),
-                            r["pred_calib"], r["ev_avg_calib"],
-                            r["place_odds_min"], r["place_odds_max"])
-
-    if all_picks:
-        picks = pd.concat(all_picks, ignore_index=True)
-        picks = picks.sort_values(["place_code", "race_no"]).reset_index(drop=True)
-    else:
-        picks = pd.DataFrame()
-
-    text = render_text(picks, target_date, time_label, args.thr)
-    html = render_html(picks, target_date, time_label, args.thr)
-    print()
-    print(text)
-
-    if not picks.empty:
-        append_picks_log(picks, time_label)
-        logger.info("候補数: %d / 投資 ¥%d", len(picks), len(picks) * 100)
-    else:
-        logger.info("候補なし")
-
-    if args.no_email:
-        logger.info("--no-email: 送信スキップ")
-        return
-
     try:
-        from gmail_notify import send_email
-    except Exception as e:
-        logger.error("gmail_notify インポート失敗: %s", e)
+        model, iso, meta = load_production()
+        client = AutoraceClient()
+
+        all_picks = []
+        for pc in args.venues:
+            venue = VENUE_CODES.get(pc, str(pc))
+            logger.info("--- %s (pc=%d) ---", venue, pc)
+            for race_no in range(1, 13):
+                df = predict_race(client, model, iso, meta, pc, target_date, race_no)
+                if df.empty:
+                    continue
+                top1 = df[df["pred_rank"] == 1].copy()
+                cands = top1[top1["ev_avg_calib"] >= args.thr].copy()
+                if cands.empty:
+                    continue
+                cands["venue"] = venue
+                all_picks.append(cands)
+                for _, r in cands.iterrows():
+                    logger.info("  R%d 車%d pred=%.3f EV=%.2f min=%.1f max=%.1f",
+                                int(r["race_no"]), int(r["car_no"]),
+                                r["pred_calib"], r["ev_avg_calib"],
+                                r["place_odds_min"], r["place_odds_max"])
+
+        if all_picks:
+            picks = pd.concat(all_picks, ignore_index=True)
+            picks = picks.sort_values(["place_code", "race_no"]).reset_index(drop=True)
+        else:
+            picks = pd.DataFrame()
+
+        text = render_text(picks, target_date, time_label, args.thr)
+        html = render_html(picks, target_date, time_label, args.thr)
+        print()
+        print(text)
+
+        if not picks.empty:
+            append_picks_log(picks, time_label)
+            logger.info("候補数: %d / 投資 ¥%d", len(picks), len(picks) * 100)
+        else:
+            logger.info("候補なし")
+
+        if args.no_email:
+            logger.info("--no-email: 送信スキップ")
+            return
+
+        try:
+            from gmail_notify import send_email
+        except Exception as e:
+            logger.error("gmail_notify インポート失敗: %s", e)
+            return
+    except Exception as fatal:
+        logger.error("daily_predict fatal: %s", fatal)
+        logger.error(traceback.format_exc())
+        _notify_fatal(target_date, time_label, fatal)
+        sys.exit(1)
         return
 
     n = len(picks)

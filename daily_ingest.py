@@ -101,6 +101,27 @@ def main() -> int:
     if err_details:
         logger.error("Errors:\n%s", "\n".join(err_details))
 
+    # エラーがあれば即時メール通知
+    if n_error > 0:
+        try:
+            from gmail_notify import send_email
+            today_str = dt.date.today().isoformat()
+            subject = f"[autorace] 🚨 daily_ingest 失敗 {today_str} (error={n_error})"
+            body = (
+                f"daily_ingest で {n_error} 件の失敗が発生しました。\n\n"
+                f"対象日: {', '.join(dates)}\n"
+                f"成功: {n_processed} / 開催なし: {n_no_race} / "
+                f"重複スキップ: {n_skip} / 失敗: {n_error}\n\n"
+                f"【エラー詳細】\n"
+                + "\n".join(f"  - {e}" for e in err_details)
+                + f"\n\n対処: data/daily_ingest.log を確認。\n"
+                f"必要に応じて手動再実行: python ingest_day.py YYYY-MM-DD <place_code>"
+            )
+            send_email(subject=subject, body=body)
+            logger.info("エラー通知メール送信済")
+        except Exception as e:
+            logger.error("エラー通知メール送信も失敗: %s", e)
+
     return 1 if n_error > 0 else 0
 
 
