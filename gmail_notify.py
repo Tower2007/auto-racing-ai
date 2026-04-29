@@ -21,11 +21,14 @@ boat-racing-ai 版から移植。.env に以下を設定:
 
 from __future__ import annotations
 
+import mimetypes
 import os
 import smtplib
 import ssl
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email import encoders
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -55,26 +58,57 @@ def send_email(
     body: str,
     html: str | None = None,
     recipients: list[str] | None = None,
+    attachments: list[str | Path] | None = None,
 ) -> None:
-    """Gmail 経由でメール送信"""
+    """Gmail 経由でメール送信。attachments はファイルパスのリスト。"""
     user, pwd, default_to = _load_config()
     to_list = recipients or default_to
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = user
-    msg["To"] = ", ".join(to_list)
+    if attachments:
+        # mixed (attachment) > alternative (text/html)
+        msg = MIMEMultipart("mixed")
+        msg["Subject"] = subject
+        msg["From"] = user
+        msg["To"] = ", ".join(to_list)
+        alt = MIMEMultipart("alternative")
+        alt.attach(MIMEText(body, "plain", "utf-8"))
+        if html:
+            alt.attach(MIMEText(html, "html", "utf-8"))
+        msg.attach(alt)
 
-    msg.attach(MIMEText(body, "plain", "utf-8"))
-    if html:
-        msg.attach(MIMEText(html, "html", "utf-8"))
+        for path in attachments:
+            p = Path(path)
+            if not p.exists():
+                raise FileNotFoundError(f"添付ファイルが見つかりません: {p}")
+            ctype, encoding = mimetypes.guess_type(str(p))
+            if ctype is None or encoding is not None:
+                ctype = "application/octet-stream"
+            maintype, subtype = ctype.split("/", 1)
+            with open(p, "rb") as fh:
+                part = MIMEBase(maintype, subtype)
+                part.set_payload(fh.read())
+            encoders.encode_base64(part)
+            part.add_header(
+                "Content-Disposition",
+                f'attachment; filename="{p.name}"',
+            )
+            msg.attach(part)
+    else:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = user
+        msg["To"] = ", ".join(to_list)
+        msg.attach(MIMEText(body, "plain", "utf-8"))
+        if html:
+            msg.attach(MIMEText(html, "html", "utf-8"))
 
     ctx = ssl.create_default_context()
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=TIMEOUT_SEC) as s:
         s.starttls(context=ctx)
         s.login(user, pwd)
         s.sendmail(user, to_list, msg.as_string())
-    print(f"[mail] sent to {to_list}  subject={subject}")
+    print(f"[mail] sent to {to_list}  subject={subject}"
+          + (f"  (添付 {len(attachments)} 個)" if attachments else ""))
 
 
 if __name__ == "__main__":
