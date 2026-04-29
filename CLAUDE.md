@@ -47,13 +47,16 @@ reports/               # 各種分析レポート(commit 対象)
 | タスク | 時刻 | 内容 |
 |---|---|---|
 | `AutoraceDailyIngest` | 毎日 06:30 | データ収集 (catchup 2 日) |
-| `AutoraceMorningPredict` | 毎日 08:00 | 朝メール: 川口/伊勢崎/浜松 の EV ≥1.50 候補 |
-| `AutoraceNoonPredict` | 毎日 13:00 | 昼メール: 飯塚 の同候補 |
+| `AutoraceMorningPredict` | 毎日 08:00 | `--venues 2 3 4 6 --time-slot morning`(liveStart < 13:00 の場のみ) |
+| `AutoraceNoonPredict` | 毎日 13:00 | `--venues 5 6 --time-slot noon`(13:00-17:00) |
+| `AutoraceEveningPredict` | 毎日 17:00 | `--venues 6 --time-slot evening`(>= 17:00 の場、主に山陽ミッドナイト) |
 | `AutoraceWeeklyRetrain` | 毎日曜 03:00 | 本番モデル再学習 |
 | `AutoraceWeeklyStatus` | 毎月曜 07:30 | 週次ステータス報告 |
 
 戦略仕様: `docs/ev_strategy_findings.md` 参照(thr=1.50、中間モデル、複勝 top-1)。
-山陽(ミッドナイト)は除外。賭け運用は手動投票(自動投票は ToS グレーで非実施)。
+山陽は開催形態(通常/ナイター/オーバーミッドナイト)で発走時刻が変わるため、
+`--time-slot` で Hold/Today の `liveStartTime` を見て朝/昼/夕タスクに動的振り分け。
+該当場なし時は空打ちメールを抑止。賭け運用は手動投票(自動投票は ToS グレーで非実施)。
 
 ## CSV ファイル構成 (data/)
 
