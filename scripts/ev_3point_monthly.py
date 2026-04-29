@@ -1,7 +1,7 @@
 """3点BUY 戦略の月次安定性検証
 
 ev_3point_buy.py で見つかった thr=1.45 と thr=1.80 について、
-25 ヶ月の eval 期間を月次に分解して以下を表示:
+eval 期間(月リスト後半半分)を月次に分解して以下を表示:
   - 月別 race 数 / ベット数
   - 月別 複勝/3連単/3連複/合算 ROI
   - 月次 ≥ 100% 月数
@@ -23,10 +23,10 @@ DATA = ROOT / "data"
 REPORTS = ROOT / "reports"
 RACE_KEY = ["race_date", "place_code", "race_no"]
 BET = 100
-CALIB_CUTOFF = "2024-04"
 
 
-def load_eval_picks() -> pd.DataFrame:
+def load_eval_picks() -> tuple[pd.DataFrame, list[str]]:
+    """eval 用 picks と eval_months(後半半分の月リスト)を返す。"""
     preds = pd.read_parquet(DATA / "walkforward_predictions_morning_top3.parquet")
     preds["race_date"] = pd.to_datetime(preds["race_date"])
     odds = pd.read_csv(DATA / "odds_summary.csv", low_memory=False)
@@ -38,8 +38,17 @@ def load_eval_picks() -> pd.DataFrame:
     ).dropna(subset=["place_odds_min"])
     df["pred_rank"] = df.groupby(RACE_KEY)["pred"].rank(method="min", ascending=False)
 
-    calib = df[df["test_month"] < CALIB_CUTOFF]
-    eval_df = df[df["test_month"] >= CALIB_CUTOFF].copy()
+    months = sorted(df["test_month"].unique())
+    if len(months) < 2:
+        raise SystemExit("test_month が 2 ヶ月未満で校正/評価分割できません")
+    half = len(months) // 2
+    calib_months = months[:half]
+    eval_months = months[half:]
+    print(f"[calib] {calib_months[0]} - {calib_months[-1]} ({len(calib_months)} months)")
+    print(f"[eval ] {eval_months[0]} - {eval_months[-1]} ({len(eval_months)} months)")
+
+    calib = df[df["test_month"].isin(calib_months)]
+    eval_df = df[df["test_month"].isin(eval_months)].copy()
     iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
     iso.fit(calib["pred"].values, calib["target_top3"].values)
     eval_df["pred_calib"] = iso.transform(eval_df["pred"].values)
@@ -58,7 +67,7 @@ def load_eval_picks() -> pd.DataFrame:
     top1 = eval_df[eval_df["pred_rank"] == 1][
         RACE_KEY + ["pred_calib", "ev_avg_calib"]
     ].drop_duplicates(subset=RACE_KEY)
-    return pivoted.merge(top1, on=RACE_KEY, how="left")
+    return pivoted.merge(top1, on=RACE_KEY, how="left"), eval_months
 
 
 def load_payouts() -> dict[str, pd.DataFrame]:
@@ -174,7 +183,7 @@ def render_monthly_table(monthly: pd.DataFrame) -> str:
 
 
 def main():
-    picks = load_eval_picks()
+    picks, eval_months = load_eval_picks()
     payouts = load_payouts()
     df = attach_payouts(picks, payouts)
     print(f"Eval set with payouts: {len(df):,} races")
@@ -206,7 +215,8 @@ def main():
     md = [
         f"# 3点BUY 月次安定性検証 ({today})",
         "",
-        "対象: walk-forward eval 25 ヶ月(2024-04 〜 2026-04)",
+        f"対象: walk-forward eval {len(eval_months)} ヶ月"
+        f"({eval_months[0]} 〜 {eval_months[-1]})",
         "",
         "## サマリ",
         "",

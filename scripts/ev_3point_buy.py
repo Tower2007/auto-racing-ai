@@ -6,7 +6,8 @@
   - 3連複 ({top-1, top-2, top-3})
 を同時 100 円ベット。各券種の ROI と合算 ROI を集計。
 
-eval set: walk-forward predictions の後半 25 ヶ月(校正は前半 24 ヶ月)
+eval set: walk-forward predictions を月リストで前半/後半に分け、
+前半で isotonic 校正、後半で EV 評価(boat ml_ev_strategy.py 方式)。
 """
 
 from __future__ import annotations
@@ -24,11 +25,13 @@ DATA = ROOT / "data"
 REPORTS = ROOT / "reports"
 RACE_KEY = ["race_date", "place_code", "race_no"]
 BET = 100
-CALIB_CUTOFF = "2024-04"
 
 
 def load_eval_set() -> pd.DataFrame:
-    """中間モデル予測 + place_odds + payouts を join、校正後 EV 付きの eval set。"""
+    """中間モデル予測 + place_odds + payouts を join、校正後 EV 付きの eval set。
+
+    test_month の前半で isotonic 校正、後半で eval。境界は実データの月数で動的決定。
+    """
     preds = pd.read_parquet(DATA / "walkforward_predictions_morning_top3.parquet")
     preds["race_date"] = pd.to_datetime(preds["race_date"])
 
@@ -42,9 +45,18 @@ def load_eval_set() -> pd.DataFrame:
 
     df["pred_rank"] = df.groupby(RACE_KEY)["pred"].rank(method="min", ascending=False)
 
-    # キャリブレーション(前半 24mo fit、後半 25mo eval)
-    calib = df[df["test_month"] < CALIB_CUTOFF]
-    eval_df = df[df["test_month"] >= CALIB_CUTOFF].copy()
+    # 月リストを前半(校正)・後半(評価)に動的分割
+    months = sorted(df["test_month"].unique())
+    if len(months) < 2:
+        raise SystemExit("test_month が 2 ヶ月未満で校正/評価分割できません")
+    half = len(months) // 2
+    calib_months = months[:half]
+    eval_months = months[half:]
+    print(f"[calib] {calib_months[0]} - {calib_months[-1]} ({len(calib_months)} months)")
+    print(f"[eval ] {eval_months[0]} - {eval_months[-1]} ({len(eval_months)} months)")
+
+    calib = df[df["test_month"].isin(calib_months)]
+    eval_df = df[df["test_month"].isin(eval_months)].copy()
     iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
     iso.fit(calib["pred"].values, calib["target_top3"].values)
     eval_df["pred_calib"] = iso.transform(eval_df["pred"].values)
