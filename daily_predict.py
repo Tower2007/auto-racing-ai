@@ -104,6 +104,9 @@ def _engineer_race_context(df: pd.DataFrame) -> pd.DataFrame:
 
 def _engineer_odds(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    # parser が None を返す列があるので numeric 化して NaN にしてから log1p。
+    for col in ("win_odds", "place_odds_min", "place_odds_max"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
     df["log_win_odds"] = np.log1p(df["win_odds"])
     df["log_place_odds_min"] = np.log1p(df["place_odds_min"])
     df["log_place_odds_max"] = np.log1p(df["place_odds_max"])
@@ -252,6 +255,13 @@ def predict_race(
         odds_resp = client.get_odds(place_code, race_date, race_no)
         odds_body = odds_resp.get("body", {})
         if isinstance(odds_body, list):
+            return pd.DataFrame()
+        # オッズ未公開(早朝)は tnsOddsList が list/空 dict で返る。
+        # EV ベース戦略はオッズなしでは計算不能なので、ここで早期 return。
+        tns = odds_body.get("tnsOddsList") if isinstance(odds_body, dict) else None
+        if not isinstance(tns, dict) or not tns:
+            logging.info("predict_race(%d, %s, %d): odds 未公開 — skip",
+                         place_code, race_date, race_no)
             return pd.DataFrame()
 
         feat = build_features_for_race(place_code, race_date, race_no, body, odds_body)
