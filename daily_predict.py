@@ -3,6 +3,8 @@
 使い方:
   python daily_predict.py --venues 2 3 4              # 朝(daytime 3場)
   python daily_predict.py --venues 5                  # 昼(飯塚)
+  python daily_predict.py --venues 2 3 4 6 --time-slot morning   # 山陽を含めて朝 slot
+  python daily_predict.py --venues 6   --time-slot evening       # 夕(山陽ミッドナイト)
   python daily_predict.py --venues 2 3 4 --no-email   # dry-run
   python daily_predict.py --venues 5 --thr 1.30       # 閾値変更
   python daily_predict.py --venues 5 --date 2026-04-29  # 日付指定
@@ -12,6 +14,9 @@
 - 校正: isotonic regression(walk-forward 予測で fit 済み)
 - 選別: 各レースで予測 top-1 車 × ev_avg_calib >= thr(default 1.50)
 - 出力: ログ + メール(候補ありの場合のみ)
+- --time-slot: Hold/Today の liveStartTime に応じて --venues を動的フィルタ
+  morning=<13:00, noon=13:00-17:00, evening=>=17:00。山陽の開催形態
+  (通常/ナイター/ミッドナイト)に追従。履歴日(--date 過去)では無効。
 
 依存ファイル:
 - data/production_model.lgb
@@ -160,6 +165,58 @@ def load_production():
     with open(DATA / "production_meta.json", "r", encoding="utf-8") as f:
         meta = json.load(f)
     return model, iso, meta
+
+
+SLOT_BOUNDS: dict[str, tuple[str, str]] = {
+    "morning": ("00:00", "13:00"),
+    "noon":    ("13:00", "17:00"),
+    "evening": ("17:00", "29:59"),  # 翌日早朝までを 17:00 起点で吸収
+}
+
+
+def _in_slot(start_time: str | None, slot: str) -> bool:
+    """liveStartTime ('HH:MM') が指定 slot の範囲内か。
+    None / 不正値は True(=フィルタ素通し)。"""
+    if not start_time or not slot:
+        return True
+    lo, hi = SLOT_BOUNDS[slot]
+    return lo <= start_time < hi
+
+
+def fetch_today_schedule(client: AutoraceClient) -> dict[int, dict]:
+    """Hold/Today から place_code 別の開催情報を返す。
+
+    キー: liveStartTime / liveEndTime / nighterCode / nighterName /
+          lastNightProgramFlg / finalRaceNo / nowRaceNo / oddsRaceNo /
+          gradeName / title / cancelFlg
+    body.today[] のみ対象(明日以降は body.next[] にいる)。
+    """
+    try:
+        resp = client.get_today_hold()
+    except Exception as e:
+        logging.warning("Hold/Today 取得失敗: %s", e)
+        return {}
+    body = resp.get("body", {}) or {}
+    today_list = body.get("today", []) if isinstance(body, dict) else []
+    out: dict[int, dict] = {}
+    for h in today_list:
+        pc = h.get("placeCode")
+        if pc is None:
+            continue
+        out[int(pc)] = {
+            "liveStartTime": h.get("liveStartTime"),
+            "liveEndTime": h.get("liveEndTime"),
+            "nighterCode": h.get("nighterCode"),
+            "nighterName": h.get("nighterName"),
+            "lastNightProgramFlg": h.get("lastNightProgramFlg"),
+            "finalRaceNo": h.get("finalRaceNo"),
+            "nowRaceNo": h.get("nowRaceNo"),
+            "oddsRaceNo": h.get("oddsRaceNo"),
+            "gradeName": h.get("gradeName"),
+            "title": h.get("title"),
+            "cancelFlg": h.get("cancelFlg"),
+        }
+    return out
 
 
 def align_features(df: pd.DataFrame, meta: dict) -> pd.DataFrame:
@@ -334,7 +391,10 @@ def main():
     p.add_argument("--thr", type=float, default=1.50)
     p.add_argument("--no-email", action="store_true")
     p.add_argument("--time-label", type=str, default=None,
-                   help="メール件名・ログ用ラベル(default: venues から自動)")
+                   help="メール件名・ログ用ラベル(default: venues / slot から自動)")
+    p.add_argument("--time-slot", type=str, default=None,
+                   choices=["morning", "noon", "evening"],
+                   help="Hold/Today の liveStartTime で venues を動的フィルタ")
     args = p.parse_args()
 
     setup_logging()
@@ -343,6 +403,8 @@ def main():
     target_date = args.date or dt.date.today().isoformat()
     if args.time_label:
         time_label = args.time_label
+    elif args.time_slot:
+        time_label = {"morning": "朝", "noon": "昼", "evening": "夕"}[args.time_slot]
     elif set(args.venues) <= {2, 3, 4}:
         time_label = "朝(daytime)"
     elif set(args.venues) == {5}:
@@ -356,6 +418,55 @@ def main():
     try:
         model, iso, meta = load_production()
         client = AutoraceClient()
+
+        # 当日スケジュール取得(Hold/Today)— 場ごとの開催状況・発走時間帯を確認
+        # 当日 args.date が today と異なる場合は履歴日扱いなので skip
+        schedule: dict[int, dict] = {}
+        is_today = args.date is None or args.date == dt.date.today().isoformat()
+        if is_today:
+            schedule = fetch_today_schedule(client)
+            logger.info("Hold/Today 開催数: %d 場", len(schedule))
+            for pc in args.venues:
+                s = schedule.get(pc)
+                if s is None:
+                    logger.info("  pc=%d (%s): 当日開催なし", pc, VENUE_CODES.get(pc, "?"))
+                else:
+                    logger.info(
+                        "  pc=%d (%s): %s 〜 %s, %s, finalR=%s, lastNightProg=%s, cancel=%s",
+                        pc, VENUE_CODES.get(pc, "?"),
+                        s.get("liveStartTime"), s.get("liveEndTime"),
+                        s.get("nighterName") or "通常",
+                        s.get("finalRaceNo"), s.get("lastNightProgramFlg"),
+                        s.get("cancelFlg"),
+                    )
+
+        # --time-slot 指定時、開催あり & 該当 slot & 中止でない場のみに絞る
+        # 履歴日(schedule 空)は filter なし — そのまま全 venues 予測(再現性)
+        if args.time_slot and is_today:
+            kept = []
+            for pc in args.venues:
+                s = schedule.get(pc)
+                if s is None:
+                    logger.info("  [slot=%s] pc=%d スキップ(当日開催なし)",
+                                args.time_slot, pc)
+                    continue
+                if str(s.get("cancelFlg")) == "1":
+                    logger.info("  [slot=%s] pc=%d スキップ(中止)", args.time_slot, pc)
+                    continue
+                st = s.get("liveStartTime")
+                if not _in_slot(st, args.time_slot):
+                    logger.info("  [slot=%s] pc=%d スキップ(liveStart=%s 範囲外)",
+                                args.time_slot, pc, st)
+                    continue
+                kept.append(pc)
+            if kept != args.venues:
+                logger.info("  → 対象 venues: %s → %s", args.venues, kept)
+            args.venues = kept
+
+            if not args.venues:
+                # 空打ちメール抑止: slot に該当する場が無ければログだけで終了
+                logger.info("該当 venue なし — メール送信スキップ")
+                return
 
         all_picks = []
         for pc in args.venues:
