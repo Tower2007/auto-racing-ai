@@ -20,11 +20,26 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import re
+import sys
 from pathlib import Path
 
 import pandas as pd
 
 from gmail_notify import send_email
+
+# 通知候補監査(オプショナル: data/daily_predict_picks.csv が無ければ skip)
+sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
+try:
+    from picks_audit import (
+        load_picks as _audit_load_picks,
+        attach_results as _audit_attach,
+        filter_period as _audit_filter,
+        render_text as _audit_render_text,
+        render_html as _audit_render_html,
+    )
+    _AUDIT_AVAILABLE = True
+except Exception:
+    _AUDIT_AVAILABLE = False
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
@@ -280,6 +295,23 @@ def main() -> None:
 
     text = render_text(summary, days, errors)
     html = render_html(summary, days, errors)
+
+    # 通知候補監査(直近 args.days 日)を追加
+    if _AUDIT_AVAILABLE:
+        try:
+            picks = _audit_load_picks()
+            audit = _audit_attach(picks)
+            audit = _audit_filter(audit, args.days)
+            text += "\n\n" + _audit_render_text(audit, args.days)
+            # HTML: footer hr の前に挿入
+            audit_html = _audit_render_html(audit, args.days)
+            html = html.replace(
+                '<hr style="border:none;',
+                audit_html + '\n<hr style="border:none;',
+                1,
+            )
+        except Exception as e:
+            text += f"\n\n(picks 監査スキップ: {e})"
 
     print(text)
 
