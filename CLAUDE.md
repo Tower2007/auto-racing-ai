@@ -16,15 +16,44 @@
 
 ```
 src/
-  client.py      # autorace.jp API クライアント
-  parser.py      # JSON → CSV 用フラット dict 変換
-  storage.py     # CSV 読み書き (data/ 配下)
-smoke_test.py    # 1日分スモークテスト (JSON 保存)
-ingest_day.py    # 1日分データ取得 → CSV 保存
-backfill.py      # 過去データ一括取得（将来）
-data/            # CSV + スモーク JSON (.gitignore)
-docs/            # 調査結果
+  client.py            # autorace.jp API クライアント
+  parser.py            # JSON → CSV 用フラット dict 変換
+  storage.py           # CSV 読み書き (data/ 配下)
+ml/
+  features.py          # 6 CSV → ml_features.parquet
+  train.py             # holdout 評価
+  walkforward.py       # 月次 walk-forward
+  walkforward_morning.py  # 中間モデル(試走なし・オッズあり)
+  walkforward_preday.py   # 前日モデル(両方なし)
+  train_production.py  # 本番モデル + isotonic 校正(週次再学習)
+smoke_test.py          # 1日分スモークテスト (JSON 保存)
+ingest_day.py          # 1日分データ取得 → CSV 保存
+backfill.py            # 過去データ一括取得
+daily_ingest.py        # 日次データ収集オーケストレータ(catchup 2)
+daily_predict.py       # 当日対象場の EV ベース買い候補メール送信
+weekly_status.py       # 週次ステータスメール
+gmail_notify.py        # Gmail SMTP 送信
+scripts/
+  ev_*.py              # EV 戦略 5 段階検証
+  daily_pnl_*.py       # 場・期間別 P&L
+  fix_*.py / dq_*.py   # データ品質チェック・修正
+data/                  # CSV + production_*.lgb/.pkl/.json (.gitignore)
+docs/                  # 調査結果・戦略まとめ
+reports/               # 各種分析レポート(commit 対象)
 ```
+
+## 自動運用タスク(Phase A: 推奨提示型)
+
+| タスク | 時刻 | 内容 |
+|---|---|---|
+| `AutoraceDailyIngest` | 毎日 06:30 | データ収集 (catchup 2 日) |
+| `AutoraceMorningPredict` | 毎日 08:00 | 朝メール: 川口/伊勢崎/浜松 の EV ≥1.50 候補 |
+| `AutoraceNoonPredict` | 毎日 13:00 | 昼メール: 飯塚 の同候補 |
+| `AutoraceWeeklyRetrain` | 毎日曜 03:00 | 本番モデル再学習 |
+| `AutoraceWeeklyStatus` | 毎月曜 07:30 | 週次ステータス報告 |
+
+戦略仕様: `docs/ev_strategy_findings.md` 参照(thr=1.50、中間モデル、複勝 top-1)。
+山陽(ミッドナイト)は除外。賭け運用は手動投票(自動投票は ToS グレーで非実施)。
 
 ## CSV ファイル構成 (data/)
 

@@ -23,6 +23,7 @@ logs/
 *_raw.html
 *_sample.html
 live_*.html
+vote_*.html
 *_js.js
 hold_today.json
 tmp_samples/
