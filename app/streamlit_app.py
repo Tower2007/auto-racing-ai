@@ -758,6 +758,8 @@ if is_live_mode:
     total_picks_settled = 0
     n_recommended_settled = 0   # 推奨判定された確定済みレース数
     n_recommended_pending = 0   # 推奨判定された未走レース数
+    recommended_settled_races: list[int] = []  # R 番号の昇順
+    recommended_pending_races: list[int] = []
     for r in races:
         info = live_data[r]
         if not info["top_cars"]:
@@ -787,8 +789,10 @@ if is_live_mode:
         if is_recommended:
             if info["has_result"]:
                 n_recommended_settled += 1
+                recommended_settled_races.append(r)
             else:
                 n_recommended_pending += 1
+                recommended_pending_races.append(r)
 
         ev_label = ""
         if top1_ev is not None:
@@ -1093,9 +1097,15 @@ if is_live_mode:
             label = "💎 BUY 推奨"
             if n_recommended_pending > 0:
                 # 未走で推奨されてるレースがある = actionable
+                pending_rs = ", ".join(f"R{r}" for r in sorted(recommended_pending_races))
+                value_txt = (
+                    f"{pending_rs}"
+                    if n_recommended_pending == 1
+                    else f"{n_recommended_pending} R ({pending_rs})"
+                )
                 st.metric(
                     label,
-                    f"{n_recommended_pending} R",
+                    value_txt,
                     delta=f"今すぐ投票検討",
                     delta_color="off",
                 )
@@ -1104,8 +1114,10 @@ if is_live_mode:
                 st.metric(label, "—", help=f"EV ≥ {recommend_thr:.2f} の未走レース")
             # 終了済の EV 高水準は補助情報として caption
             if n_recommended_settled > 0:
+                settled_rs = ", ".join(f"R{r}" for r in sorted(recommended_settled_races))
                 st.caption(
-                    f"📊 終了 R で EV≥{recommend_thr:.2f}: {n_recommended_settled} R"
+                    f"📊 振り返り: 終了 R で EV≥{recommend_thr:.2f} だった R は {settled_rs}"
+                    f"({n_recommended_settled}件)"
                 )
 
         if pending_cost > 0 and n_settled > 0:
