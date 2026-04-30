@@ -1,4 +1,4 @@
-"""2026-03〜04 の本番戦略シミュレーション + 収支表
+"""任意期間の本番戦略シミュレーション + 収支表
 
 本番運用条件:
 - 中間モデル(walkforward_predictions_morning_top3.parquet)
@@ -6,16 +6,18 @@
 - top1 + ev_avg_calib >= 1.50
 - 複勝 fns、1 R 100 円固定
 
+使い方:
+  python scripts/simulate_2026_mar_apr.py                    # default 2026-03〜04
+  python scripts/simulate_2026_mar_apr.py 2025-10-01 2026-04-30
+  python scripts/simulate_2026_mar_apr.py 2025-10 2026-04    # 月指定もOK
+
 出力:
-- reports/simulate_2026_mar_apr.md
-  - 全 picks 一覧
-  - 日別収支
-  - 場別収支
-  - 全体サマリ
+- reports/simulate_<start>_to_<end>.md
 """
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -33,7 +35,16 @@ THR = 1.50
 VENUE_NAMES = {2: "kawaguchi", 3: "isesaki", 4: "hamamatsu", 5: "iizuka", 6: "sanyou"}
 
 
-def load_and_pick():
+def normalize_date(s: str, end: bool = False) -> str:
+    """'2025-10' → '2025-10-01' (start) or '2025-10-31' (end)。'YYYY-MM-DD' はそのまま。"""
+    if len(s) == 7:  # YYYY-MM
+        if end:
+            return (pd.Period(s, freq="M").to_timestamp(how="end")).date().isoformat()
+        return f"{s}-01"
+    return s
+
+
+def load_and_pick(start_date: str, end_date: str):
     preds = pd.read_parquet(DATA / "walkforward_predictions_morning_top3.parquet")
     preds["race_date"] = pd.to_datetime(preds["race_date"])
     odds = pd.read_csv(DATA / "odds_summary.csv", low_memory=False)
@@ -65,8 +76,8 @@ def load_and_pick():
         df["pred_calib"] * (df["place_odds_min"] + df["place_odds_max"]) / 2
     )
 
-    # 2026-03〜04 + top1 + EV>=1.50 で picks 抽出
-    target_period = (df["race_date"] >= "2026-03-01") & (df["race_date"] <= "2026-04-30")
+    # 期間 + top1 + EV>=1.50 で picks 抽出
+    target_period = (df["race_date"] >= start_date) & (df["race_date"] <= end_date)
     picks = df[target_period & (df["pred_rank"] == 1) & (df["ev_avg_calib"] >= THR)].copy()
     picks["venue"] = picks["place_code"].map(VENUE_NAMES)
     picks["profit"] = picks["payout"] - BET
@@ -81,9 +92,22 @@ def fmt_yen(v: float) -> str:
 
 
 def main():
-    picks = load_and_pick()
+    p = argparse.ArgumentParser()
+    p.add_argument("start", nargs="?", default="2026-03-01",
+                   help="開始日 'YYYY-MM-DD' or 'YYYY-MM' (default: 2026-03-01)")
+    p.add_argument("end", nargs="?", default="2026-04-30",
+                   help="終了日 'YYYY-MM-DD' or 'YYYY-MM' (default: 2026-04-30)")
+    args = p.parse_args()
+    start_date = normalize_date(args.start, end=False)
+    end_date = normalize_date(args.end, end=True)
+
+    picks = load_and_pick(start_date, end_date)
+    print(f"期間指定: {start_date} 〜 {end_date}")
+    if picks.empty:
+        print("picks が 0 件です。期間を確認してください。")
+        return
     print(f"全 picks: {len(picks)} 件")
-    print(f"期間: {picks['race_date'].min().date()} 〜 {picks['race_date'].max().date()}")
+    print(f"実データ範囲: {picks['race_date'].min().date()} 〜 {picks['race_date'].max().date()}")
 
     # ── サマリ ──
     n = len(picks)
@@ -126,8 +150,9 @@ def main():
     daily["roi"] = daily["payout"] / daily["cost"]
 
     # ── レポート出力 ──
+    period_label = f"{picks['race_date'].min().date()}_to_{picks['race_date'].max().date()}"
     md = []
-    md.append(f"# 2026-03〜04 シミュレーション収支表")
+    md.append(f"# シミュレーション収支表 ({picks['race_date'].min().date()} 〜 {picks['race_date'].max().date()})")
     md.append("")
     md.append("**戦略**: 中間モデル + top1 + ev_avg_calib >= 1.50 + 複勝(fns) / 1 R 100 円")
     md.append(f"**期間**: {picks['race_date'].min().date()} 〜 {picks['race_date'].max().date()}")
@@ -194,7 +219,7 @@ def main():
         )
     md.append("")
 
-    out = REPORTS / "simulate_2026_mar_apr.md"
+    out = REPORTS / f"simulate_{period_label}.md"
     out.write_text("\n".join(md), encoding="utf-8")
     print(f"\nReport: {out}")
     print(f"\n=== サマリ ===")
