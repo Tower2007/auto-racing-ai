@@ -405,6 +405,10 @@ def main():
     p.add_argument("--time-slot", type=str, default=None,
                    choices=["morning", "noon", "evening"],
                    help="Hold/Today の liveStartTime で venues を動的フィルタ")
+    p.add_argument("--races", type=int, nargs="+", default=None,
+                   help="対象 race_no を限定(default: 1..12 全部)")
+    p.add_argument("--suppress-noresult-email", action="store_true",
+                   help="候補なしの場合メール送信スキップ(動的発火用、空打ち抑止)")
     args = p.parse_args()
 
     setup_logging()
@@ -479,10 +483,11 @@ def main():
                 return
 
         all_picks = []
+        race_nos = args.races if args.races else list(range(1, 13))
         for pc in args.venues:
             venue = VENUE_CODES.get(pc, str(pc))
-            logger.info("--- %s (pc=%d) ---", venue, pc)
-            for race_no in range(1, 13):
+            logger.info("--- %s (pc=%d) races=%s ---", venue, pc, race_nos)
+            for race_no in race_nos:
                 df = predict_race(client, model, iso, meta, pc, target_date, race_no)
                 if df.empty:
                     continue
@@ -517,6 +522,10 @@ def main():
 
         if args.no_email:
             logger.info("--no-email: 送信スキップ")
+            return
+
+        if args.suppress_noresult_email and picks.empty:
+            logger.info("--suppress-noresult-email: 候補なしのため送信スキップ")
             return
 
         try:

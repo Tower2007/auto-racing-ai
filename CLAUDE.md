@@ -31,6 +31,9 @@ ingest_day.py          # 1日分データ取得 → CSV 保存
 backfill.py            # 過去データ一括取得
 daily_ingest.py        # 日次データ収集オーケストレータ(catchup 2)
 daily_predict.py       # 当日対象場の EV ベース買い候補メール送信
+                       # (--races / --suppress-noresult-email 対応で 1R 単位呼出可)
+dynamic_scheduler.py   # 各レース発走 30 分前に daily_predict を 1R 単位で
+                       # 起動する schtasks one-shot を毎朝生成
 weekly_status.py       # 週次ステータスメール
 gmail_notify.py        # Gmail SMTP 送信
 scripts/
@@ -44,20 +47,31 @@ reports/               # 各種分析レポート(commit 対象)
 
 ## 自動運用タスク(Phase A: 推奨提示型)
 
+### per-race 動的発火方式(2026-04-30〜)
+
 | タスク | 時刻 | 内容 |
 |---|---|---|
 | `AutoraceDailyIngest` | 毎日 06:30 | データ収集 (catchup 2 日) |
-| `AutoraceMorningPredict` | 毎日 10:00 | `--venues 2 3 4 5 6 --time-slot morning`(liveStart < 13:00 の場のみ。実質 山陽 daytime 第1R 10:25 直前狙い。09:00 では autorace.jp のオッズ dict が大半 placeholder で EV 計算不能だったため 10:00 に再調整) |
-| `AutoraceNoonPredict` | 毎日 13:00 | `--venues 2 3 4 5 6 --time-slot noon`(13:00-17:00) |
-| `AutoraceEveningPredict` | 毎日 17:00 | `--venues 2 3 4 5 6 --time-slot evening`(>= 17:00 の場) |
+| `AutoraceDynamicScheduler` | 毎日 07:00 | `python dynamic_scheduler.py`: Hold/Today から各場 R1/liveEnd を取得し、各レース発走 30 分前の `AutoraceDyn_{venue}_R{n}` one-shot を 12 R × 場数ぶん登録(冪等、毎日再生成) |
+| `AutoraceDyn_{venue}_R{n}` | 各レース発走 30 分前(動的) | `python daily_predict.py --venues {pc} --races {n} --suppress-noresult-email`: 1 R 単位で予測、候補ありのみメール送信 |
 | `AutoraceWeeklyRetrain` | 毎日曜 03:00 | 本番モデル再学習 |
 | `AutoraceWeeklyStatus` | 毎月曜 07:30 | 週次ステータス報告 |
 
+#### 設計
+- 発走時刻推定: `R1 = liveStartTime`、`R12 ≒ liveEndTime − 5 min`(最終R終了→発走時刻補正)、間隔 = (R12 - R1) / 11。通常 30-40 分。
+- 各レース発走 30 分前で one-shot 発火 → そのレースの 1 R 分だけ predict
+- `--suppress-noresult-email`: 候補なしの R はメールスキップ(候補ありの R のみ通知)
+- 当日中止・liveStartTime 取得失敗の場は登録スキップ
+- 冪等: 既存 `AutoraceDyn_*` を全削除してから再登録、同日中の手動再走 OK
+
+#### 旧 fixed-slot 方式(参考、2026-04-30 まで)
+朝 10:00 / 昼 13:00 / 夕 17:00 の 3 固定 task で `--time-slot` フィルタ。
+- 問題: 09:00 はオッズ未公開 → 10:00 に変更 → それでも morning slot 後半 R(11:00–13:00 開始)で odds 薄く NaN → 取りこぼし発生
+- 動的方式に置換。`AutoraceMorningPredict` / `NoonPredict` / `EveningPredict` は 動的稼働確認後に disable / 削除予定
+
 戦略仕様: `docs/ev_strategy_findings.md` 参照(thr=1.50、中間モデル、複勝 top-1)。
-全 5 場(川口/伊勢崎/浜松/飯塚/山陽)を全 slot に登録、`--time-slot` で Hold/Today の
-`liveStartTime` を見て朝/昼/夕タスクに動的振り分け。場ごとに開催形態(通常/ナイター/
-ミッドナイト)が変わっても `liveStartTime` で自動追従するため取り逃がしなし。
-該当場なし時は空打ちメールを抑止。賭け運用は手動投票(自動投票は ToS グレーで非実施)。
+場ごとに開催形態(通常/ナイター/ミッドナイト)が変わっても `liveStartTime` / `liveEndTime`
+で自動追従するため取り逃がしなし。賭け運用は手動投票(自動投票は ToS グレーで非実施)。
 
 ## CSV ファイル構成 (data/)
 
