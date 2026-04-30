@@ -52,6 +52,7 @@ from src.parser import (
 DATA = ROOT / "data"
 LOG_FILE = DATA / "daily_predict.log"
 PRODUCTION_LOG = DATA / "daily_predict_picks.csv"
+ODDS_SNAPSHOT_LOG = DATA / "odds_snapshots.csv"  # 発火時オッズスナップ (信号 persistence 解析用)
 
 
 def setup_logging():
@@ -378,6 +379,28 @@ def append_picks_log(picks: pd.DataFrame, time_label: str):
     new.to_csv(PRODUCTION_LOG, mode="a", header=write_header, index=False)
 
 
+def append_odds_snapshot(feat: pd.DataFrame, time_label: str):
+    """発火時の全車オッズ + EV を odds_snapshots.csv に追記。
+
+    後日 odds_summary.csv (= 確定後オッズ) と join して、信号 persistence
+    (発火時 EV>=thr が確定時にも残るか) を測定するため。
+    """
+    if feat is None or feat.empty:
+        return
+    ODDS_SNAPSHOT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    cols = [
+        "race_date", "place_code", "race_no", "car_no",
+        "pred", "pred_calib", "ev_avg_calib",
+        "pred_rank", "place_odds_min", "place_odds_max", "win_odds",
+    ]
+    keep = [c for c in cols if c in feat.columns]
+    snap = feat[keep].copy()
+    snap["batch"] = time_label
+    snap["captured_at"] = dt.datetime.now().isoformat(timespec="seconds")
+    write_header = not ODDS_SNAPSHOT_LOG.exists() or ODDS_SNAPSHOT_LOG.stat().st_size == 0
+    snap.to_csv(ODDS_SNAPSHOT_LOG, mode="a", header=write_header, index=False)
+
+
 # ─── メイン ───────────────────────────────────────────────────
 
 def _notify_fatal(target_date: str, time_label: str, err: Exception) -> None:
@@ -501,6 +524,11 @@ def main():
                 df = predict_race(client, model, iso, meta, pc, target_date, race_no)
                 if df.empty:
                     continue
+                # 発火時の全車スナップを保存 (後日 persistence 解析用)
+                try:
+                    append_odds_snapshot(df, time_label)
+                except Exception as e:
+                    logger.warning("odds_snapshot 追記失敗: %s", e)
                 n_eval += 1
                 top1 = df[df["pred_rank"] == 1].copy()
                 top1_ev = float(top1["ev_avg_calib"].iloc[0]) if not top1.empty else float("nan")
