@@ -180,3 +180,38 @@ class AutoraceClient:
             "/race_info/RaceRefund",
             {"placeCode": place_code, "raceDate": race_date},
         )
+
+    # ─── HTML スクレイピング ────────────────────────────
+    # JSON API が当日 1 R 分の `raceStartTime` しか公開していないため、
+    # R 毎の発走予定時刻は印刷用 Program ページからスクレイプして取得する。
+
+    def get_program_print_times(self, venue_key: str, race_date: str) -> dict[int, str]:
+        """`/race_info/Program/Print/{venueKey}/{YYYY-MM-DD}` から
+        R番号 → 発走予定時刻('HH:MM') の dict を返す。
+        非開催日は空 dict。HTTP 500/取得失敗も空 dict。
+
+        venue_key: 'sanyou' / 'isesaki' / 'kawaguchi' / 'hamamatsu' / 'iizuka'
+        race_date: 'YYYY-MM-DD'
+        """
+        import re
+        url = f"{BASE_URL}/race_info/Program/Print/{venue_key}/{race_date}"
+        try:
+            resp = self._session.get(url, timeout=30)
+        except Exception as e:
+            logger.warning("Program/Print fetch failed %s: %s", url, e)
+            return {}
+        time.sleep(self._delay)
+        if resp.status_code != 200:
+            return {}
+        # `>1R 予選 3100M 発走予定時刻 10:56<` のような構造から抽出。
+        # 日本語部分は文字化けしても regex は ASCII のみ参照。
+        hits = re.findall(r">(\d{1,2})R[^<>]*?(\d{1,2}:\d{2})<", resp.text)
+        out: dict[int, str] = {}
+        for r_str, t_str in hits:
+            try:
+                rn = int(r_str)
+                if 1 <= rn <= 12 and rn not in out:
+                    out[rn] = t_str
+            except ValueError:
+                continue
+        return out

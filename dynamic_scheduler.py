@@ -1,12 +1,13 @@
-"""動的発火スケジューラ: Hold/Today から各場 R1 開始時刻を取得し、
+"""動的発火スケジューラ: 各場の R 毎の正確な発走時刻を取得し、
 各レース発走 LEAD_MIN 分前に daily_predict.py を 1 R 単位で起動する
 schtasks /SC ONCE one-shot を一括登録する。
 
 毎日 07:00(daily_ingest 06:30 完了後)に起動する想定。
 
 設計:
-- 場毎の R 発走時刻は R1 + (n-1) * RACE_INTERVAL_MIN で推定
-  (autorace.jp は通常 30 分間隔、ミッドナイトのみ短縮の可能性あり)
+- 発走時刻は autorace.jp の印刷用 Program ページから R 毎にスクレイプして取得
+  (`/race_info/Program/Print/{venueKey}/{YYYY-MM-DD}`、12 R 全て掲載)
+- 取得失敗時のみ Hold/Today の anchor + 平均 interval で推定する fallback あり
 - 既に過ぎた発火時刻は登録しない(再走時の冪等化)
 - 既存 AutoraceDyn_* タスクを毎回全削除してから登録(冪等化)
 - 候補なしメールは --suppress-noresult-email で抑止 → 候補ありの R のみ通知
@@ -176,6 +177,28 @@ def estimate_race_start(
     return out
 
 
+def build_exact_race_starts(
+    times_hhmm: dict[int, str], today: dt.date,
+) -> dict[int, dt.datetime]:
+    """{race_no: 'HH:MM'} → {race_no: datetime}。
+    R 番号順に走査し、前 R より早い時刻が出たら +1 日(深夜跨ぎ対策)。
+    """
+    out: dict[int, dt.datetime] = {}
+    day_offset = 0
+    prev: dt.datetime | None = None
+    for rn in sorted(times_hhmm.keys()):
+        t = parse_hhmm(times_hhmm[rn])
+        if t is None:
+            continue
+        cand = dt.datetime.combine(today + dt.timedelta(days=day_offset), t)
+        if prev is not None and cand <= prev:
+            day_offset += 1
+            cand = dt.datetime.combine(today + dt.timedelta(days=day_offset), t)
+        out[rn] = cand
+        prev = cand
+    return out
+
+
 def register_one_shot(task_name: str, fire_at: dt.datetime, command: str) -> bool:
     sd = fire_at.strftime("%Y/%m/%d")
     st = fire_at.strftime("%H:%M")
@@ -222,34 +245,64 @@ def main() -> int:
 
     for pc in sorted(schedule.keys()):
         info = schedule[pc]
-        venue_jp = VENUE_CODES.get(pc, str(pc))
+        venue_key = VENUE_CODES.get(pc, str(pc))
         venue_short = VENUE_SHORT.get(pc, str(pc))
 
         if str(info.get("cancelFlg")) == "1":
-            logging.info("pc=%d (%s) cancelFlg=1 — スキップ", pc, venue_jp)
+            logging.info("pc=%d (%s) cancelFlg=1 — スキップ", pc, venue_key)
             skipped_other += RACES_PER_DAY
             continue
-        anchor_r, anchor_time = derive_anchor(info)
-        if anchor_time is None:
-            logging.info("pc=%d (%s) 発走時刻情報取得失敗 — スキップ", pc, venue_jp)
-            skipped_other += RACES_PER_DAY
-            continue
-        end = parse_hhmm(info.get("liveEndTime"))
-        interval = estimate_interval_min(today, anchor_r, anchor_time, end)
 
-        logging.info(
-            "pc=%d (%s) anchor=R%d@%s, liveEnd=%s, 推定 interval=%.1f min, R12=%s",
-            pc, venue_jp, anchor_r,
-            anchor_time.strftime("%H:%M"),
-            end.strftime("%H:%M") if end else "?",
-            interval,
-            estimate_race_start(today, anchor_r, anchor_time,
-                                RACES_PER_DAY, interval).strftime("%H:%M"),
-        )
+        # まず Program/Print から R 毎の正確な発走時刻を取得
+        exact_times = client.get_program_print_times(venue_key, today.isoformat())
+        race_starts = build_exact_race_starts(exact_times, today)
+
+        if race_starts:
+            logging.info(
+                "pc=%d (%s) Program/Print から R 毎発走時刻取得: R1=%s, R12=%s (%d R)",
+                pc, venue_key,
+                race_starts.get(1).strftime("%H:%M") if 1 in race_starts else "?",
+                race_starts.get(RACES_PER_DAY).strftime("%H:%M")
+                if RACES_PER_DAY in race_starts else "?",
+                len(race_starts),
+            )
+
+        # 取得できなかった R 用の anchor + interval fallback を準備
+        anchor_r, anchor_time = derive_anchor(info)
+        end = parse_hhmm(info.get("liveEndTime"))
+        if anchor_time is None:
+            interval = float(DEFAULT_RACE_INTERVAL_MIN)
+        else:
+            interval = estimate_interval_min(today, anchor_r, anchor_time, end)
+
+        if not race_starts:
+            if anchor_time is None:
+                logging.info("pc=%d (%s) Program/Print 失敗 + anchor 取得失敗 — スキップ",
+                             pc, venue_key)
+                skipped_other += RACES_PER_DAY
+                continue
+            logging.info(
+                "pc=%d (%s) Program/Print 失敗 → fallback anchor=R%d@%s, "
+                "liveEnd=%s, 推定 interval=%.1f min, R12=%s",
+                pc, venue_key, anchor_r,
+                anchor_time.strftime("%H:%M"),
+                end.strftime("%H:%M") if end else "?",
+                interval,
+                estimate_race_start(today, anchor_r, anchor_time,
+                                    RACES_PER_DAY, interval).strftime("%H:%M"),
+            )
 
         for race_no in range(1, RACES_PER_DAY + 1):
-            race_start = estimate_race_start(today, anchor_r, anchor_time,
-                                             race_no, interval)
+            if race_no in race_starts:
+                race_start = race_starts[race_no]
+                source = "exact"
+            elif anchor_time is not None:
+                race_start = estimate_race_start(today, anchor_r, anchor_time,
+                                                 race_no, interval)
+                source = "estimate"
+            else:
+                skipped_other += 1
+                continue
             fire_at = race_start - dt.timedelta(minutes=LEAD_MIN)
 
             if fire_at <= now + dt.timedelta(minutes=1):
@@ -264,9 +317,9 @@ def main() -> int:
             )
 
             if register_one_shot(task_name, fire_at, command):
-                logging.info("registered %s @ %s (race=%s)",
+                logging.info("registered %s @ %s (race=%s, %s)",
                              task_name, fire_at.strftime("%H:%M"),
-                             race_start.strftime("%H:%M"))
+                             race_start.strftime("%H:%M"), source)
                 registered += 1
 
     logging.info("=== dynamic_scheduler done: registered=%d skipped_past=%d skipped_other=%d ===",
