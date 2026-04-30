@@ -47,7 +47,7 @@ reports/               # 各種分析レポート(commit 対象)
 | タスク | 時刻 | 内容 |
 |---|---|---|
 | `AutoraceDailyIngest` | 毎日 06:30 | データ収集 (catchup 2 日) |
-| `AutoraceMorningPredict` | 毎日 08:00 | `--venues 2 3 4 5 6 --time-slot morning`(liveStart < 13:00 の場のみ) |
+| `AutoraceMorningPredict` | 毎日 09:00 | `--venues 2 3 4 5 6 --time-slot morning`(liveStart < 13:00 の場のみ。autorace.jp はおおむね 09:00 にオッズ公開のため 08:00→09:00 に後ろ倒し) |
 | `AutoraceNoonPredict` | 毎日 13:00 | `--venues 2 3 4 5 6 --time-slot noon`(13:00-17:00) |
 | `AutoraceEveningPredict` | 毎日 17:00 | `--venues 2 3 4 5 6 --time-slot evening`(>= 17:00 の場) |
 | `AutoraceWeeklyRetrain` | 毎日曜 03:00 | 本番モデル再学習 |
