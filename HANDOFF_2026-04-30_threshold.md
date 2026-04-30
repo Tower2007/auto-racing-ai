@@ -14,25 +14,61 @@
 今日 R1/R2 連続 0 件はサンプル内でも普通だが、**期待頻度に対する許容感** と
 **閾値設計** を別 PC で再評価したい。
 
-## 1. リポジトリ状態 (2026-04-30 10:55)
+## 1. リポジトリ状態 (2026-04-30 12:10)
 
 - ブランチ: `main`、`origin/main` と一致
 - 直近コミット(本日分):
   ```
+  9dc25d0 Add threshold-review handoff for cross-PC continuation
   0d072d4 Use Program/Print page to get exact per-race start times
   9056b35 Use raceStartTime/nowRaceNo as scheduler anchor
   390e720 Add dynamic per-race firing scheduler
-  29520a2 Move AutoraceMorningPredict 09:00 -> 10:00
-  072f70c Move AutoraceMorningPredict 08:00 -> 09:00
-  d0e2bd7 Fix daily_predict crash on unpublished odds (early-return + numeric coerce)
-  9cf18ac Add HANDOFF_2026-04-30.md for cross-PC handoff
   ```
 - working tree: 本ファイル追加のみ(コミット予定)
 - データ: `data/race_*.csv`, `payouts.csv`, `odds_summary.csv` は 5 年分 + 当日分
 - モデル: `data/production_model.lgb`, `production_calib.pkl`, `production_meta.json`
   (週次再学習タスク `AutoraceWeeklyRetrain` が日曜 03:00 に上書き)
 
-別 PC 移行手順は朝版 HANDOFF の §1, §5 と同じ。
+### 1-A. データの所在(2026-04-30 移行)
+
+PC#1(本機)の `data/` は **directory junction** で Google Drive のミラーフォルダを指す:
+
+```
+C:\Users\no28a\Claude-project\Auto_racing_AI\data
+  → G:\マイドライブ\auto-racing-ai-data\        (177MB, 24 ファイル)
+```
+
+- 書き込みは junction 透過 → Drive ミラーフォルダに反映 → 自動アップロード → 別 PC のミラー
+  に降りてくる。junction 経由のスケジューラタスク発火(sanyou R3/R4 等)で書き込み実証済。
+- **書き込みは原則 PC#1 のみ**:
+  - `daily_ingest`(06:30)、`daily_predict`(R 毎の `AutoraceDyn_*`)、`dynamic_scheduler`(07:00)、
+    `weekly_retrain`(日 03:00)はすべて PC#1 のスケジュールタスクで動く
+  - 別 PC は **読み取り専用** で運用。`ml_features.parquet` の再生成も PC#1 のみで
+    (両PC同時実行→ Drive で `-conflict` 付きファイルが生まれる)
+- 差分転送ではなく **CSV は変更時に丸ごと再アップ**(Drive の仕様)。
+  - 日次合計 ≒ 150MB↑ / PC#1、150MB↓ / PC#2、月 9GB 規模
+  - 06:30 の ingest 完了 〜 1〜3 分で Drive 反映、別 PC 起動時にダウンロード
+
+### 1-B. 別 PC 移行手順(初回のみ)
+
+1. リポジトリ:
+   ```
+   git clone https://github.com/Tower2007/auto-racing-ai.git
+   cd auto-racing-ai
+   git pull origin main
+   ```
+2. Drive 同期完了を待つ(タスクトレイの Drive アイコンで「最新の状態」確認、家庭回線 5–15 分)
+3. ローカル空 `data/` を削除し junction を貼る:
+   ```cmd
+   rmdir data
+   mklink /J data "G:\マイドライブ\auto-racing-ai-data"
+   ```
+   別 PC の Drive ミラーパスが違う場合は target を実パスに合わせる。
+4. `.env` を旧 PC からコピー(Gmail SMTP 認証等)
+5. 動作確認:
+   ```
+   python -c "import pandas as pd; print(pd.read_csv('data/race_results.csv', nrows=3))"
+   ```
 
 ## 2. 自動運用の現状(本日改修後)
 
@@ -107,6 +143,8 @@ top1 + `ev_avg_calib`(本番設定)。
 - 自動投票化(ToS グレー)。検証結果は手動投票前提で。
 - 3点BUY(rt3/rf3)系の再採用検討 — 2026-04-30 既に `decision_3point_buy_rejected.md`
   に却下記録あり。複勝 top-1 ベースでの閾値調整に集中。
+- `data/` への書き込み(daily_ingest 起動、ml_features 再生成、結果 CSV 出力など)。
+  PC#1 と同時に走ると Drive で `-conflict` ファイル発生 → 整合性破綻。**読み取りのみ**。
 
 ## 5. 関連ファイル
 
