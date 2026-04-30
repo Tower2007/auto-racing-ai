@@ -52,16 +52,18 @@ reports/               # 各種分析レポート(commit 対象)
 | タスク | 時刻 | 内容 |
 |---|---|---|
 | `AutoraceDailyIngest` | 毎日 06:30 | データ収集 (catchup 2 日) |
-| `AutoraceDynamicScheduler` | 毎日 07:00 | `python dynamic_scheduler.py`: Hold/Today から各場 R1/liveEnd を取得し、各レース発走 30 分前の `AutoraceDyn_{venue}_R{n}` one-shot を 12 R × 場数ぶん登録(冪等、毎日再生成) |
+| `AutoraceDynamicScheduler` | 毎日 07:00 | `python dynamic_scheduler.py`: Hold/Today から各場の anchor(nowRaceNo の raceStartTime)と liveEndTime を取得し、各レース発走 30 分前の `AutoraceDyn_{venue}_R{n}` one-shot を 12 R × 場数ぶん登録(冪等、毎日再生成) |
 | `AutoraceDyn_{venue}_R{n}` | 各レース発走 30 分前(動的) | `python daily_predict.py --venues {pc} --races {n} --suppress-noresult-email`: 1 R 単位で予測、候補ありのみメール送信 |
 | `AutoraceWeeklyRetrain` | 毎日曜 03:00 | 本番モデル再学習 |
 | `AutoraceWeeklyStatus` | 毎月曜 07:30 | 週次ステータス報告 |
 
 #### 設計
-- 発走時刻推定: `R1 = liveStartTime`、`R12 ≒ liveEndTime − 5 min`(最終R終了→発走時刻補正)、間隔 = (R12 - R1) / 11。通常 30-40 分。
+- 発走時刻推定: anchor = `(nowRaceNo, raceStartTime)`(その場の現時点 R の実発走時刻)。`R12 ≒ liveEndTime − 5 min`(最終R終了→発走時刻補正)、間隔 = (R12 − anchor) / (12 − anchor_r)。通常 30-40 分。
+  - `liveStartTime` は放送開始(R1 より約 30 分早い)で誤差源のため fallback のみ。
+  - `raceStartTime` は schedule 進行とともに更新されるので、朝 07:00 起動時は R1 を、再走時は当時点の進行 R を anchor に取る。
 - 各レース発走 30 分前で one-shot 発火 → そのレースの 1 R 分だけ predict
 - `--suppress-noresult-email`: 候補なしの R はメールスキップ(候補ありの R のみ通知)
-- 当日中止・liveStartTime 取得失敗の場は登録スキップ
+- 当日中止・anchor 取得失敗(raceStartTime/liveStartTime 共に欠落)の場は登録スキップ
 - 冪等: 既存 `AutoraceDyn_*` を全削除してから再登録、同日中の手動再走 OK
 
 #### 旧 fixed-slot 方式(参考、2026-04-30 まで)

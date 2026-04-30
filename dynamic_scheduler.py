@@ -124,28 +124,56 @@ def parse_hhmm(s: str | None) -> dt.time | None:
         return None
 
 
-def estimate_interval_min(today: dt.date, r1: dt.time, end_time: dt.time | None) -> float:
-    """liveStartTime と liveEndTime から平均 race 間隔(分)を推定。
-    end_time が None の日は DEFAULT_RACE_INTERVAL_MIN を返す。
-    end_time < r1(ナイター日跨ぎ)は +1 日として扱う。
+def derive_anchor(info: dict) -> tuple[int, dt.time | None]:
+    """Hold/Today の info dict から (anchor_race_no, anchor_time) を返す。
+
+    raceStartTime は nowRaceNo が指す R の実発走時刻なので、これを anchor にする。
+    liveStartTime は放送開始(R1 より約 30 分早い)で誤差源なので fallback のみ。
     """
-    if end_time is None or RACES_PER_DAY <= 1:
+    rstart = parse_hhmm(info.get("raceStartTime"))
+    now_r = info.get("nowRaceNo")
+    if rstart is not None and now_r is not None:
+        try:
+            return int(now_r), rstart
+        except (TypeError, ValueError):
+            pass
+    # fallback: liveStartTime を R1 と仮定(誤差大、最後の手段)
+    lstart = parse_hhmm(info.get("liveStartTime"))
+    return 1, lstart
+
+
+def estimate_interval_min(
+    today: dt.date,
+    anchor_r: int, anchor_time: dt.time,
+    end_time: dt.time | None,
+) -> float:
+    """anchor R の発走時刻と liveEndTime から平均 race 間隔(分)を推定。
+    end_time が None / span<=0 の場合は DEFAULT_RACE_INTERVAL_MIN を返す。
+    end_time < anchor(ナイター日跨ぎ)は +1 日として扱う。
+    """
+    if end_time is None or anchor_r >= RACES_PER_DAY:
         return float(DEFAULT_RACE_INTERVAL_MIN)
-    start = dt.datetime.combine(today, r1)
+    start = dt.datetime.combine(today, anchor_time)
     end = dt.datetime.combine(today, end_time)
     if end <= start:
         end += dt.timedelta(days=1)
     r12_start = end - dt.timedelta(minutes=LIVE_END_TO_R12_START_OFFSET_MIN)
     span = (r12_start - start).total_seconds() / 60.0
-    if span <= 0:
+    n_steps = RACES_PER_DAY - anchor_r
+    if span <= 0 or n_steps <= 0:
         return float(DEFAULT_RACE_INTERVAL_MIN)
-    return span / (RACES_PER_DAY - 1)
+    return span / n_steps
 
 
-def estimate_race_start(today: dt.date, r1: dt.time, race_no: int,
-                        interval_min: float) -> dt.datetime:
-    base = dt.datetime.combine(today, r1)
-    return base + dt.timedelta(minutes=(race_no - 1) * interval_min)
+def estimate_race_start(
+    today: dt.date,
+    anchor_r: int, anchor_time: dt.time,
+    race_no: int, interval_min: float,
+) -> dt.datetime:
+    """anchor を起点に race_no の発走時刻を推定。日跨ぎナイター対応。"""
+    base = dt.datetime.combine(today, anchor_time)
+    out = base + dt.timedelta(minutes=(race_no - anchor_r) * interval_min)
+    return out
 
 
 def register_one_shot(task_name: str, fire_at: dt.datetime, command: str) -> bool:
@@ -201,23 +229,27 @@ def main() -> int:
             logging.info("pc=%d (%s) cancelFlg=1 — スキップ", pc, venue_jp)
             skipped_other += RACES_PER_DAY
             continue
-        r1 = parse_hhmm(info.get("liveStartTime"))
-        if r1 is None:
-            logging.info("pc=%d (%s) liveStartTime 取得失敗 — スキップ", pc, venue_jp)
+        anchor_r, anchor_time = derive_anchor(info)
+        if anchor_time is None:
+            logging.info("pc=%d (%s) 発走時刻情報取得失敗 — スキップ", pc, venue_jp)
             skipped_other += RACES_PER_DAY
             continue
         end = parse_hhmm(info.get("liveEndTime"))
-        interval = estimate_interval_min(today, r1, end)
+        interval = estimate_interval_min(today, anchor_r, anchor_time, end)
 
-        logging.info("pc=%d (%s) R1=%s, liveEnd=%s, 推定 interval=%.1f min, R12=%s",
-                     pc, venue_jp,
-                     r1.strftime("%H:%M"),
-                     end.strftime("%H:%M") if end else "?",
-                     interval,
-                     estimate_race_start(today, r1, RACES_PER_DAY, interval).strftime("%H:%M"))
+        logging.info(
+            "pc=%d (%s) anchor=R%d@%s, liveEnd=%s, 推定 interval=%.1f min, R12=%s",
+            pc, venue_jp, anchor_r,
+            anchor_time.strftime("%H:%M"),
+            end.strftime("%H:%M") if end else "?",
+            interval,
+            estimate_race_start(today, anchor_r, anchor_time,
+                                RACES_PER_DAY, interval).strftime("%H:%M"),
+        )
 
         for race_no in range(1, RACES_PER_DAY + 1):
-            race_start = estimate_race_start(today, r1, race_no, interval)
+            race_start = estimate_race_start(today, anchor_r, anchor_time,
+                                             race_no, interval)
             fire_at = race_start - dt.timedelta(minutes=LEAD_MIN)
 
             if fire_at <= now + dt.timedelta(minutes=1):

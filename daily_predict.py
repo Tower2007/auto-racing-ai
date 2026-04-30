@@ -191,8 +191,11 @@ def fetch_today_schedule(client: AutoraceClient) -> dict[int, dict]:
 
     キー: liveStartTime / liveEndTime / nighterCode / nighterName /
           lastNightProgramFlg / finalRaceNo / nowRaceNo / oddsRaceNo /
-          gradeName / title / cancelFlg
+          raceStartTime / gradeName / title / cancelFlg
     body.today[] のみ対象(明日以降は body.next[] にいる)。
+
+    raceStartTime は nowRaceNo が指すレースの実発走時刻('HH:MM')。
+    liveStartTime(放送開始)とは別物で約30分遅い。動的発火時刻計算に必須。
     """
     try:
         resp = client.get_today_hold()
@@ -215,6 +218,7 @@ def fetch_today_schedule(client: AutoraceClient) -> dict[int, dict]:
             "finalRaceNo": h.get("finalRaceNo"),
             "nowRaceNo": h.get("nowRaceNo"),
             "oddsRaceNo": h.get("oddsRaceNo"),
+            "raceStartTime": h.get("raceStartTime"),
             "gradeName": h.get("gradeName"),
             "title": h.get("title"),
             "cancelFlg": h.get("cancelFlg"),
