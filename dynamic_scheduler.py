@@ -32,7 +32,9 @@ LOG_FILE = DATA / "dynamic_scheduler.log"
 
 TASK_PREFIX = "AutoraceDyn_"
 DEFAULT_RACE_INTERVAL_MIN = 30  # liveEndTime 取得失敗時のフォールバック
-LEAD_MIN = 30
+# 発走 LEAD_MIN 分前に発火。30 分前は複勝オッズが薄く EV=NaN で silent skip
+# する事象が 2026-04-30 に観測されたため 15 分前に短縮(調査結果)。
+LEAD_MIN = 15
 RACES_PER_DAY = 12
 # 最終R終了時刻 = R12 発走 + おおよそレース3分 + 払戻数分。
 # liveEndTime からこの分を差し引いて R12 発走時刻と扱う。

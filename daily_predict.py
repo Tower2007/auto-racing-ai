@@ -488,6 +488,12 @@ def main():
 
         all_picks = []
         race_nos = args.races if args.races else list(range(1, 13))
+        # サマリ用カウンタ: 発走 30→15 分前へ短縮しても複勝オッズが薄ければ
+        # NaN で silent skip する。可視化のため eval/NaN/below/hit を集計。
+        n_eval = 0
+        n_nan = 0
+        n_below_thr = 0
+        nan_races = []  # (venue, race_no) の list
         for pc in args.venues:
             venue = VENUE_CODES.get(pc, str(pc))
             logger.info("--- %s (pc=%d) races=%s ---", venue, pc, race_nos)
@@ -495,9 +501,22 @@ def main():
                 df = predict_race(client, model, iso, meta, pc, target_date, race_no)
                 if df.empty:
                     continue
+                n_eval += 1
                 top1 = df[df["pred_rank"] == 1].copy()
+                top1_ev = float(top1["ev_avg_calib"].iloc[0]) if not top1.empty else float("nan")
+                if pd.isna(top1_ev):
+                    n_nan += 1
+                    nan_races.append(f"{venue}_R{race_no}")
+                    pmin = top1["place_odds_min"].iloc[0] if not top1.empty else None
+                    pmax = top1["place_odds_max"].iloc[0] if not top1.empty else None
+                    logger.warning("  R%d top1 EV=NaN (place_odds_min=%s, max=%s) — fns 未公開で silent skip",
+                                   race_no, pmin, pmax)
+                    continue
                 cands = top1[top1["ev_avg_calib"] >= args.thr].copy()
                 if cands.empty:
+                    n_below_thr += 1
+                    car = int(top1["car_no"].iloc[0])
+                    logger.info("  R%d top1 車%d EV=%.2f < %.2f", race_no, car, top1_ev, args.thr)
                     continue
                 cands["venue"] = venue
                 all_picks.append(cands)
@@ -518,6 +537,10 @@ def main():
         print()
         print(text)
 
+        n_hit = len(picks)
+        logger.info("サマリ: eval=%d / hit=%d / below_thr=%d / NaN-skip=%d%s",
+                    n_eval, n_hit, n_below_thr, n_nan,
+                    f" [{', '.join(nan_races)}]" if nan_races else "")
         if not picks.empty:
             append_picks_log(picks, time_label)
             logger.info("候補数: %d / 投資 ¥%d", len(picks), len(picks) * 100)
