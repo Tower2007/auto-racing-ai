@@ -29,46 +29,32 @@
 - モデル: `data/production_model.lgb`, `production_calib.pkl`, `production_meta.json`
   (週次再学習タスク `AutoraceWeeklyRetrain` が日曜 03:00 に上書き)
 
-### 1-A. データの所在(2026-04-30 移行)
+### 1-A. データの所在 ― **Google Drive 同期は中止 (2026-04-30 12:35)**
 
-PC#1(本機)の `data/` は **directory junction** で Google Drive のミラーフォルダを指す:
+一度 PC#1 の `data/` を junction で `G:\マイドライブ\auto-racing-ai-data\` に
+移行したが、Drive Desktop が `race_results.csv` / `payouts.csv` を相手に
+upload-loop(毎秒 CANCELLED 再試行、Drive 内部キャッシュが 55MB に膨れたまま
+ディスク実体 19MB と乖離)に陥り使用不能。Drive 再起動でも回復せず、
+**全ファイルを Drive フォルダから退避 → 通常ローカル `data/` に復旧** で fallback。
 
-```
-C:\Users\no28a\Claude-project\Auto_racing_AI\data
-  → G:\マイドライブ\auto-racing-ai-data\        (177MB, 24 ファイル)
-```
+現在 PC#1 の `data/` は通常ディレクトリ。`G:\マイドライブ\auto-racing-ai-data\` は
+削除済(クラウド側もそのうち削除反映)。
 
-- 書き込みは junction 透過 → Drive ミラーフォルダに反映 → 自動アップロード → 別 PC のミラー
-  に降りてくる。junction 経由のスケジューラタスク発火(sanyou R3/R4 等)で書き込み実証済。
-- **書き込みは原則 PC#1 のみ**:
-  - `daily_ingest`(06:30)、`daily_predict`(R 毎の `AutoraceDyn_*`)、`dynamic_scheduler`(07:00)、
-    `weekly_retrain`(日 03:00)はすべて PC#1 のスケジュールタスクで動く
-  - 別 PC は **読み取り専用** で運用。`ml_features.parquet` の再生成も PC#1 のみで
-    (両PC同時実行→ Drive で `-conflict` 付きファイルが生まれる)
-- 差分転送ではなく **CSV は変更時に丸ごと再アップ**(Drive の仕様)。
-  - 日次合計 ≒ 150MB↑ / PC#1、150MB↓ / PC#2、月 9GB 規模
-  - 06:30 の ingest 完了 〜 1〜3 分で Drive 反映、別 PC 起動時にダウンロード
+### 1-B. 別 PC への データ共有(未確定、要検討)
 
-### 1-B. 別 PC 移行手順(初回のみ)
+別 PC からデータにアクセスする手段の候補:
+- **rclone + Drive API**(別フォルダパスで mirror 衝突回避): `rclone sync data/ gdrive:auto-racing-ai-csv/` を
+  daily_ingest 完了後に実行。Drive Desktop を経由せず API 直叩きなので upload-loop は
+  起きない。別 PC は `rclone sync gdrive:auto-racing-ai-csv/ data/` で pull。
+- **Syncthing** P2P(クラウド経由なし): 両 PC 起動中に bidirectional 同期。
+  プライバシー◎、両 PC 同時稼働必要。
+- **rsync over SSH**: PC#1 に SSH server 立てる。最も確実。
+- **Git LFS は不可**: 1GB 無料枠を 5 年データ初回 push で食い潰す。
+- **当面は PC#1 のみ運用 + 必要時に手動でデータコピー**(USB / SCP)。閾値検討は
+  CSV の 1 部分(picks の集計や月次評価)があれば済むので、必要分だけコピーする手も。
 
-1. リポジトリ:
-   ```
-   git clone https://github.com/Tower2007/auto-racing-ai.git
-   cd auto-racing-ai
-   git pull origin main
-   ```
-2. Drive 同期完了を待つ(タスクトレイの Drive アイコンで「最新の状態」確認、家庭回線 5–15 分)
-3. ローカル空 `data/` を削除し junction を貼る:
-   ```cmd
-   rmdir data
-   mklink /J data "G:\マイドライブ\auto-racing-ai-data"
-   ```
-   別 PC の Drive ミラーパスが違う場合は target を実パスに合わせる。
-4. `.env` を旧 PC からコピー(Gmail SMTP 認証等)
-5. 動作確認:
-   ```
-   python -c "import pandas as pd; print(pd.read_csv('data/race_results.csv', nrows=3))"
-   ```
+別 PC で `git pull` でリポジトリ・コード・`reports/` までは同期可。
+`data/` 配下(177MB)だけ別途。
 
 ## 2. 自動運用の現状(本日改修後)
 
