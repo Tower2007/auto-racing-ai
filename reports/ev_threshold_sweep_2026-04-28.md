@@ -1,5 +1,11 @@
 # EV 閾値スイープ (2026-04-28)
 
+> ⚠️ **注意 (2026-04-30 追記)**: 本レポートは **通常モデル**
+> (`walkforward_predictions_top3.parquet`) の結果。**本番は中間モデル**
+> (`walkforward_predictions_morning_top3.parquet`) で運用しており、本番モデルで
+> 再評価すると thr=1.50 が優位(本レポートの結論「thr=1.45 が profit 最大」とは異なる)。
+> 本番運用の意思決定には `reports/ev_threshold_review_2026-04-30.md` を参照。
+
 対象: eval set 25ヶ月 (2024-04 〜 2026-04)、isotonic-calibrated pred 使用。
 
 閾値を上げると ROI は上がるが、ベット数・総利益・統計信頼性が変動する。

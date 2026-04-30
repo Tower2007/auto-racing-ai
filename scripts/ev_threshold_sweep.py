@@ -1,6 +1,17 @@
 """EV 閾値スイープ:ROI / n_bets / 総利益 / 年度別安定性のトレードオフ分析
 
 ev_avg_calib (校正済 EV avg) ベース、top-1 限定で thr を細かく振る。
+
+⚠️ WARNING (2026-04-30):
+  本スクリプトは `walkforward_predictions_top3.parquet`(通常モデル)を読む。
+  しかし **本番運用は中間モデル**(`walkforward_predictions_morning_top3.parquet`)。
+  本スクリプトの結果は **本番運用の意思決定に使ってはいけない**。
+  例: HANDOFF_2026-04-30_threshold.md §3 で「thr=1.45 が profit 最大 ¥69,900」
+  と書かれた根拠は本スクリプトだが、本番モデルで再評価すると thr=1.50 が優位。
+  詳細: `reports/ev_threshold_review_2026-04-30.md` / `scripts/ev_threshold_review.py`
+
+  本スクリプトを使う前に load() の入力 parquet を `_morning_` 版に
+  差し替えるか、`scripts/ev_threshold_review.py` を拡張すること。
 """
 
 from __future__ import annotations
