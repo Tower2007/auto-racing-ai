@@ -312,12 +312,13 @@ def render_text(picks: pd.DataFrame, today: str, time_label: str, thr: float) ->
     lines.append("")
     lines.append(f"計 {len(picks)} 候補 / 投資 ¥{len(picks)*100:,}")
     lines.append("")
-    lines.append("【投票ページ】")
+    lines.append("【オッズ確認 / 投票】")
     for _, r in picks.iterrows():
         lines.append(
             f"  {r['venue']} R{int(r['race_no'])}: "
             f"https://autorace.jp/race_info/Odds/{r['venue']}/{today}/{int(r['race_no'])}"
         )
+    lines.append(f"  🎯 投票 (公式): https://vote.autorace.jp/")
     return "\n".join(lines)
 
 
@@ -342,19 +343,25 @@ def render_html(picks: pd.DataFrame, today: str, time_label: str, thr: float) ->
             f'<tr><th style={TH}>場</th><th style={TH}>R</th><th style={TH}>車</th>'
             f'<th style={TH}>pred</th><th style={TH}>EV</th>'
             f'<th style={TH}>fns_min</th><th style={TH}>fns_max</th><th style={TH}>tns</th>'
-            f'<th style={TH}>投票</th></tr>'
+            f'<th style={TH}>オッズ</th><th style={TH}>投票</th></tr>'
         )
-        BTN = (
-            '"display:inline-block; padding:5px 12px; background:#c62828; '
+        BTN_ODDS = (
+            '"display:inline-block; padding:5px 10px; background:#1565c0; '
+            'color:#ffffff; text-decoration:none; border-radius:4px; '
+            'font-weight:bold; font-size:12px;"'
+        )
+        BTN_VOTE = (
+            '"display:inline-block; padding:5px 10px; background:#c62828; '
             'color:#ffffff; text-decoration:none; border-radius:4px; '
             'font-weight:bold; font-size:12px;"'
         )
         for i, (_, r) in enumerate(picks.iterrows()):
             alt = ' style="background:#fafafa;"' if i % 2 == 1 else ""
-            url = (
+            odds_url = (
                 f'https://autorace.jp/race_info/Odds/{r["venue"]}/'
                 f'{today}/{int(r["race_no"])}'
             )
+            vote_url = "https://vote.autorace.jp/"
             parts.append(
                 f'<tr{alt}>'
                 f'<td style={TD_L}>{r["venue"]}</td>'
@@ -365,14 +372,13 @@ def render_html(picks: pd.DataFrame, today: str, time_label: str, thr: float) ->
                 f'<td style={TD}>{r["place_odds_min"]:.1f}</td>'
                 f'<td style={TD}>{r["place_odds_max"]:.1f}</td>'
                 f'<td style={TD}>{r["win_odds"]:.1f}</td>'
-                f'<td style={TD}><a href="{url}" style={BTN}>投票</a></td>'
+                f'<td style={TD}><a href="{odds_url}" style={BTN_ODDS}>📊 オッズ</a></td>'
+                f'<td style={TD}><a href="{vote_url}" style={BTN_VOTE}>🎯 投票</a></td>'
                 f'</tr>'
             )
         parts.append('</table>')
         parts.append(
-            f'<p style="margin:12px 0;">計 <b>{len(picks)}</b> 候補 / 投資 <b>¥{len(picks)*100:,}</b>'
-            f' &nbsp;<span style="color:#888; font-size:12px;">'
-            f'(リンク先: autorace.jp 公式オッズページ → ログインで投票)</span></p>'
+            f'<p style="margin:12px 0;">計 <b>{len(picks)}</b> 候補 / 投資 <b>¥{len(picks)*100:,}</b></p>'
         )
     parts.append(
         '<hr style="border:none; border-top:1px solid #ddd; margin:18px 0 8px 0;">'
