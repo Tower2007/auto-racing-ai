@@ -175,7 +175,7 @@ def fetch_live_day(date_str: str, pc: int) -> dict:
         except Exception:
             out[r] = info; continue
 
-        # オッズ取得 (有効値=0.0以外がN車以上ある場合のみ has_odds=True)
+        # オッズ取得 (単勝・複勝とも 4 車以上有効ならば中間モデル可能)
         try:
             odds_resp = client.get_odds(pc, date_str, r)
             odds_body = odds_resp.get("body", {})
@@ -188,8 +188,20 @@ def fetch_live_day(date_str: str, pc: int) -> dict:
                             n_valid_tns += 1
                     except Exception:
                         pass
-            # 半数以上の車に有効単勝オッズ → 中間モデル可能と判断
-            has_odds = n_valid_tns >= 4
+            # 複勝の min が有効な車数も別途カウント (EV 計算に必須)
+            fns = odds_body.get("fnsOddsList") if isinstance(odds_body, dict) else None
+            n_valid_fns = 0
+            if isinstance(fns, dict):
+                for entry in fns.values():
+                    if isinstance(entry, dict):
+                        try:
+                            m = float(entry.get("min", 0))
+                            if m > 0:
+                                n_valid_fns += 1
+                        except Exception:
+                            pass
+            # 単勝・複勝とも 4 車以上有効ならば中間モデルで本予想
+            has_odds = (n_valid_tns >= 4) and (n_valid_fns >= 4)
         except Exception:
             odds_body, has_odds = {}, False
         info["has_odds"] = has_odds
@@ -205,6 +217,11 @@ def fetch_live_day(date_str: str, pc: int) -> dict:
                         X = align_features(feat, meta)
                         feat["pred"] = model.predict(X)
                         feat["pred_calib"] = iso.transform(feat["pred"].values)
+                        feat["ev_avg_calib"] = (
+                            feat["pred_calib"]
+                            * (feat["place_odds_min"] + feat["place_odds_max"])
+                            / 2
+                        )
                         feat["pred_rank"] = feat["pred"].rank(method="min", ascending=False)
                         feat = feat.sort_values("pred_calib", ascending=False)
                         info["df"] = feat
@@ -339,6 +356,86 @@ st.markdown("""
     color: #f39c12;
     font-weight: bold;
     text-shadow: 0 0 8px rgba(243,156,18,0.5);
+}
+/* === 💎 購入推奨 派手バナー === */
+@keyframes rec-pulse {
+    0%, 100% {
+        box-shadow: 0 0 10px rgba(255, 215, 0, 0.7),
+                    0 0 20px rgba(255, 100, 100, 0.5),
+                    inset 0 0 12px rgba(255,255,255,0.3);
+        transform: scale(1);
+    }
+    50% {
+        box-shadow: 0 0 24px rgba(255, 215, 0, 1),
+                    0 0 48px rgba(255, 100, 100, 0.8),
+                    inset 0 0 20px rgba(255,255,255,0.5);
+        transform: scale(1.02);
+    }
+}
+@keyframes rec-rainbow {
+    0%   { background-position: 0% 50%; }
+    100% { background-position: 200% 50%; }
+}
+@keyframes rec-shake {
+    0%, 100% { transform: rotate(0deg); }
+    25% { transform: rotate(-3deg); }
+    75% { transform: rotate(3deg); }
+}
+@keyframes diamond-spin {
+    0% { transform: scale(1) rotate(0deg); }
+    50% { transform: scale(1.4) rotate(180deg); }
+    100% { transform: scale(1) rotate(360deg); }
+}
+.recommend-banner {
+    display: block;
+    padding: 10px 18px;
+    margin: 10px 0 -4px 0;
+    border-radius: 8px;
+    font-size: 17px;
+    font-weight: 900;
+    color: white;
+    text-align: center;
+    letter-spacing: 1px;
+    text-shadow: 0 2px 4px rgba(0,0,0,0.5),
+                 0 0 8px rgba(255,255,255,0.4);
+    background: linear-gradient(
+        90deg,
+        #ff006e 0%, #ff8c00 16%, #ffd700 33%,
+        #00d4aa 50%, #00b4ff 66%, #8b5cf6 83%, #ff006e 100%);
+    background-size: 300% auto;
+    animation:
+        rec-pulse 1.0s ease-in-out infinite,
+        rec-rainbow 4s linear infinite;
+    border: 2px solid rgba(255, 255, 255, 0.6);
+}
+.recommend-banner .gem {
+    display: inline-block;
+    animation: diamond-spin 1.5s ease-in-out infinite;
+    font-size: 22px;
+    margin: 0 6px;
+}
+.recommend-banner .urgent {
+    display: inline-block;
+    animation: rec-shake 0.4s ease-in-out infinite;
+    color: #fff200;
+    text-shadow: 0 0 8px rgba(255,242,0,0.8);
+}
+/* 推奨ティッカー (画面上の点滅バー) */
+@keyframes ticker-blink {
+    0%, 50% { opacity: 1; }
+    51%, 100% { opacity: 0.65; }
+}
+.rec-ticker {
+    background: linear-gradient(90deg, #c0392b, #e67e22, #c0392b);
+    background-size: 200% 100%;
+    animation: rec-rainbow 3s linear infinite, ticker-blink 0.8s ease-in-out infinite;
+    color: white;
+    padding: 8px 14px;
+    border-radius: 6px;
+    font-weight: bold;
+    text-align: center;
+    margin: 8px 0;
+    box-shadow: 0 0 16px rgba(231,76,60,0.6);
 }
 .hero-title {
     font-size: 28px;
@@ -588,6 +685,11 @@ with st.sidebar:
         st.stop()
 
     bet_amount = st.number_input("1 券種あたり金額 (¥)", min_value=100, max_value=10000, value=100, step=100)
+    recommend_thr = st.number_input(
+        "💎 購入推奨 EV 閾値",
+        min_value=1.0, max_value=3.0, value=1.50, step=0.05,
+        help="top1 の ev_avg_calib がこの値以上で「💎 推奨」を表示。本番運用は 1.50。",
+    )
     show_results = st.checkbox("結果も表示する(リプレイなので答え合わせ)", value=True)
 
 # メインエリア
@@ -654,6 +756,8 @@ if is_live_mode:
     biggest_payout_bt = None
     total_hits = 0
     total_picks_settled = 0
+    n_recommended_settled = 0   # 推奨判定された確定済みレース数
+    n_recommended_pending = 0   # 推奨判定された未走レース数
     for r in races:
         info = live_data[r]
         if not info["top_cars"]:
@@ -666,7 +770,37 @@ if is_live_mode:
         # ヘッダ表示
         time_label = f" 発走 {start_time_str}" if start_time_str else ""
         source_label = "中間モデル" if info["source"] == "middle_model" else "公式 AI 予想"
-        header_extra = f" | 予想 top1: {top_cars[0]}号 ({source_label})"
+
+        # top1 の EV (中間モデル時のみ計算可)
+        top1_ev = None
+        if info["df"] is not None and "ev_avg_calib" in info["df"].columns:
+            top1_row = info["df"].iloc[0]  # df は pred_calib 降順でソート済
+            try:
+                v = float(top1_row["ev_avg_calib"])
+                if not pd.isna(v):
+                    top1_ev = v
+            except Exception:
+                top1_ev = None
+
+        # 推奨判定 (NaN は推奨しない)
+        is_recommended = (top1_ev is not None) and (top1_ev >= recommend_thr)
+        if is_recommended:
+            if info["has_result"]:
+                n_recommended_settled += 1
+            else:
+                n_recommended_pending += 1
+
+        ev_label = ""
+        if top1_ev is not None:
+            if is_recommended and not info["has_result"]:
+                ev_mark = " 💎 推奨"  # 未走のみ推奨
+            elif is_recommended and info["has_result"]:
+                ev_mark = " 💎"       # 終了済は装飾のみ (推奨という言葉は使わない)
+            else:
+                ev_mark = ""
+            ev_label = f" EV {top1_ev:.2f}{ev_mark}"
+
+        header_extra = f" | 予想 top1: {top_cars[0]}号{ev_label} ({source_label})"
 
         # 結果反映用の payout 情報を refund_info から構築
         race_refund = 0
@@ -835,18 +969,42 @@ if is_live_mode:
         # 次のレースは 🔥 prefix + 自動展開
         is_next = (r == next_race_no)
         next_prefix = "🔥 NEXT  " if is_next else ""
+
+        # 💎 購入推奨バナー (expander の前)
+        if is_recommended and not info["has_result"]:
+            urgent_part = (
+                f'<span class="urgent">⚡ MAMONAKU !!</span>' if (is_next and next_race_min is not None and next_race_min <= 10)
+                else ""
+            )
+            st.markdown(
+                f'<div class="recommend-banner">'
+                f'<span class="gem">💎</span> BUY RECOMMENDED <span class="gem">💎</span>'
+                f'&nbsp;&nbsp;R{r} {start_time_str or ""}&nbsp;&nbsp;'
+                f'予想 {top_cars[0]} 号  EV <b>{top1_ev:.2f}</b>'
+                f'&nbsp;&nbsp;{urgent_part}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
         with st.expander(
             f"{next_prefix}R{r}{time_label}  {badge}  ({detail}){header_extra}{race_summary_label}",
-            expanded=(is_next or badge.startswith("⏳")),  # 次のレース or 結果待ちを自動展開
+            expanded=(is_next or is_recommended or badge.startswith("⏳")),
         ):
             c1, c2 = st.columns([1, 2])
             with c1:
                 st.markdown(f"**予想 top 3** ({source_label})")
                 if info["df"] is not None:
-                    top3 = info["df"].head(3)[["car_no", "pred_calib"]].copy()
+                    cols_show = ["car_no", "pred_calib"]
+                    if "ev_avg_calib" in info["df"].columns:
+                        cols_show.append("ev_avg_calib")
+                    top3 = info["df"].head(3)[cols_show].copy()
                     top3["car_no"] = top3["car_no"].astype(int)
                     top3["pred_calib"] = top3["pred_calib"].round(3)
-                    top3.columns = ["車", "pred"]
+                    rename_map = {"car_no": "車", "pred_calib": "pred"}
+                    if "ev_avg_calib" in top3.columns:
+                        top3["ev_avg_calib"] = top3["ev_avg_calib"].round(2)
+                        rename_map["ev_avg_calib"] = "EV"
+                    top3 = top3.rename(columns=rename_map)
                     st.dataframe(top3, hide_index=True, use_container_width=True)
                 else:
                     st.dataframe(
@@ -871,8 +1029,23 @@ if is_live_mode:
                 n_settled / len(races),
                 text=f"進捗: {n_settled} / {len(races)} レース確定 ／ 投票残 {len(races) - n_settled} R",
             )
+        # 推奨ティッカー (未走推奨があれば点滅バー)
+        if n_recommended_pending > 0:
+            st.markdown(
+                f'<div class="rec-ticker">'
+                f'💎 BUY 推奨 {n_recommended_pending} レース あり！'
+                f' (EV ≥ {recommend_thr:.2f})  '
+                f'下のレースカードを確認してください'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            # 一度だけ風船演出 (session_state で過剰発火を抑制)
+            sig = f"{target_date}_{venue}_{n_recommended_pending}"
+            if st.session_state.get("balloon_sig") != sig:
+                st.balloons()
+                st.session_state["balloon_sig"] = sig
 
-        cols = st.columns(4)
+        cols = st.columns(5)
         with cols[0]:
             if n_settled > 0:
                 profit_emoji = "🟢" if profit > 0 else ("🔴" if profit < 0 else "⚪")
@@ -916,6 +1089,24 @@ if is_live_mode:
                 )
             else:
                 st.metric("⏰ 次のレース", "🏁 全終了")
+        with cols[4]:
+            label = "💎 BUY 推奨"
+            if n_recommended_pending > 0:
+                # 未走で推奨されてるレースがある = actionable
+                st.metric(
+                    label,
+                    f"{n_recommended_pending} R",
+                    delta=f"今すぐ投票検討",
+                    delta_color="off",
+                )
+            else:
+                # 未走推奨なし
+                st.metric(label, "—", help=f"EV ≥ {recommend_thr:.2f} の未走レース")
+            # 終了済の EV 高水準は補助情報として caption
+            if n_recommended_settled > 0:
+                st.caption(
+                    f"📊 終了 R で EV≥{recommend_thr:.2f}: {n_recommended_settled} R"
+                )
 
         if pending_cost > 0 and n_settled > 0:
             st.caption(f"💸 未走レース予定投資: {fmt_yen(pending_cost)}（確定すると上の収支に加算）")

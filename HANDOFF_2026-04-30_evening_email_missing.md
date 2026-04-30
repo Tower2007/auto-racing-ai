@@ -185,3 +185,66 @@ walk-forward の odds スナップショットを発走 30 分前 / 15 分前 / 
 git pull origin main
 cat HANDOFF_2026-04-30_evening_email_missing.md   # 本ファイル
 ```
+
+---
+
+## 8. 追加発見: pred-top1 vs max-EV 戦略の本日比較
+
+ライブアプリで R7 isesaki を見ていたユーザーが「2 番目の EV 高い車が結局 1 着になってる気がする」と
+気づいた。本日 20 R 確定分で検証したところ、**短期サンプルだが max-EV が大きく上回る**。
+
+### 8-1. 本日 20 R の比較 (複勝ベース、¥100 ベット)
+
+| 戦略 | hit | 投資 | 払戻 | ROI | 収支 |
+|---|---:|---:|---:|---:|---:|
+| pred-top1 (現本番) | 14/20 (70%) | ¥2,000 | ¥1,920 | **96.0%** | **-¥80** |
+| **max-EV** (EV 最大車を 1 R 1 つ) | 8/20 (40%) | ¥2,000 | ¥2,940 | **147.0%** | **+¥940** |
+
+- pred-top1: 的中率高いが オッズ薄くてトントン未満
+- max-EV: 的中率低いが オッズ厚くて圧勝
+
+### 8-2. R7 isesaki の典型例
+
+| 順位 | 車 | pred_calib | 平均複勝オッズ | EV |
+|---:|---:|---:|---:|---:|
+| pred 1位 | 4 | 0.824 | 約 1.55 | 1.28 |
+| **pred 2位** | **5** | 0.754 | 約 3.14 | **2.37** ⭐ |
+| pred 3位 | 3 | 0.672 | 約 1.76 | 1.18 |
+
+**実結果: 5→4→7** (#5 が 1 着) → max-EV が当たって +¥80, pred-top1 (#4) は 2 着で +¥20。
+
+### 8-3. これが構造的勝ちか確認すべきこと
+
+サンプル 20 R では結論できない。月次 walk-forward で検証必要:
+
+1. **scripts/ev_strategy_compare.py** (本コミットで追加) を実行
+   - eval set 25 ヶ月で top1 / max-EV / all-cars 戦略を比較
+   - 月次対決、年次集計、ゼロ日割合で判定
+2. 結果を `reports/ev_strategy_compare_YYYY-MM-DD.md` に出力
+3. もし max-EV が **8 月以上勝ち** で **総 profit も上回る** なら戦略変更検討
+4. 同時に検討: 戦略変更すると thr=1.50 の最適値が変わる(再 sweep 必要)
+
+### 8-4. 朝の email 問題 との関連
+
+- §1 の 6 R で EV>=1.50 だったが、これは pred-top1 ベース
+- max-EV ベースだと **本日 全 20 R すべてで EV>=2 越え**(1 R 1 つは必ず value bet がある)
+- もし戦略を切替えるなら、通知頻度が大幅に上がる(月数百件か?)
+- **digest メールの必要性が増す** (個別通知だと埋もれる)
+
+### 8-5. 21:00 着手予定の調査メニュー
+
+```bash
+git pull origin main
+
+# A. 朝の email 問題 (§3)
+powershell -c "Get-Content data\daily_predict.log -Tail 500" > /tmp/log_today.txt
+# 仮説 A/B/C 切り分け
+
+# B. max-EV 戦略の月次対決 (新規)
+python scripts/ev_strategy_compare.py
+# → reports/ev_strategy_compare_2026-04-30.md
+# → top1 vs max-EV vs all_cars の月勝率, 総 profit, 月次 ROI std
+
+# C. 統合判断
+# A の結果と B の結果から、本番運用を変える価値があるか判断
+```
