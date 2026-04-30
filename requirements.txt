@@ -8,3 +8,6 @@ pyarrow>=15.0
 scikit-learn>=1.4
 lightgbm>=4.0
 tabulate>=0.9
+
+# Live prediction app
+streamlit>=1.30
