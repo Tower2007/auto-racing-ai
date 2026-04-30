@@ -989,6 +989,12 @@ if is_live_mode:
                 f'</div>',
                 unsafe_allow_html=True,
             )
+            # 投票ページへのリンク (autorace.jp 公式オッズ)
+            st.link_button(
+                f"🎯 {venue} R{r} を投票する → autorace.jp 公式",
+                f"https://autorace.jp/race_info/Odds/{venue}/{target_date}/{r}",
+                use_container_width=True,
+            )
 
         with st.expander(
             f"{next_prefix}R{r}{time_label}  {badge}  ({detail}){header_extra}{race_summary_label}",
