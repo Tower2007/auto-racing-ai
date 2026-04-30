@@ -881,6 +881,9 @@ if is_live_mode:
                     fmt_yen(profit),
                     delta=f"ROI {roi*100:.1f}%" if settled_cost else None,
                 )
+                st.caption(
+                    f"投資 {fmt_yen(settled_cost)} → 払戻 {fmt_yen(settled_refund)}"
+                )
             else:
                 st.metric("💰 当日収支", "—", help="まだ確定レースなし")
         with cols[1]:
