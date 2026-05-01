@@ -29,6 +29,12 @@ DATA = ROOT / "data"
 sys.path.insert(0, str(ROOT))  # daily_predict / src を import 可能に
 RACE_KEY = ["race_date", "place_code", "race_no"]
 
+# デプロイモード: 環境変数 DEPLOY_MODE=cloud で iPhone/公開向け簡易 UI に。
+# デフォルト (local) は PC ローカル運用向けフル UI。
+import os as _os
+DEPLOY_MODE = _os.environ.get("DEPLOY_MODE", "local").lower()
+IS_CLOUD = DEPLOY_MODE == "cloud"
+
 # 推奨ベット額ルックアップ (daily_predict.recommended_bet_yen と同等、独立実装で
 # Streamlit reload 時の import 衝突を回避)
 EXPECTED_VOTES_CSV = ROOT / "data" / "expected_votes.csv"
@@ -333,7 +339,24 @@ def fmt_yen(v: float) -> str:
 
 # ── UI 層 ──
 
-st.set_page_config(page_title="オートレース予想 エンタメ版", page_icon="🏁", layout="wide")
+st.set_page_config(
+    page_title="オートレース予想 エンタメ版",
+    page_icon="🏁",
+    # cloud (iPhone) は centered で読みやすく、local (PC) は wide で情報量重視
+    layout="centered" if IS_CLOUD else "wide",
+)
+# iPhone Safari で適切な viewport meta + ホーム画面追加 OK
+if IS_CLOUD:
+    st.markdown("""
+    <style>
+    /* モバイル: フォント大きめ、表は横スクロール、ボタン押しやすく */
+    body { font-size: 16px; }
+    .stButton button, .stLinkButton a { padding: 12px 18px !important; font-size: 15px !important; }
+    [data-testid="stMetricValue"] { font-size: 22px !important; }
+    /* リプレイモード関連の widget が誤って残ってもサイドバー狭く */
+    section[data-testid="stSidebar"] { min-width: 240px; max-width: 280px; }
+    </style>
+    """, unsafe_allow_html=True)
 
 # カスタム CSS (エンタメ感アップ)
 st.markdown("""
@@ -633,14 +656,19 @@ max_date = preds["race_date"].max().date()
 with st.sidebar:
     st.header("設定")
 
-    mode = st.radio(
-        "モード",
-        options=["📡 ライブ予想 (今日)", "📼 リプレイ (過去日)"],
-        index=0,  # ライブをデフォルト (現地利用が主用途)
-        horizontal=False,
-        help="ライブ=本番モデル+autorace.jp から今日のデータ取得 / リプレイ=OOF 予測+実績結果",
-    )
-    is_live_mode = mode.startswith("📡")
+    if IS_CLOUD:
+        # 公開版: ライブ予想のみ (リプレイは個人ログ依存で重いので非表示)
+        is_live_mode = True
+        st.caption("📡 ライブ予想モード (公開版)")
+    else:
+        mode = st.radio(
+            "モード",
+            options=["📡 ライブ予想 (今日)", "📼 リプレイ (過去日)"],
+            index=0,
+            horizontal=False,
+            help="ライブ=本番モデル+autorace.jp から今日のデータ取得 / リプレイ=OOF 予測+実績結果",
+        )
+        is_live_mode = mode.startswith("📡")
 
     if is_live_mode:
         # 今日の開催場だけ抽出
