@@ -245,7 +245,7 @@ def align_features(df: pd.DataFrame, meta: dict) -> pd.DataFrame:
     return out
 
 
-PREDICT_RETRY_MAX = 5          # top1 EV NaN 時の odds 再取得試行回数 (1min × 5 = 最大 5 分待機)
+PREDICT_RETRY_MAX = 2          # top1 EV NaN 時の odds 再取得試行回数 (1min × 2 = 最大 2 分待機)
 PREDICT_RETRY_SLEEP_SEC = 60   # 再取得までの待機秒
 
 

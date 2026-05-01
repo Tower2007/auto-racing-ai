@@ -33,12 +33,12 @@ LOG_FILE = DATA / "dynamic_scheduler.log"
 TASK_PREFIX = "AutoraceDyn_"
 DEFAULT_RACE_INTERVAL_MIN = 30  # liveEndTime 取得失敗時のフォールバック
 # 発走 LEAD_MIN 分前に発火。
-# 当初 30 分前 → 15 分前(2026-04-30) → 10 分前(2026-05-01)へ段階的に短縮。
-# 15 分前でも人気車の複勝オッズ (fnsOddsList) が API センチネル 0.0/0.0 で
-# 戻ることがあり (sanyou R1 で観測)、daily_predict 側で 1min×5 リトライ
-# (合計最大 5 分待機)で救済する設計。発火 -10min + リトライ -5min 完了で
-# 投票時間 5 分を確保。
-LEAD_MIN = 10
+# 30→15→10→5 分前へ段階的に短縮 (2026-05-01)。
+# 10 分前段階では複勝オッズが late money 前で EV 上ブレし、確定時に
+# 閾値割れする drift bias が観測された。eval は closing odds 基準なので
+# 信号鮮度を最優先して 5 分前へ短縮。daily_predict 側 60s × 2 retry で
+# 最悪 -3min まで救済 → 投票時間 3 分確保。
+LEAD_MIN = 5
 RACES_PER_DAY = 12
 # 最終R終了時刻 = R12 発走 + おおよそレース3分 + 払戻数分。
 # liveEndTime からこの分を差し引いて R12 発走時刻と扱う。
