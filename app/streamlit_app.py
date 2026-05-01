@@ -713,9 +713,18 @@ st.markdown(f'<div class="bike-track">{_dusts_html}{_bikes_html}</div>', unsafe_
 
 st.caption("中間モデル(直前) + 公式 AI 予想(前売) を時間で自動切替。5〜7 券種を提示します。")
 
-preds, odds, pay = load_data()
-min_date = preds["race_date"].min().date()
-max_date = preds["race_date"].max().date()
+# cloud モードはリプレイ機能を使わないので大型 CSV/parquet を読まない
+# (data/walkforward_predictions_morning_top3.parquet, odds_summary.csv 等は git 管理外)
+if IS_CLOUD:
+    import pandas as _pd
+    preds = _pd.DataFrame({"race_date": []})
+    odds = _pd.DataFrame()
+    pay = _pd.DataFrame()
+    min_date = max_date = dt.date.today()
+else:
+    preds, odds, pay = load_data()
+    min_date = preds["race_date"].min().date()
+    max_date = preds["race_date"].max().date()
 
 # サイドバー
 with st.sidebar:
