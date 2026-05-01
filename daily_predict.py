@@ -682,11 +682,13 @@ def main():
         for pc in args.venues:
             venue = VENUE_CODES.get(pc, str(pc))
             logger.info("--- %s (pc=%d) races=%s ---", venue, pc, race_nos)
+            NEAR_MISS_BAND = 0.30  # EV ≥ thr-0.30 なら drift up を期待して retry
+            NEAR_MISS_RETRIES = 2  # 60s × 2 で最大 -3min まで監視
             for race_no in race_nos:
                 df = predict_race(client, model, iso, meta, pc, target_date, race_no)
                 if df.empty:
                     continue
-                # 発火時の全車スナップを保存 (後日 persistence 解析用)
+                # 初回 snapshot のみ保存 (retry 分は別行になり persistence 解析を歪めるため)
                 try:
                     append_odds_snapshot(df, time_label)
                 except Exception as e:
@@ -694,6 +696,24 @@ def main():
                 n_eval += 1
                 top1 = df[df["pred_rank"] == 1].copy()
                 top1_ev = float(top1["ev_avg_calib"].iloc[0]) if not top1.empty else float("nan")
+                # near-miss retry: 閾値未達だが近接 → odds drift up で thr 跨ぎ可能性
+                for nm_attempt in range(NEAR_MISS_RETRIES):
+                    if pd.isna(top1_ev):
+                        break  # NaN は predict_race 内部で既に retry 済
+                    if top1_ev >= args.thr:
+                        break  # 閾値到達、retry 不要
+                    if top1_ev < args.thr - NEAR_MISS_BAND:
+                        break  # 大きく未達、drift up で届く可能性低い
+                    car = int(top1["car_no"].iloc[0]) if not top1.empty else 0
+                    logger.info("  R%d 近接未達 (車%d EV=%.2f < %.2f, band %.2f), %d 秒後リトライ (%d/%d)",
+                                race_no, car, top1_ev, args.thr, NEAR_MISS_BAND,
+                                PREDICT_RETRY_SLEEP_SEC, nm_attempt + 1, NEAR_MISS_RETRIES)
+                    time.sleep(PREDICT_RETRY_SLEEP_SEC)
+                    df = predict_race(client, model, iso, meta, pc, target_date, race_no)
+                    if df.empty:
+                        break
+                    top1 = df[df["pred_rank"] == 1].copy()
+                    top1_ev = float(top1["ev_avg_calib"].iloc[0]) if not top1.empty else float("nan")
                 if pd.isna(top1_ev):
                     n_nan += 1
                     nan_races.append(f"{venue}_R{race_no}")
