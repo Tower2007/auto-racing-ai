@@ -337,8 +337,9 @@ def make_picks(top_cars: list[int]) -> dict[str, list[int]]:
 def fmt_combo(bt: str, cars: list[int]) -> str:
     if bt in ("tns", "fns"):
         return str(cars[0])
-    if bt in ("rt3", "rtw"):  # 順序あり (二車単・三連単)
-        return "→".join(str(c) for c in cars)
+    # 順序ありは半角ダッシュ + > で表現 (mobile 列幅節約のため → を使わない)
+    if bt in ("rt3", "rtw"):
+        return ">".join(str(c) for c in cars)
     return "-".join(str(c) for c in sorted(cars))
 
 
@@ -1116,21 +1117,21 @@ if is_live_mode:
                 result_cell = "🏆 ○" if refund >= 1000 else "○"
             else:
                 # 外れ: 実結果を bet_type に応じて表示
+                # mobile では狭い列で truncate されるので「→」「実着順=」等は省略
                 if actual_top3 and bt == "tns":
-                    result_cell = f"✗ (1着={actual_top3[0]})"
+                    result_cell = f"✗ 1着 {actual_top3[0]}"
                 elif actual_top3 and bt == "fns":
-                    result_cell = f"✗ (3着内={','.join(str(c) for c in actual_top3)})"
+                    result_cell = f"✗ 3着 {','.join(str(c) for c in actual_top3)}"
                 elif actual_top3 and bt == "wid":
-                    # ワイド = 3着内 2 車組合せ。3着内の3車を提示すれば的中組合せ(3組)が読める
-                    result_cell = f"✗ (3着内={','.join(str(c) for c in actual_top3)})"
+                    result_cell = f"✗ 3着 {','.join(str(c) for c in actual_top3)}"
                 elif actual_top3 and bt == "rfw":
-                    result_cell = f"✗ (1-2着={'-'.join(str(c) for c in sorted(actual_top3[:2]))})"
+                    result_cell = f"✗ 1-2 {'-'.join(str(c) for c in sorted(actual_top3[:2]))}"
                 elif actual_top3 and bt == "rtw":
-                    result_cell = f"✗ (1-2着={'→'.join(str(c) for c in actual_top3[:2])})"
+                    result_cell = f"✗ 1-2 {'-'.join(str(c) for c in actual_top3[:2])}"
                 elif actual_top3 and bt == "rf3":
-                    result_cell = f"✗ (3着内={'-'.join(str(c) for c in sorted(actual_top3))})"
+                    result_cell = f"✗ 3着 {'-'.join(str(c) for c in sorted(actual_top3))}"
                 elif actual_top3 and bt == "rt3":
-                    result_cell = f"✗ (実着順={'→'.join(str(c) for c in actual_top3)})"
+                    result_cell = f"✗ 着順 {'-'.join(str(c) for c in actual_top3)}"
                 else:
                     result_cell = "✗"
             result_rows.append({
