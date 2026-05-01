@@ -814,8 +814,21 @@ if is_live_mode:
             except Exception:
                 top1_ev = None
 
-        # 推奨判定 (NaN は推奨しない)
-        is_recommended = (top1_ev is not None) and (top1_ev >= recommend_thr)
+        # 発走 -5min 以降だけ推奨を出す (それより前のオッズは drift bias が大きく当てにならない)
+        within_5min_window = False
+        if start_time_str:
+            try:
+                hh, mm = map(int, str(start_time_str).split(":"))
+                race_start_dt = dt.datetime.combine(dt.date.today(), dt.time(hh, mm))
+                if race_start_dt < now - dt.timedelta(hours=12):
+                    race_start_dt += dt.timedelta(days=1)
+                within_5min_window = (now >= race_start_dt - dt.timedelta(minutes=5))
+            except (ValueError, AttributeError):
+                pass
+
+        # 推奨判定 (NaN は推奨しない、-5min 以前は閾値超えていても保留)
+        ev_above_thr = (top1_ev is not None) and (top1_ev >= recommend_thr)
+        is_recommended = ev_above_thr and within_5min_window
         if is_recommended:
             if info["has_result"]:
                 n_recommended_settled += 1
@@ -827,9 +840,11 @@ if is_live_mode:
         ev_label = ""
         if top1_ev is not None:
             if is_recommended and not info["has_result"]:
-                ev_mark = " 💎 推奨"  # 未走のみ推奨
+                ev_mark = " 💎 推奨"  # 未走 + -5min 以降のみ推奨
             elif is_recommended and info["has_result"]:
-                ev_mark = " 💎"       # 終了済は装飾のみ (推奨という言葉は使わない)
+                ev_mark = " 💎"       # 終了済は装飾のみ
+            elif ev_above_thr and not within_5min_window and not info["has_result"]:
+                ev_mark = " ⏳"       # -5min 待機中 (閾値超えだが時刻まだ早い)
             else:
                 ev_mark = ""
             ev_label = f" EV {top1_ev:.2f}{ev_mark}"
