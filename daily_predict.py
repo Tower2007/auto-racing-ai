@@ -84,6 +84,69 @@ def recommended_bet_yen(place_code: int, race_no: int) -> int:
     return max(100, _VOTES_LOOKUP.get((place_code, race_no), 100))
 
 
+def cumulative_performance() -> dict | None:
+    """data/daily_predict_picks.csv + payouts.csv から累積運用成績を集計。
+
+    戻り値 dict:
+      start_date, end_date, n_total, n_settled, n_pending,
+      n_hits, hit_rate, cost, payout, profit, roi
+    データ無ければ None。
+    """
+    try:
+        sys.path.insert(0, str(ROOT / "scripts"))
+        from picks_audit import load_picks, attach_results, summarize  # noqa: WPS433
+        picks = load_picks()
+        if picks.empty:
+            return None
+        audit = attach_results(picks)
+        summary = summarize(audit)
+        summary["start_date"] = audit["race_date"].min().date()
+        summary["end_date"] = audit["race_date"].max().date()
+        return summary
+    except Exception as e:
+        logging.warning("cumulative_performance() 失敗: %s", e)
+        return None
+
+
+def render_cumulative_text(perf: dict) -> str:
+    """累積成績の text 版 (メール末尾用)。"""
+    if perf is None or perf["n_total"] == 0:
+        return "📊 本番運用累積成績: データなし"
+    lines = [
+        "================================================",
+        f"📊 本番運用累積成績 (運用開始 {perf['start_date']}〜{perf['end_date']})",
+        f"   戦績: {perf['n_hits']} 勝 / {perf['n_settled']} 確定 = {perf['hit_rate']*100:.1f}%"
+        f" / 累積¥{perf['profit']:+,.0f} / ROI {perf['roi']*100:.1f}%",
+        f"   未確定: {perf['n_pending']} 件 (本日分など、結果待ち)",
+        "================================================",
+    ]
+    return "\n".join(lines)
+
+
+def render_cumulative_html(perf: dict) -> str:
+    """累積成績の HTML 版 (メール末尾用)。"""
+    if perf is None or perf["n_total"] == 0:
+        return ""
+    profit_color = "#2e7d32" if perf["profit"] >= 0 else "#c62828"
+    return (
+        '<div style="margin-top:20px; padding:12px 16px; '
+        'background:#f0f7ff; border-left:4px solid #1565c0; '
+        'border-radius:4px; font-family:Arial,sans-serif; font-size:13px;">'
+        f'<div style="font-weight:bold; color:#1565c0; margin-bottom:6px;">'
+        f'📊 本番運用累積成績 '
+        f'<span style="color:#666; font-weight:normal; font-size:11px;">'
+        f'({perf["start_date"]}〜{perf["end_date"]})</span></div>'
+        f'<div>戦績: <b>{perf["n_hits"]}</b> 勝 / <b>{perf["n_settled"]}</b> 確定 = '
+        f'<b>{perf["hit_rate"]*100:.1f}%</b>'
+        f' &nbsp;|&nbsp; 累積収支: <b style="color:{profit_color};">'
+        f'¥{perf["profit"]:+,.0f}</b>'
+        f' &nbsp;|&nbsp; ROI <b>{perf["roi"]*100:.1f}%</b></div>'
+        f'<div style="color:#888; font-size:11px; margin-top:4px;">'
+        f'未確定: {perf["n_pending"]} 件 (本日分など結果待ち)</div>'
+        '</div>'
+    )
+
+
 def setup_logging():
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -376,6 +439,11 @@ def render_text(picks: pd.DataFrame, today: str, time_label: str, thr: float) ->
             f"https://autorace.jp/race_info/Odds/{r['venue']}/{today}/{int(r['race_no'])}"
         )
     lines.append(f"  🎯 投票 (公式): https://vote.autorace.jp/")
+    # 累積成績フッタ
+    perf = cumulative_performance()
+    if perf and perf["n_total"] > 0:
+        lines.append("")
+        lines.append(render_cumulative_text(perf))
     return "\n".join(lines)
 
 
@@ -444,6 +512,10 @@ def render_html(picks: pd.DataFrame, today: str, time_label: str, thr: float) ->
             f' &nbsp;<span style="color:#888; font-size:11px;">'
             f'(オッズ低下≦10% 目安、過去180日中央値票数ベース)</span></p>'
         )
+    # 累積成績フッタ (青ボックス)
+    perf = cumulative_performance()
+    if perf and perf["n_total"] > 0:
+        parts.append(render_cumulative_html(perf))
     parts.append(
         '<hr style="border:none; border-top:1px solid #ddd; margin:18px 0 8px 0;">'
         '<p style="color:#999; font-size:11px; margin:0;">'

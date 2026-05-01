@@ -296,7 +296,26 @@ def main() -> None:
     text = render_text(summary, days, errors)
     html = render_html(summary, days, errors)
 
-    # 通知候補監査(直近 args.days 日)を追加
+    # 全期間累積成績(daily_predict と同じソース・フォーマット)
+    try:
+        from daily_predict import (
+            cumulative_performance,
+            render_cumulative_text,
+            render_cumulative_html,
+        )
+        perf = cumulative_performance()
+        if perf and perf["n_total"] > 0:
+            text += "\n\n" + render_cumulative_text(perf)
+            cum_html = render_cumulative_html(perf)
+            html = html.replace(
+                '<hr style="border:none;',
+                cum_html + '\n<hr style="border:none;',
+                1,
+            )
+    except Exception as e:
+        text += f"\n\n(累積成績スキップ: {e})"
+
+    # 通知候補監査(直近 args.days 日 詳細)
     if _AUDIT_AVAILABLE:
         try:
             picks = _audit_load_picks()
