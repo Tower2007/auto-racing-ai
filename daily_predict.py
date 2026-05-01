@@ -34,6 +34,7 @@ import json
 import logging
 import pickle
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -244,11 +245,21 @@ def align_features(df: pd.DataFrame, meta: dict) -> pd.DataFrame:
     return out
 
 
+PREDICT_RETRY_MAX = 5          # top1 EV NaN 時の odds 再取得試行回数 (1min × 5 = 最大 5 分待機)
+PREDICT_RETRY_SLEEP_SEC = 60   # 再取得までの待機秒
+
+
 def predict_race(
     client: AutoraceClient, model: lgb.Booster, iso, meta,
     place_code: int, race_date: str, race_no: int,
 ) -> pd.DataFrame:
-    """1 レース分の予測 + EV 計算結果を返す(空 DataFrame なら対象外)。"""
+    """1 レース分の予測 + EV 計算結果を返す(空 DataFrame なら対象外)。
+
+    top-1 (pred 1位) の ev_avg_calib が NaN (= 人気車の複勝オッズが
+    まだ未確定で API センチネル 0.0/0.0) の場合、最大 PREDICT_RETRY_MAX 回
+    PREDICT_RETRY_SLEEP_SEC 秒待って odds を再取得する。1 回でも有効な
+    数値が取れれば以降の集計に使う。
+    """
     try:
         prog = client.get_program(place_code, race_date, race_no)
         if prog.get("result") != "Success":
@@ -257,34 +268,47 @@ def predict_race(
         if isinstance(body, list) or not body.get("playerList"):
             return pd.DataFrame()
 
-        odds_resp = client.get_odds(place_code, race_date, race_no)
-        odds_body = odds_resp.get("body", {})
-        if isinstance(odds_body, list):
-            return pd.DataFrame()
-        # オッズ未公開(早朝)は tnsOddsList が list/空 dict で返る。
-        # EV ベース戦略はオッズなしでは計算不能なので、ここで早期 return。
-        tns = odds_body.get("tnsOddsList") if isinstance(odds_body, dict) else None
-        if not isinstance(tns, dict) or not tns:
-            logging.info("predict_race(%d, %s, %d): odds 未公開 — skip",
-                         place_code, race_date, race_no)
-            return pd.DataFrame()
+        feat = pd.DataFrame()
+        for attempt in range(PREDICT_RETRY_MAX + 1):
+            odds_resp = client.get_odds(place_code, race_date, race_no)
+            odds_body = odds_resp.get("body", {})
+            if isinstance(odds_body, list):
+                return pd.DataFrame()
+            # オッズ未公開(早朝)は tnsOddsList が list/空 dict で返る。
+            # EV ベース戦略はオッズなしでは計算不能なので、ここで早期 return。
+            tns = odds_body.get("tnsOddsList") if isinstance(odds_body, dict) else None
+            if not isinstance(tns, dict) or not tns:
+                logging.info("predict_race(%d, %s, %d): odds 未公開 — skip",
+                             place_code, race_date, race_no)
+                return pd.DataFrame()
 
-        feat = build_features_for_race(place_code, race_date, race_no, body, odds_body)
-        if feat.empty:
-            return pd.DataFrame()
+            feat = build_features_for_race(place_code, race_date, race_no, body, odds_body)
+            if feat.empty:
+                return pd.DataFrame()
+            feat = feat[feat["is_absent"] == 0].copy()
+            if feat.empty:
+                return pd.DataFrame()
 
-        # 欠車除外
-        feat = feat[feat["is_absent"] == 0].copy()
-        if feat.empty:
-            return pd.DataFrame()
+            X = align_features(feat, meta)
+            feat["pred"] = model.predict(X)
+            feat["pred_calib"] = iso.transform(feat["pred"].values)
+            feat["ev_avg_calib"] = feat["pred_calib"] * (
+                feat["place_odds_min"] + feat["place_odds_max"]
+            ) / 2
+            feat["pred_rank"] = feat["pred"].rank(method="min", ascending=False)
 
-        X = align_features(feat, meta)
-        feat["pred"] = model.predict(X)
-        feat["pred_calib"] = iso.transform(feat["pred"].values)
-        feat["ev_avg_calib"] = feat["pred_calib"] * (
-            feat["place_odds_min"] + feat["place_odds_max"]
-        ) / 2
-        feat["pred_rank"] = feat["pred"].rank(method="min", ascending=False)
+            top1 = feat[feat["pred_rank"] == 1]
+            top1_ev = float(top1["ev_avg_calib"].iloc[0]) if not top1.empty else float("nan")
+            if not pd.isna(top1_ev):
+                if attempt > 0:
+                    logging.info("predict_race(%d, %s, %d): リトライ %d 回目で top1 EV=%.2f を取得",
+                                 place_code, race_date, race_no, attempt, top1_ev)
+                return feat
+            if attempt < PREDICT_RETRY_MAX:
+                logging.info("predict_race(%d, %s, %d): top1 EV=NaN, %d 秒後にリトライ (試行 %d/%d)",
+                             place_code, race_date, race_no, PREDICT_RETRY_SLEEP_SEC,
+                             attempt + 1, PREDICT_RETRY_MAX)
+                time.sleep(PREDICT_RETRY_SLEEP_SEC)
         return feat
     except Exception as e:
         logging.error("predict_race(%d, %s, %d) failed: %s", place_code, race_date, race_no, e)
