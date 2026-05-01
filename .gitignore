@@ -12,7 +12,12 @@ venv/
 *.pem
 
 # Data / logs
-data/
+# data/ 以下は基本 ignore だが Streamlit Cloud デプロイ用にモデル/小型 CSV のみ例外
+data/*
+!data/production_model.lgb
+!data/production_calib.pkl
+!data/production_meta.json
+!data/expected_votes.csv
 *.db
 *.sqlite
 *.sqlite3
