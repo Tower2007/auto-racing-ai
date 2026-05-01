@@ -975,7 +975,8 @@ if is_live_mode:
             except Exception:
                 top1_ev = None
 
-        # 発走 -5min 以降だけ推奨を出す (それより前のオッズは drift bias が大きく当てにならない)
+        # 発走 -5min 〜 発走時刻の間だけ推奨を出す
+        # (それより前は drift bias で当てにならない、過去レースは推奨しても意味なし)
         within_5min_window = False
         if start_time_str:
             try:
@@ -983,13 +984,16 @@ if is_live_mode:
                 race_start_dt = dt.datetime.combine(jst_today(), dt.time(hh, mm))
                 if race_start_dt < now - dt.timedelta(hours=12):
                     race_start_dt += dt.timedelta(days=1)
-                within_5min_window = (now >= race_start_dt - dt.timedelta(minutes=5))
+                # 発走 -5min から発走時刻まで (発走後はもう推奨対象外)
+                within_5min_window = (
+                    race_start_dt - dt.timedelta(minutes=5) <= now < race_start_dt
+                )
             except (ValueError, AttributeError):
                 pass
 
-        # 推奨判定 (NaN は推奨しない、-5min 以前は閾値超えていても保留)
+        # 推奨判定 (NaN は推奨しない、確定済 R も対象外)
         ev_above_thr = (top1_ev is not None) and (top1_ev >= recommend_thr)
-        is_recommended = ev_above_thr and within_5min_window
+        is_recommended = ev_above_thr and within_5min_window and not info["has_result"]
         if is_recommended:
             if info["has_result"]:
                 n_recommended_settled += 1
