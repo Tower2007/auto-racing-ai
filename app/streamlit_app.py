@@ -28,6 +28,28 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 sys.path.insert(0, str(ROOT))  # daily_predict / src を import 可能に
 RACE_KEY = ["race_date", "place_code", "race_no"]
+
+# 推奨ベット額ルックアップ (daily_predict.recommended_bet_yen と同等、独立実装で
+# Streamlit reload 時の import 衝突を回避)
+EXPECTED_VOTES_CSV = ROOT / "data" / "expected_votes.csv"
+_VOTES_LOOKUP_CACHE: dict | None = None
+
+
+def recommended_bet_yen(place_code: int, race_no: int) -> int:
+    """場×R 別 推奨ベット額。CSV 無ければ ¥100 fallback。"""
+    global _VOTES_LOOKUP_CACHE
+    if _VOTES_LOOKUP_CACHE is None:
+        try:
+            import pandas as _pd
+            df = _pd.read_csv(EXPECTED_VOTES_CSV)
+            _VOTES_LOOKUP_CACHE = {
+                (int(r["place_code"]), int(r["race_no"])): int(r["rec_yen_10pct"])
+                for _, r in df.iterrows()
+            }
+        except Exception:
+            _VOTES_LOOKUP_CACHE = {}
+    return max(100, _VOTES_LOOKUP_CACHE.get((place_code, race_no), 100))
+
 BET = 100
 CALIB_CUTOFF = "2024-04"
 
@@ -1025,7 +1047,6 @@ if is_live_mode:
                 f'<span class="urgent">⚡ MAMONAKU !!</span>' if (is_next and next_race_min is not None and next_race_min <= 10)
                 else ""
             )
-            from daily_predict import recommended_bet_yen
             rec_yen = recommended_bet_yen(pc, r)
             st.markdown(
                 f'<div class="recommend-banner">'
