@@ -192,6 +192,8 @@ def fetch_live_day(date_str: str, pc: int) -> dict:
             "has_result": r in refund_by_race,
             "source": "none", "top_cars": [], "df": None,
             "refund_info": refund_by_race.get(r),
+            # 全券種オッズ (display 用)
+            "odds_lists": {},  # {bet_type: raw API odds dict}
         }
         try:
             prog = client.get_program(pc, date_str, r)
@@ -207,6 +209,17 @@ def fetch_live_day(date_str: str, pc: int) -> dict:
         try:
             odds_resp = client.get_odds(pc, date_str, r)
             odds_body = odds_resp.get("body", {})
+            # 全券種オッズを保存 (display 用、bet_type ごとに raw dict)
+            if isinstance(odds_body, dict):
+                for bt_key, list_key in [
+                    ("tns", "tnsOddsList"), ("fns", "fnsOddsList"),
+                    ("wid", "widOddsList"), ("rfw", "rfwOddsList"),
+                    ("rtw", "rtwOddsList"),
+                    ("rf3", "rf3OddsList"), ("rt3", "rt3OddsList"),
+                ]:
+                    v = odds_body.get(list_key)
+                    if isinstance(v, dict) and v:
+                        info["odds_lists"][bt_key] = v
             tns = odds_body.get("tnsOddsList") if isinstance(odds_body, dict) else None
             n_valid_tns = 0
             if isinstance(tns, dict):
@@ -297,6 +310,53 @@ def fmt_combo(bt: str, cars: list[int]) -> str:
     if bt in ("rt3", "rtw"):  # 順序あり (二車単・三連単)
         return "→".join(str(c) for c in cars)
     return "-".join(str(c) for c in sorted(cars))
+
+
+def lookup_odds(bt: str, cars: list[int], odds_lists: dict) -> str:
+    """券種別オッズを raw API dict から lookup → 表示用 string"""
+    if not cars or not odds_lists:
+        return "未公開"
+    od = odds_lists.get(bt)
+    if not isinstance(od, dict) or not od:
+        return "未公開"
+    try:
+        if bt == "tns":
+            v = od.get(str(cars[0]))
+            return f"{float(v):.1f}" if v and float(v) > 0 else "未公開"
+        if bt == "fns":
+            entry = od.get(str(cars[0]), {})
+            mn, mx = float(entry.get("min", 0)), float(entry.get("max", 0))
+            return f"{mn:.1f}-{mx:.1f}" if mn > 0 else "未公開"
+        if bt == "wid":
+            # widOddsList[c1][c2] = {min, max} (c1 < c2)
+            s = sorted(cars)
+            entry = od.get(str(s[0]), {}).get(str(s[1]), {})
+            mn, mx = float(entry.get("min", 0)), float(entry.get("max", 0))
+            return f"{mn:.1f}-{mx:.1f}" if mn > 0 else "未公開"
+        if bt == "rfw":
+            # rfwOddsList[c1][c2] = odds (二車連、c1 < c2)
+            s = sorted(cars)
+            v = od.get(str(s[0]), {}).get(str(s[1]))
+            return f"{float(v):.1f}" if v and float(v) > 0 else "未公開"
+        if bt == "rtw":
+            # rtwOddsList[c1][c2] = odds (二車単、順序あり)
+            v = od.get(str(cars[0]), {}).get(str(cars[1]))
+            return f"{float(v):.1f}" if v and float(v) > 0 else "未公開"
+        if bt == "rf3":
+            # rf3OddsList[c1][c2] = odds (三連複、c1 < c2 < c3、最後のキーは省略可能)
+            s = sorted(cars)
+            entry = od.get(str(s[0]), {}).get(str(s[1]))
+            if isinstance(entry, dict):
+                v = entry.get(str(s[2]))
+                return f"{float(v):.1f}" if v and float(v) > 0 else "未公開"
+            return f"{float(entry):.1f}" if entry and float(entry) > 0 else "未公開"
+        if bt == "rt3":
+            # rt3OddsList[c1][c2][c3] = odds (三連単、順序あり)
+            v = od.get(str(cars[0]), {}).get(str(cars[1]), {}).get(str(cars[2]))
+            return f"{float(v):.1f}" if v and float(v) > 0 else "未公開"
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return "未公開"
 
 
 def check_hit(bt: str, picked: list[int], pay_rows: pd.DataFrame) -> tuple[bool, float]:
@@ -943,15 +1003,8 @@ if is_live_mode:
             if not picked:
                 continue
             combo = fmt_combo(bt, picked)
-            if bt == "tns":
-                od = win_odds_map.get(picked[0])
-                od_s = f"{od:.1f}" if (od and pd.notna(od) and od > 0) else "未公開"
-            elif bt == "fns":
-                pmn = place_min_map.get(picked[0])
-                pmx = place_max_map.get(picked[0])
-                od_s = f"{pmn:.1f}-{pmx:.1f}" if (pmn and pd.notna(pmn) and pmn > 0) else "未公開"
-            else:
-                od_s = "—"
+            # 全券種オッズを raw API 経由で lookup (単勝・複勝以外も対応)
+            od_s = lookup_odds(bt, picked, info.get("odds_lists", {}))
             # 結果判定 (API 構造の違い:
             #   tns/fns: {carNo, refund, ...}
             #   wid/rfw/rtw: {1thCarNo, 2thCarNo, refund, ...}
