@@ -54,6 +54,34 @@ DATA = ROOT / "data"
 LOG_FILE = DATA / "daily_predict.log"
 PRODUCTION_LOG = DATA / "daily_predict_picks.csv"
 ODDS_SNAPSHOT_LOG = DATA / "odds_snapshots.csv"  # 発火時オッズスナップ (信号 persistence 解析用)
+EXPECTED_VOTES_CSV = DATA / "expected_votes.csv"  # 場×R別 typical 票数 → 推奨ベット額算出
+
+
+def _load_votes_lookup() -> dict[tuple[int, int], int]:
+    """expected_votes.csv → {(place_code, race_no): rec_yen_10pct} dict"""
+    if not EXPECTED_VOTES_CSV.exists():
+        return {}
+    try:
+        df = pd.read_csv(EXPECTED_VOTES_CSV)
+        return {
+            (int(r["place_code"]), int(r["race_no"])): int(r["rec_yen_10pct"])
+            for _, r in df.iterrows()
+        }
+    except Exception:
+        return {}
+
+
+_VOTES_LOOKUP = None
+
+
+def recommended_bet_yen(place_code: int, race_no: int) -> int:
+    """場×R 別の推奨ベット額 (オッズ低下 ≦ 10%、100円単位)。
+    expected_votes.csv が無い or 行が無ければ ¥100 を返す。
+    """
+    global _VOTES_LOOKUP
+    if _VOTES_LOOKUP is None:
+        _VOTES_LOOKUP = _load_votes_lookup()
+    return max(100, _VOTES_LOOKUP.get((place_code, race_no), 100))
 
 
 def setup_logging():
@@ -327,14 +355,19 @@ def render_text(picks: pd.DataFrame, today: str, time_label: str, thr: float) ->
         "",
         f"{'場':6s}{'R':>3s}{'車':>3s}{'pred':>7s}{'EV':>6s}{'min':>6s}{'max':>7s}",
     ]
+    total_rec = 0
     for _, r in picks.iterrows():
+        rec = recommended_bet_yen(int(r["place_code"]), int(r["race_no"]))
+        total_rec += rec
         lines.append(
             f"{r['venue']:6s}{int(r['race_no']):3d}{int(r['car_no']):3d}"
             f"{r['pred_calib']:7.3f}{r['ev_avg_calib']:6.2f}"
             f"{r['place_odds_min']:6.1f}{r['place_odds_max']:7.1f}"
+            f"  推奨¥{rec}"
         )
     lines.append("")
-    lines.append(f"計 {len(picks)} 候補 / 投資 ¥{len(picks)*100:,}")
+    lines.append(f"計 {len(picks)} 候補 / 投資 ¥{len(picks)*100:,} (=¥100 均一)")
+    lines.append(f"        推奨額合計 ¥{total_rec:,} (オッズ低下≦10% 目安、過去180日中央値ベース)")
     lines.append("")
     lines.append("【オッズ確認 / 投票】")
     for _, r in picks.iterrows():
@@ -367,7 +400,7 @@ def render_html(picks: pd.DataFrame, today: str, time_label: str, thr: float) ->
             f'<tr><th style={TH}>場</th><th style={TH}>R</th><th style={TH}>車</th>'
             f'<th style={TH}>pred</th><th style={TH}>EV</th>'
             f'<th style={TH}>fns_min</th><th style={TH}>fns_max</th><th style={TH}>tns</th>'
-            f'<th style={TH}>オッズ</th><th style={TH}>投票</th></tr>'
+            f'<th style={TH}>推奨¥</th><th style={TH}>オッズ</th><th style={TH}>投票</th></tr>'
         )
         BTN_ODDS = (
             '"display:inline-block; padding:5px 10px; background:#1565c0; '
@@ -379,6 +412,7 @@ def render_html(picks: pd.DataFrame, today: str, time_label: str, thr: float) ->
             'color:#ffffff; text-decoration:none; border-radius:4px; '
             'font-weight:bold; font-size:12px;"'
         )
+        total_rec = 0
         for i, (_, r) in enumerate(picks.iterrows()):
             alt = ' style="background:#fafafa;"' if i % 2 == 1 else ""
             odds_url = (
@@ -386,6 +420,8 @@ def render_html(picks: pd.DataFrame, today: str, time_label: str, thr: float) ->
                 f'{today}/{int(r["race_no"])}'
             )
             vote_url = "https://vote.autorace.jp/"
+            rec_yen = recommended_bet_yen(int(r["place_code"]), int(r["race_no"]))
+            total_rec += rec_yen
             parts.append(
                 f'<tr{alt}>'
                 f'<td style={TD_L}>{r["venue"]}</td>'
@@ -396,13 +432,17 @@ def render_html(picks: pd.DataFrame, today: str, time_label: str, thr: float) ->
                 f'<td style={TD}>{r["place_odds_min"]:.1f}</td>'
                 f'<td style={TD}>{r["place_odds_max"]:.1f}</td>'
                 f'<td style={TD}>{r["win_odds"]:.1f}</td>'
+                f'<td style={TD}><b style="color:#1565c0;">¥{rec_yen}</b></td>'
                 f'<td style={TD}><a href="{odds_url}" style={BTN_ODDS}>📊 オッズ</a></td>'
                 f'<td style={TD}><a href="{vote_url}" style={BTN_VOTE}>🎯 投票</a></td>'
                 f'</tr>'
             )
         parts.append('</table>')
         parts.append(
-            f'<p style="margin:12px 0;">計 <b>{len(picks)}</b> 候補 / 投資 <b>¥{len(picks)*100:,}</b></p>'
+            f'<p style="margin:12px 0;">計 <b>{len(picks)}</b> 候補'
+            f' / 推奨額合計 <b>¥{total_rec:,}</b>'
+            f' &nbsp;<span style="color:#888; font-size:11px;">'
+            f'(オッズ低下≦10% 目安、過去180日中央値票数ベース)</span></p>'
         )
     parts.append(
         '<hr style="border:none; border-top:1px solid #ddd; margin:18px 0 8px 0;">'

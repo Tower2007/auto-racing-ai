@@ -1025,11 +1025,14 @@ if is_live_mode:
                 f'<span class="urgent">⚡ MAMONAKU !!</span>' if (is_next and next_race_min is not None and next_race_min <= 10)
                 else ""
             )
+            from daily_predict import recommended_bet_yen
+            rec_yen = recommended_bet_yen(pc, r)
             st.markdown(
                 f'<div class="recommend-banner">'
                 f'<span class="gem">💎</span> BUY RECOMMENDED <span class="gem">💎</span>'
                 f'&nbsp;&nbsp;R{r} {start_time_str or ""}&nbsp;&nbsp;'
                 f'予想 {top_cars[0]} 号  EV <b>{top1_ev:.2f}</b>'
+                f'&nbsp;&nbsp;<span style="color:#fff; background:#1565c0; padding:2px 8px; border-radius:4px; font-size:0.85em;">推奨額 ¥{rec_yen}</span>'
                 f'&nbsp;&nbsp;{urgent_part}'
                 f'</div>',
                 unsafe_allow_html=True,
