@@ -29,10 +29,15 @@ DATA = ROOT / "data"
 sys.path.insert(0, str(ROOT))  # daily_predict / src を import 可能に
 RACE_KEY = ["race_date", "place_code", "race_no"]
 
-# デプロイモード: 環境変数 DEPLOY_MODE=cloud で iPhone/公開向け簡易 UI に。
+# デプロイモード判定: 以下いずれかで cloud モードに切替
+#   1. 環境変数 DEPLOY_MODE=cloud
+#   2. Streamlit Cloud は /mount/src 配下で実行されるので path で自動判定
 # デフォルト (local) は PC ローカル運用向けフル UI。
 import os as _os
-DEPLOY_MODE = _os.environ.get("DEPLOY_MODE", "local").lower()
+DEPLOY_MODE = _os.environ.get("DEPLOY_MODE", "").lower()
+if not DEPLOY_MODE:
+    # Streamlit Cloud auto-detect (path は /mount/src/<repo>/...)
+    DEPLOY_MODE = "cloud" if str(ROOT).startswith("/mount/src") else "local"
 IS_CLOUD = DEPLOY_MODE == "cloud"
 
 # 推奨ベット額ルックアップ (daily_predict.recommended_bet_yen と同等、独立実装で
