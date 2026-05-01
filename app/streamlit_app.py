@@ -696,20 +696,50 @@ with st.sidebar:
 target_ts = pd.Timestamp(target_date)
 
 if is_live_mode:
+    # 30 秒毎の auto-rerun (キャッシュヒット時は瞬時、本当の API 取得は -5min 境界のみ)
+    from streamlit_autorefresh import st_autorefresh
+    st_autorefresh(interval=30000, key=f"live_refresh_{venue}")
+
     # 更新ボタン
     col_btn, col_now = st.columns([1, 4])
     with col_btn:
-        if st.button("🔄 更新", help="autorace.jp から最新の状態を再取得"):
+        if st.button("🔄 更新", help="autorace.jp から最新の状態を強制再取得"):
             st.cache_data.clear()
+            st.session_state.pop(f"refreshed_set_{target_date}_{venue}", None)
             st.rerun()
     now = dt.datetime.now()
     with col_now:
         st.caption(f"⏰ 現在時刻: {now.strftime('%H:%M:%S')} ／ "
-                   f"オッズ・結果が更新されたら更新ボタンを押してください")
+                   f"30 秒毎に画面更新、各 R 発走 -5min 時点で API から再取得します")
 
     with st.spinner(f"autorace.jp から {target_date} {venue_label} のデータを取得中…"):
         race_start_times = fetch_race_start_times(str(target_date), pc)
         live_data = fetch_live_day(str(target_date), pc)
+
+    # ── スマート refresh: 各 R 発走 -5min を超えたら 1 度だけ cache 破棄 + rerun ──
+    refreshed_key = f"refreshed_set_{target_date}_{venue}"
+    refreshed_set: set = st.session_state.setdefault(refreshed_key, set())
+    now_dt = dt.datetime.now()
+    today_d = dt.date.today()
+    for r_no, time_str in (race_start_times or {}).items():
+        if not time_str or r_no in refreshed_set:
+            continue
+        try:
+            hh, mm = map(int, str(time_str).split(":"))
+        except (ValueError, AttributeError):
+            continue
+        race_start = dt.datetime.combine(today_d, dt.time(hh, mm))
+        # 深夜跨ぎ (今 00:30 で R12 が 23:50 開始だった等) 補正
+        if race_start < now_dt - dt.timedelta(hours=12):
+            race_start += dt.timedelta(days=1)
+        fire_at = race_start - dt.timedelta(minutes=5)
+        # 既に発走済の R は refresh しない (確定オッズに変動なし)
+        race_in_future = now_dt < race_start
+        if now_dt >= fire_at and race_in_future:
+            refreshed_set.add(r_no)
+            st.cache_data.clear()
+            st.toast(f"🔄 R{r_no} 発走 -5min: 最新データに更新中…", icon="⚡")
+            st.rerun()
 
     valid_races = [r for r, info in live_data.items() if info["top_cars"]]
     if not valid_races:

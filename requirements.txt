@@ -11,3 +11,4 @@ tabulate>=0.9
 
 # Live prediction app
 streamlit>=1.30
+streamlit-autorefresh>=1.0
