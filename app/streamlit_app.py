@@ -112,16 +112,28 @@ def get_autorace_client():
     return AutoraceClient()
 
 
-@st.cache_data(ttl=900, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_today_open_venues() -> list[int]:
-    """Hold/Today API で本日開催かつ中止でない場の place_code リストを返す。"""
+    """Hold/Today API で本日開催 + 中止でない + 投票未終了の場 place_code リストを返す。"""
     from daily_predict import fetch_today_schedule
     client = get_autorace_client()
     schedule = fetch_today_schedule(client)
+    # raw API も再取得して telvoteClose を確認 (fetch_today_schedule では未取得の項目)
+    try:
+        raw = client.get_today_hold().get("body", {}).get("today", [])
+        telvote_closed = {
+            int(h.get("placeCode")): bool(h.get("telvoteClose"))
+            for h in raw if h.get("placeCode") is not None
+        }
+    except Exception:
+        telvote_closed = {}
     open_pcs = []
     for pc, info in schedule.items():
-        if str(info.get("cancelFlg")) != "1":
-            open_pcs.append(pc)
+        if str(info.get("cancelFlg")) == "1":
+            continue
+        if telvote_closed.get(pc, False):
+            continue  # 全 R 投票終了済 = 表示しても無意味
+        open_pcs.append(pc)
     return sorted(open_pcs)
 
 
@@ -797,24 +809,31 @@ with st.sidebar:
     if is_live_mode:
         st.caption("⚠️ 各レースで API 2 回 × 12R = 約 12 秒かかります")
 
-    selected_labels = st.multiselect(
-        "購入する券種",
-        options=[BET_LABELS[bt] for bt in BET_ORDER],
-        default=[BET_LABELS[bt] for bt in BET_ORDER],
-        help="チェックを外すとその券種は購入しない (1 日分一括)",
-    )
-    selected_bets = [bt for bt in BET_ORDER if BET_LABELS[bt] in selected_labels]
-    if not selected_bets:
-        st.warning("少なくとも 1 つは選んでください")
-        st.stop()
+    if IS_CLOUD:
+        # モバイル: サイドバー操作が辛いのでデフォルト固定 (全券種 / ¥100 / EV 1.50)
+        selected_bets = list(BET_ORDER)
+        bet_amount = 100
+        recommend_thr = 1.50
+        show_results = True
+    else:
+        selected_labels = st.multiselect(
+            "購入する券種",
+            options=[BET_LABELS[bt] for bt in BET_ORDER],
+            default=[BET_LABELS[bt] for bt in BET_ORDER],
+            help="チェックを外すとその券種は購入しない (1 日分一括)",
+        )
+        selected_bets = [bt for bt in BET_ORDER if BET_LABELS[bt] in selected_labels]
+        if not selected_bets:
+            st.warning("少なくとも 1 つは選んでください")
+            st.stop()
 
-    bet_amount = st.number_input("1 券種あたり金額 (¥)", min_value=100, max_value=10000, value=100, step=100)
-    recommend_thr = st.number_input(
-        "💎 購入推奨 EV 閾値",
-        min_value=1.0, max_value=3.0, value=1.50, step=0.05,
-        help="top1 の ev_avg_calib がこの値以上で「💎 推奨」を表示。本番運用は 1.50。",
-    )
-    show_results = st.checkbox("結果も表示する(リプレイなので答え合わせ)", value=True)
+        bet_amount = st.number_input("1 券種あたり金額 (¥)", min_value=100, max_value=10000, value=100, step=100)
+        recommend_thr = st.number_input(
+            "💎 購入推奨 EV 閾値",
+            min_value=1.0, max_value=3.0, value=1.50, step=0.05,
+            help="top1 の ev_avg_calib がこの値以上で「💎 推奨」を表示。本番運用は 1.50。",
+        )
+        show_results = st.checkbox("結果も表示する(リプレイなので答え合わせ)", value=True)
 
 # メインエリア
 target_ts = pd.Timestamp(target_date)
