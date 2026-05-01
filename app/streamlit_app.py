@@ -434,6 +434,7 @@ st.set_page_config(
     page_icon="🏁",
     # cloud (iPhone) は centered で読みやすく、local (PC) は wide で情報量重視
     layout="centered" if IS_CLOUD else "wide",
+    initial_sidebar_state="expanded",  # iPhone でも最初からサイドバー開く
 )
 # iPhone Safari で適切な viewport meta + ホーム画面追加 OK
 if IS_CLOUD:
@@ -822,31 +823,29 @@ with st.sidebar:
     if is_live_mode:
         st.caption("⚠️ 各レースで API 2 回 × 12R = 約 12 秒かかります")
 
-    if IS_CLOUD:
-        # モバイル: サイドバー操作が辛いのでデフォルト固定 (全券種 / ¥100 / EV 1.50)
-        selected_bets = list(BET_ORDER)
-        bet_amount = 100
-        recommend_thr = 1.50
-        show_results = True
-    else:
-        selected_labels = st.multiselect(
-            "購入する券種",
-            options=[BET_LABELS[bt] for bt in BET_ORDER],
-            default=[BET_LABELS[bt] for bt in BET_ORDER],
-            help="チェックを外すとその券種は購入しない (1 日分一括)",
-        )
-        selected_bets = [bt for bt in BET_ORDER if BET_LABELS[bt] in selected_labels]
-        if not selected_bets:
-            st.warning("少なくとも 1 つは選んでください")
-            st.stop()
+    selected_labels = st.multiselect(
+        "購入する券種",
+        options=[BET_LABELS[bt] for bt in BET_ORDER],
+        default=[BET_LABELS[bt] for bt in BET_ORDER],
+        help="チェックを外すとその券種は購入しない (1 日分一括)",
+    )
+    selected_bets = [bt for bt in BET_ORDER if BET_LABELS[bt] in selected_labels]
+    if not selected_bets:
+        st.warning("少なくとも 1 つは選んでください")
+        st.stop()
 
-        bet_amount = st.number_input("1 券種あたり金額 (¥)", min_value=100, max_value=10000, value=100, step=100)
-        recommend_thr = st.number_input(
-            "💎 購入推奨 EV 閾値",
-            min_value=1.0, max_value=3.0, value=1.50, step=0.05,
-            help="top1 の ev_avg_calib がこの値以上で「💎 推奨」を表示。本番運用は 1.50。",
-        )
-        show_results = st.checkbox("結果も表示する(リプレイなので答え合わせ)", value=True)
+    bet_amount = st.number_input(
+        "1 券種あたり金額 (¥)", min_value=100, max_value=10000, value=100, step=100
+    )
+    recommend_thr = st.number_input(
+        "💎 購入推奨 EV 閾値",
+        min_value=1.0, max_value=3.0, value=1.50, step=0.05,
+        help="top1 の ev_avg_calib がこの値以上で「💎 推奨」を表示。本番運用は 1.50。",
+    )
+    # cloud 版ではリプレイ機能無いので結果表示固定 (チェックボックスを出さない)
+    show_results = True if IS_CLOUD else st.checkbox(
+        "結果も表示する(リプレイなので答え合わせ)", value=True
+    )
 
 # メインエリア
 target_ts = pd.Timestamp(target_date)
