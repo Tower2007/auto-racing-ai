@@ -29,6 +29,19 @@ DATA = ROOT / "data"
 sys.path.insert(0, str(ROOT))  # daily_predict / src を import 可能に
 RACE_KEY = ["race_date", "place_code", "race_no"]
 
+# JST 固定 (Streamlit Cloud は UTC なので明示変換が必須)
+JST = dt.timezone(dt.timedelta(hours=9))
+
+
+def jst_now() -> dt.datetime:
+    """現在時刻 JST (tz-naive)"""
+    return dt.datetime.now(JST).replace(tzinfo=None)
+
+
+def jst_today() -> dt.date:
+    """本日 JST"""
+    return jst_now().date()
+
 # デプロイモード判定: 以下いずれかで cloud モードに切替
 #   1. 環境変数 DEPLOY_MODE=cloud
 #   2. Streamlit Cloud は /mount/src 配下で実行されるので path で自動判定
@@ -732,7 +745,7 @@ if IS_CLOUD:
     preds = _pd.DataFrame({"race_date": []})
     odds = _pd.DataFrame()
     pay = _pd.DataFrame()
-    min_date = max_date = dt.date.today()
+    min_date = max_date = jst_today()
 else:
     preds, odds, pay = load_data()
     min_date = preds["race_date"].min().date()
@@ -770,7 +783,7 @@ with st.sidebar:
         )
         pc = next(p for p in open_pcs if VENUE_JP[p] == venue_label)
         venue = VENUE_NAMES[pc]
-        target_date = dt.date.today()
+        target_date = jst_today()
         st.caption(f"📅 {target_date} の開催場: {len(open_pcs)} 場 ({', '.join(VENUE_JP[p] for p in open_pcs)})")
     else:
         venue_label = st.selectbox(
@@ -850,7 +863,7 @@ if is_live_mode:
             st.cache_data.clear()
             st.session_state.pop(f"refreshed_set_{target_date}_{venue}", None)
             st.rerun()
-    now = dt.datetime.now()
+    now = jst_now()
     with col_now:
         st.caption(f"⏰ 現在時刻: {now.strftime('%H:%M:%S')} ／ "
                    f"30 秒毎に画面更新、各 R 発走 -5min 時点で API から再取得します")
@@ -862,8 +875,8 @@ if is_live_mode:
     # ── スマート refresh: 各 R 発走 -5min を超えたら 1 度だけ cache 破棄 + rerun ──
     refreshed_key = f"refreshed_set_{target_date}_{venue}"
     refreshed_set: set = st.session_state.setdefault(refreshed_key, set())
-    now_dt = dt.datetime.now()
-    today_d = dt.date.today()
+    now_dt = jst_now()
+    today_d = jst_today()
     for r_no, time_str in (race_start_times or {}).items():
         if not time_str or r_no in refreshed_set:
             continue
@@ -962,7 +975,7 @@ if is_live_mode:
         if start_time_str:
             try:
                 hh, mm = map(int, str(start_time_str).split(":"))
-                race_start_dt = dt.datetime.combine(dt.date.today(), dt.time(hh, mm))
+                race_start_dt = dt.datetime.combine(jst_today(), dt.time(hh, mm))
                 if race_start_dt < now - dt.timedelta(hours=12):
                     race_start_dt += dt.timedelta(days=1)
                 within_5min_window = (now >= race_start_dt - dt.timedelta(minutes=5))
