@@ -127,25 +127,28 @@ def get_autorace_client():
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_today_open_venues() -> list[int]:
-    """Hold/Today API で本日開催 + 中止でない + 投票未終了の場 place_code リストを返す。"""
+    """Hold/Today API で本日開催 + 中止でない + 全レース未終了の場 place_code リストを返す。
+
+    判定は finalRefundFlg=1 (全 R 払戻確定 = 本日終了) で除外。
+    telvoteClose は per-race フラグで現在 R の投票締切しか示さないため不適切。
+    """
     from daily_predict import fetch_today_schedule
     client = get_autorace_client()
     schedule = fetch_today_schedule(client)
-    # raw API も再取得して telvoteClose を確認 (fetch_today_schedule では未取得の項目)
     try:
         raw = client.get_today_hold().get("body", {}).get("today", [])
-        telvote_closed = {
-            int(h.get("placeCode")): bool(h.get("telvoteClose"))
+        final_refund = {
+            int(h.get("placeCode")): str(h.get("finalRefundFlg")) == "1"
             for h in raw if h.get("placeCode") is not None
         }
     except Exception:
-        telvote_closed = {}
+        final_refund = {}
     open_pcs = []
     for pc, info in schedule.items():
         if str(info.get("cancelFlg")) == "1":
             continue
-        if telvote_closed.get(pc, False):
-            continue  # 全 R 投票終了済 = 表示しても無意味
+        if final_refund.get(pc, False):
+            continue  # 全 R 払戻確定 = 本日終了
         open_pcs.append(pc)
     return sorted(open_pcs)
 
