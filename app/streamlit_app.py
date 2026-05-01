@@ -126,11 +126,11 @@ def get_autorace_client():
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_today_open_venues() -> list[int]:
-    """Hold/Today API で本日開催 + 中止でない + 全レース未終了の場 place_code リストを返す。
+def fetch_today_open_venues() -> list[tuple[int, bool]]:
+    """Hold/Today API で本日開催 + 中止でない場の (place_code, is_finished) リストを返す。
 
-    判定は finalRefundFlg=1 (全 R 払戻確定 = 本日終了) で除外。
-    telvoteClose は per-race フラグで現在 R の投票締切しか示さないため不適切。
+    is_finished: finalRefundFlg=1 (全 R 払戻確定 = 本日終了)
+    終了場も結果振り返り目的で残す (selectbox では「(終了)」suffix で識別)。
     """
     from daily_predict import fetch_today_schedule
     client = get_autorace_client()
@@ -143,14 +143,13 @@ def fetch_today_open_venues() -> list[int]:
         }
     except Exception:
         final_refund = {}
-    open_pcs = []
+    out = []
     for pc, info in schedule.items():
         if str(info.get("cancelFlg")) == "1":
             continue
-        if final_refund.get(pc, False):
-            continue  # 全 R 払戻確定 = 本日終了
-        open_pcs.append(pc)
-    return sorted(open_pcs)
+        out.append((pc, final_refund.get(pc, False)))
+    # 進行中 → 終了の順、各群内は pc 昇順
+    return sorted(out, key=lambda x: (x[1], x[0]))
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -775,21 +774,27 @@ with st.sidebar:
         is_live_mode = mode.startswith("📡")
 
     if is_live_mode:
-        # 今日の開催場だけ抽出
+        # 今日の開催場だけ抽出 (進行中 + 終了の両方含む、終了は「(終了)」suffix で識別)
         with st.spinner("今日の開催場を確認中…"):
-            open_pcs = fetch_today_open_venues()
-        if not open_pcs:
+            open_pcs_with_state = fetch_today_open_venues()  # [(pc, is_finished), ...]
+        if not open_pcs_with_state:
             st.error("⚠️ 今日は 5 場とも開催なしです。リプレイモードを使ってください。")
             st.stop()
-        venue_label = st.selectbox(
-            "場を選ぶ (今日の開催場)",
-            options=[VENUE_JP[pc] for pc in open_pcs],
-            index=0,
-        )
-        pc = next(p for p in open_pcs if VENUE_JP[p] == venue_label)
+        # selectbox label: 進行中はそのまま、終了は「(終了)」付き
+        venue_options = [
+            f"{VENUE_JP[pc]}{' (終了)' if is_fin else ''}"
+            for pc, is_fin in open_pcs_with_state
+        ]
+        venue_label = st.selectbox("場を選ぶ (今日の開催場)", options=venue_options, index=0)
+        # 選択された label から pc を逆引き
+        selected_idx = venue_options.index(venue_label)
+        pc = open_pcs_with_state[selected_idx][0]
         venue = VENUE_NAMES[pc]
         target_date = jst_today()
-        st.caption(f"📅 {target_date} の開催場: {len(open_pcs)} 場 ({', '.join(VENUE_JP[p] for p in open_pcs)})")
+        n_active = sum(1 for _, fin in open_pcs_with_state if not fin)
+        n_finished = sum(1 for _, fin in open_pcs_with_state if fin)
+        cap = f"📅 {target_date} の開催場: 進行中 {n_active} / 終了 {n_finished}"
+        st.caption(cap)
     else:
         venue_label = st.selectbox(
             "場を選ぶ",
