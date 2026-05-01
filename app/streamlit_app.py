@@ -846,10 +846,12 @@ with st.sidebar:
         min_value=1.0, max_value=3.0, value=1.50, step=0.05,
         help="top1 の ev_avg_calib がこの値以上で「💎 推奨」を表示。本番運用は 1.50。",
     )
-    # cloud 版ではリプレイ機能無いので結果表示固定 (チェックボックスを出さない)
-    show_results = True if IS_CLOUD else st.checkbox(
-        "結果も表示する(リプレイなので答え合わせ)", value=True
-    )
+    # 結果表示 checkbox はリプレイ専用 (ライブでは未走 R が結果なし、
+    # 確定済 R は別ロジックで表示するため checkbox を出しても意味無し)
+    if IS_CLOUD or is_live_mode:
+        show_results = True
+    else:
+        show_results = st.checkbox("結果も表示する(リプレイなので答え合わせ)", value=True)
 
 # メインエリア
 target_ts = pd.Timestamp(target_date)
