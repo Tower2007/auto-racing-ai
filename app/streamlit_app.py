@@ -862,9 +862,9 @@ with st.sidebar:
 target_ts = pd.Timestamp(target_date)
 
 if is_live_mode:
-    # 30 秒毎の auto-rerun (キャッシュヒット時は瞬時、本当の API 取得は -5min 境界のみ)
-    from streamlit_autorefresh import st_autorefresh
-    st_autorefresh(interval=30000, key=f"live_refresh_{venue}")
+    # API 再取得イベント: R 毎に発走 (-3min, +1min, +5min) の 3 タイミング
+    REFETCH_EVENTS_MIN = [-3, 1, 5]  # 発走時刻からのオフセット (分)
+    HOT_WINDOW_MIN = 5               # この範囲に最近イベントがあれば「ホット」帯
 
     # 更新ボタン
     col_btn, col_now = st.columns([1, 4])
@@ -873,39 +873,83 @@ if is_live_mode:
             st.cache_data.clear()
             st.session_state.pop(f"refreshed_set_{target_date}_{venue}", None)
             st.rerun()
-    now = jst_now()
-    with col_now:
-        st.caption(f"⏰ 現在時刻: {now.strftime('%H:%M:%S')} ／ "
-                   f"30 秒毎に画面更新、各 R 発走 -5min 時点で API から再取得します")
 
     with st.spinner(f"autorace.jp から {target_date} {venue_label} のデータを取得中…"):
         race_start_times = fetch_race_start_times(str(target_date), pc)
         live_data = fetch_live_day(str(target_date), pc)
 
-    # ── スマート refresh: 各 R 発走 -5min を超えたら 1 度だけ cache 破棄 + rerun ──
-    refreshed_key = f"refreshed_set_{target_date}_{venue}"
-    refreshed_set: set = st.session_state.setdefault(refreshed_key, set())
+    # ── 各 R の発走時刻 → 絶対 datetime に解決 ──
     now_dt = jst_now()
     today_d = jst_today()
+    race_start_dts: dict[int, dt.datetime] = {}
     for r_no, time_str in (race_start_times or {}).items():
-        if not time_str or r_no in refreshed_set:
+        if not time_str:
             continue
         try:
             hh, mm = map(int, str(time_str).split(":"))
         except (ValueError, AttributeError):
             continue
-        race_start = dt.datetime.combine(today_d, dt.time(hh, mm))
-        # 深夜跨ぎ (今 00:30 で R12 が 23:50 開始だった等) 補正
-        if race_start < now_dt - dt.timedelta(hours=12):
-            race_start += dt.timedelta(days=1)
-        fire_at = race_start - dt.timedelta(minutes=5)
-        # 既に発走済の R は refresh しない (確定オッズに変動なし)
-        race_in_future = now_dt < race_start
-        if now_dt >= fire_at and race_in_future:
-            refreshed_set.add(r_no)
-            st.cache_data.clear()
-            st.toast(f"🔄 R{r_no} 発走 -5min: 最新データに更新中…", icon="⚡")
-            st.rerun()
+        rs = dt.datetime.combine(today_d, dt.time(hh, mm))
+        # 深夜跨ぎ補正
+        if rs < now_dt - dt.timedelta(hours=12):
+            rs += dt.timedelta(days=1)
+        race_start_dts[r_no] = rs
+
+    # ── スマート refresh: 各 R で (-3, +1, +5) min イベントを 1 度ずつ発火 ──
+    refreshed_key = f"refreshed_set_{target_date}_{venue}"
+    refreshed_set: set = st.session_state.setdefault(refreshed_key, set())
+    for r_no, race_start in race_start_dts.items():
+        for offset in REFETCH_EVENTS_MIN:
+            ev_key = (r_no, offset)
+            if ev_key in refreshed_set:
+                continue
+            ev_at = race_start + dt.timedelta(minutes=offset)
+            if now_dt >= ev_at:
+                refreshed_set.add(ev_key)
+                st.cache_data.clear()
+                label = f"-{-offset}min" if offset < 0 else f"+{offset}min"
+                st.toast(f"🔄 R{r_no} 発走 {label}: 最新データに更新中…", icon="⚡")
+                st.rerun()
+
+    # ── アダプティブ rerun 間隔: ホット帯 30s / 通常 120s / 終了後 300s ──
+    # 「ホット帯」= 直近の未発火イベントまで HOT_WINDOW_MIN 分以内 or
+    # 直前のイベントから HOT_WINDOW_MIN 分以内
+    next_event_dt: dt.datetime | None = None
+    last_event_dt: dt.datetime | None = None
+    for r_no, race_start in race_start_dt.items():
+        for offset in REFETCH_EVENTS_MIN:
+            ev_at = race_start + dt.timedelta(minutes=offset)
+            if ev_at >= now_dt:
+                if next_event_dt is None or ev_at < next_event_dt:
+                    next_event_dt = ev_at
+            else:
+                if last_event_dt is None or ev_at > last_event_dt:
+                    last_event_dt = ev_at
+
+    if next_event_dt is None:
+        # 全 R 終了 (これ以上のイベントなし)
+        rerun_interval_ms = 300_000
+        rerun_caption = "全レース終了 ／ 5 分毎に画面更新"
+    else:
+        sec_to_next = (next_event_dt - now_dt).total_seconds()
+        sec_since_last = (now_dt - last_event_dt).total_seconds() if last_event_dt else 1e9
+        is_hot = sec_to_next <= HOT_WINDOW_MIN * 60 or sec_since_last <= HOT_WINDOW_MIN * 60
+        if is_hot:
+            rerun_interval_ms = 30_000
+            rerun_caption = "ホット帯: 30 秒毎に画面更新"
+        else:
+            rerun_interval_ms = 120_000
+            rerun_caption = "2 分毎に画面更新"
+
+    from streamlit_autorefresh import st_autorefresh
+    st_autorefresh(interval=rerun_interval_ms, key=f"live_refresh_{venue}")
+
+    now = jst_now()
+    with col_now:
+        st.caption(
+            f"⏰ {now.strftime('%H:%M')} ／ {rerun_caption}、"
+            f"各 R 発走 -3 / +1 / +5 min で API 再取得"
+        )
 
     valid_races = [r for r, info in live_data.items() if info["top_cars"]]
     if not valid_races:
