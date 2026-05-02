@@ -101,8 +101,14 @@ def load_data():
     pay["race_date"] = pd.to_datetime(pay["race_date"])
 
     calib = preds[preds["test_month"] < CALIB_CUTOFF]
-    iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
-    iso.fit(calib["pred"].values, calib["target_top3"].values)
+    if calib.empty:
+        # データ retention で CALIB_CUTOFF 以前が消えた場合のフォールバック:
+        # production_calib.pkl (週次再学習で生成) を使う
+        with open(DATA / "production_calib.pkl", "rb") as f:
+            iso = pickle.load(f)
+    else:
+        iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+        iso.fit(calib["pred"].values, calib["target_top3"].values)
     preds["pred_calib"] = iso.transform(preds["pred"].values)
     return preds, odds, pay
 

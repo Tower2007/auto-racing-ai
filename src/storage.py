@@ -9,7 +9,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path("data")
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
 # CSV ファイル名 → カラム定義
 CSV_SCHEMAS: dict[str, list[str]] = {
