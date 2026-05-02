@@ -1,0 +1,5 @@
+# LightGBM のテキスト形式モデル等を Windows 環境で
+# autocrlf により壊さないようバイナリ宣言する。
+*.lgb     binary
+*.pkl     binary
+*.parquet binary
