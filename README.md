@@ -10,6 +10,16 @@
 - 主目的: データ蓄積・予想表示・ML 検証(娯楽用途)
 - ユーザー: 個人 / Windows 11 / Python 3.13
 
+## セットアップ
+
+依存は **グローバル Python に直接 install** する想定:
+
+```
+pip install -r requirements.txt
+```
+
+`dynamic_scheduler.py` が schtasks に登録するコマンドは `python daily_predict.py ...` を素で叩く形なので、グローバル Python に `pandas / numpy / lightgbm / scikit-learn / requests / streamlit` 等が入っている必要がある。venv を使う場合は `dynamic_scheduler.CMD_TEMPLATE` のパスを `.venv\Scripts\python.exe` に書き換えること。
+
 ## ステータス
 
 調査フェーズ完了(2026-04-26)。
