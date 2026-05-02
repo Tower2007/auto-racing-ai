@@ -95,7 +95,9 @@ def _build_target(results: pd.DataFrame) -> pd.DataFrame:
     df = results[CAR_KEY + ["order"]].copy()
     df["target_top3"] = ((df["order"] >= 1) & (df["order"] <= 3)).astype(int)
     df["target_win"] = (df["order"] == 1).astype(int)
-    df["finished"] = df["order"].notna().astype(int)
+    # finished = race_results に行が存在する = 結果取得済(失格・落車も含む)。
+    # parser が order>=9 を NULL 化するので order.notna() だと DQ/落車が学習から漏れる。
+    df["finished"] = 1
     return df[CAR_KEY + ["target_top3", "target_win", "finished"]]
 
 
