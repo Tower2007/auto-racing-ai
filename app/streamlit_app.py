@@ -916,7 +916,7 @@ if is_live_mode:
     # 直前のイベントから HOT_WINDOW_MIN 分以内
     next_event_dt: dt.datetime | None = None
     last_event_dt: dt.datetime | None = None
-    for r_no, race_start in race_start_dt.items():
+    for r_no, race_start in race_start_dts.items():
         for offset in REFETCH_EVENTS_MIN:
             ev_at = race_start + dt.timedelta(minutes=offset)
             if ev_at >= now_dt:
