@@ -1,5 +1,21 @@
 # auto-racing-ai 運用ガイド
 
+## AI 協働体制 (2026-04-30 導入)
+
+複数 AI で意見を出し合って改善していく方針。詳細は各ガイド:
+- `AGENTS.md` — Codex 用(分析・代替案、`Opinion/` のみ編集可、常任)
+- `GEMINI.md` — Gemini 用(大局観・第三者レビュー、`Opinion/` のみ編集可、スポット)
+- `Opinion/README.md` — 意見ファイル運用ルール
+- 意見ログ: `Opinion/{ClaudeFeedback,CodexOpinion,GeminiOpinion}.md`
+
+Claude(自分)は実装本体・コード編集・git 操作を担当。他 AI の意見はユーザーが
+明示的に「○○の意見も読んで」と指示した時だけ参照する。
+
+姉妹プロジェクト keiba / boat-racing-ai と同じ枠組み。boat とは EV 戦略の往復実績あり
+(`Boat_racing_AI/HANDOFF_FROM_AUTORACE.md` 経由)。
+
+---
+
 ## プロジェクト概要
 
 オートレース（autorace.jp）のデータ蓄積・可視化・ML検証アプリ。
