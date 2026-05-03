@@ -2,7 +2,8 @@
 
 最終更新: 2026-04-30(Codex audit 反映)
 
-walk-forward LightGBM 予測を使って「期待値ベースで複勝を選別すれば ROI > 100% にできるか」を 5 段階で検証した記録。**結論: closing odds backtest では真のエッジ約 +5%(thr=1.00 ベース)〜 +30%(thr=1.45)が観測されたが、実発火時オッズに切り替えると ROI は 132% → 67% へ大暴落することが判明(2026-04-30 Codex audit + odds_snapshot_eval で確認)。「真の edge の証拠」と断言できる段階ではない。**
+walk-forward LightGBM 予測を使って「期待値ベースで複勝を選別すれば ROI > 100% にできるか」を 5 段階で検証した記録。
+**結論: closing odds backtest では複勝 top-1 に robust な edge が観測された(cutoff 2024-01〜06 を全て試しても thr=1.50 近傍の月次全勝が崩れない)。ただし実発火 odds で測ると ROI 132% → 67% に転落するため、「真の edge」と断定できる段階ではない。live / paper 検証待ち(2026-04-30 Codex audit + odds_snapshot_eval で確認)。**
 
 ## ⚠️ Closing odds 問題(2026-04-30 追加・最重要)
 
@@ -68,8 +69,10 @@ EV の 119.5% は 3 要因の積み重ね:
 
 ### Step 5: 校正 + ev_avg ベースで再評価
 - isotonic regression で pred を校正(前半 24ヶ月 fit、後半 25ヶ月評価)
-- ev_avg(min/max 中央値)で payout 推定を honest 化
-- → **真の ROI 104.7%**(thr=1.00、top-1 限定、25ヶ月 7,546 ベット)
+- ev_avg(min/max 中央値)で **ev_min より過度な保守バイアスを緩和**
+  - ただし hit 時の `realized_odds / odds_avg` は中央値 0.692 / 平均 0.751 で、
+    ev_avg を実払戻の honest proxy と断定するのは強い(2026-04-30 Codex audit 確認)
+- → **closing odds backtest ROI 104.7%**(thr=1.00、top-1 限定、25ヶ月 7,546 ベット)
 - 校正自体の効果は限定的(time-shift が原因と推定)
 
 ## 真の戦略仕様
@@ -185,9 +188,14 @@ Codex 提案: 「本番 baseline 維持 + 山陽 rf3 を将来再検討の対象
 
 1. **baseline は closing odds backtest で異常な安定性**: 25 ヶ月全月プラス、最悪月 +¥430、累計 DD ¥0
    (複勝 top-1 EV ≥ 1.45 の closing odds backtest で広く薄い edge が観測される。
-   ただし「真の edge の証拠」と断言するには発火時 odds での再現確認が必要 — 上の
-   ⚠️ Closing odds 問題セクション参照)
-2. **3連系は上振れ依存度が極端**: ex_iizuka_full は top 3 ヶ月 (2025-05/-11/-12) で
+   閾値は eval 期間の sweep で選ばれているため「真の edge」と断定せず live / paper
+   検証待ち — ⚠️ Closing odds 問題セクション参照)
+2. **採用理由の主語**: 「baseline の 25/25 が真の edge の証拠だから」ではなく、
+   **「baseline は stakes が単純で下振れ耐性が高く、live / paper 検証で崩れた時に
+   原因分解しやすいから」**。3連系は過去 backtest の利益額こそ大きいが、外れ値依存・
+   月次赤字・券種別 drift の検証負荷が大きく、closing odds 問題が解決するまでは
+   切り分けが難しい(2026-04-30 Codex audit 反映)
+3. **3連系は上振れ依存度が極端**: ex_iizuka_full は top 3 ヶ月 (2025-05/-11/-12) で
    ¥+171,690 を稼ぎ、残り 22 ヶ月の利益はわずか ¥+32,780。月平均 +¥1,490
 3. **過去再現性が低い**: 549.4% / 394.9% / 291.2% という単月 ROI は外れ値であり、
    次の 25 ヶ月で同等の大当たりが来る保証はない。3連系のサンプル数が薄いため

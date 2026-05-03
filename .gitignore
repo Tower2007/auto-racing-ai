@@ -24,6 +24,10 @@ data/*
 logs/
 *.log
 
+# Codex / 各 AI の作業中 temp ディレクトリ
+Opinion/tmp_*/
+Opinion/.venv/
+
 # Investigation artifacts (HTML/JS dumps from initial URL structure probe)
 *_raw.html
 *_sample.html
