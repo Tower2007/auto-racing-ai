@@ -10,6 +10,8 @@
 
 **closing odds backtest の edge は想定より頑丈。ただし live 発火時 odds では未確認なので、「真の edge」断定はまだ早い。**
 
+追記: その後コード監査で `scripts/odds_snapshot_eval.py` に未確定レースを 0 払戻として混ぜるバグを確認。`ROI 67.0%` は過小評価で、確定済レースだけなら同じ snapshot 期間の pred-top1 EV>=1.50 は n=13、ROI=103.1%。詳細は `Opinion/baseline_audit/2026-05-04_code_bug_review.md`。
+
 ### 実データ検証の要点
 
 `.venv` を作り、`requirements.txt` の pandas / pyarrow / scikit-learn を入れて parquet を直接読んだ。`walkforward_predictions_morning_top3.parquet` は 2022-04〜2026-04 の 49 `test_month`、217,578 rows。

@@ -87,12 +87,13 @@ def main():
     print(f"  発火 R 数: {n_races}, 行数: {len(snap)} (全 8 車含む)")
     print()
 
-    # 1. fns 確定済の R に絞る
-    snap_with_pay = snap.merge(fns, on=RACE_KEY + ["car_no"], how="left")
-    has_pay = snap_with_pay.dropna(subset=["payout"])
-    n_pay_races = has_pay.groupby(RACE_KEY).ngroups
-    snap_with_pay["payout"] = snap_with_pay["payout"].fillna(0).astype(int)
-    snap_with_pay["hit"] = (snap_with_pay["payout"] > 0).astype(int)
+    # 1. 確定済レースを判定 (fns に行が存在する race を「確定」とみなす)
+    #    Codex audit (2026-05-04 P1) を反映: 旧ロジックは未確定レースを 0 払戻として
+    #    eval_df に残しており、ROI が大幅に過小評価されていた。
+    #    confirmed_keys は snap に登場する race のみを対象にする (全 fns ではない)。
+    snap_keys = snap[RACE_KEY].drop_duplicates()
+    confirmed_keys = fns.merge(snap_keys, on=RACE_KEY, how="inner")[RACE_KEY].drop_duplicates()
+    n_pay_races = len(confirmed_keys)
     print(f"  fns 確定済 R 数: {n_pay_races} / 全 {n_races} R "
           f"({n_pay_races/n_races*100:.0f}%, 残りは未走 or 払戻未取り込み)")
     print()
@@ -101,9 +102,11 @@ def main():
         print("[info] 確定済 R が 0 — 解析できません。daily_ingest が走った後に再実行。")
         return
 
-    # 2. 戦略別 picks 抽出
-    eval_df = snap_with_pay.dropna(subset=["payout"]).copy()
-    eval_df["payout"] = eval_df["payout"].astype(int)
+    # 2. 確定済 race に snap を絞り込んでから fns と join、非的中車だけ 0 払戻
+    eval_df = snap.merge(confirmed_keys, on=RACE_KEY, how="inner").copy()
+    eval_df = eval_df.merge(fns, on=RACE_KEY + ["car_no"], how="left")
+    eval_df["payout"] = eval_df["payout"].fillna(0).astype(int)
+    eval_df["hit"] = (eval_df["payout"] > 0).astype(int)
 
     print(f"=== 発火時 EV>={args.thr} 信号の実成績 (n_races={n_pay_races}) ===")
     # pred-top1 + EV>=thr (現本番戦略)

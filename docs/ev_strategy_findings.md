@@ -3,32 +3,39 @@
 最終更新: 2026-04-30(Codex audit 反映)
 
 walk-forward LightGBM 予測を使って「期待値ベースで複勝を選別すれば ROI > 100% にできるか」を 5 段階で検証した記録。
-**結論: closing odds backtest では複勝 top-1 に robust な edge が観測された(cutoff 2024-01〜06 を全て試しても thr=1.50 近傍の月次全勝が崩れない)。ただし実発火 odds で測ると ROI 132% → 67% に転落するため、「真の edge」と断定できる段階ではない。live / paper 検証待ち(2026-04-30 Codex audit + odds_snapshot_eval で確認)。**
+**結論: closing odds backtest では複勝 top-1 に robust な edge が観測された(cutoff 2024-01〜06 を全て試しても thr=1.50 近傍の月次全勝が崩れない)。実発火 odds で測ると ROI 132% → ~105%(2026-05-04 時点 n=16 と小標本)で完全な「崩壊」ではないが、closing odds backtest 数字を実運用期待値に置くのは依然危険。live / paper 検証の蓄積待ち(2026-04-30 Codex audit + 2026-05-04 P1 バグ修正後の odds_snapshot_eval で確認)。**
 
-## ⚠️ Closing odds 問題(2026-04-30 追加・最重要)
+## ⚠️ Closing odds 問題(2026-04-30 追加 / 2026-05-04 P1 バグ修正反映)
 
 本 doc 全体の数字は **closing odds (= 後日 API で取得した最終オッズ) backtest** に基づく。
-実発火 5 分前のスナップショット(`data/odds_snapshots.csv`)で測定すると以下のように乖離:
+実発火 5 分前のスナップショット(`data/odds_snapshots.csv`)で測定すると乖離あり:
 
-| 指標 | closing backtest | 発火時 snap (n=20) |
+| 指標 | closing backtest (25mo) | 発火時 snap (2026-05-04 時点、61R 確定済 / 全 79R) |
 |---|---:|---:|
-| pred-top1 EV≥1.50 ROI | **132.5%** | **67.0%** |
-| pred-top1 EV≥1.50 hit | 65.3% | 45.0% |
+| pred-top1 EV≥1.50 ROI | **132.5%** | **105.0% (n=16)** |
+| pred-top1 EV≥1.50 hit | 65.3% | 75.0% |
 | snap EV≥1.5 が close でも EV≥1.5 維持率 | - | 30.8% |
 | snap EV → close EV drift 平均 | - | -0.503 |
 
-つまり「発火時に EV≥1.50 で買おうとした 13 件のうち、close 時点で EV≥1.50 を保つのは 4 件のみ」「backtest の ROI 132.5% は実発火基準では 67% に転落」。
+⚠️ 初期版 doc の「ROI 67%」「ROI 132% → 67% に転落」は `scripts/odds_snapshot_eval.py`
+の P1 バグ(未確定レースを 0 払戻として混入)による過小評価。Codex の 2026-05-04
+コード監査で発見・修正済。バグ修正後の正しい数字は上表の通り。
 
-加えて `realized_payout / odds_avg` は中央値 0.69(平均 0.75)で、**backtest は odds_avg で 25-30% 過大評価**していた可能性が高い。
+加えて `realized_payout / odds_avg` は中央値 0.69(平均 0.75)で、`ev_avg` を
+honest proxy と断定するのはまだ強い(odds_avg の 25-30% は実払戻に届かない hit case)。
 
 **示唆**:
-- 本 doc の以下の数字はすべて「closing odds backtest ROI」と読み替えるべき
-- 実運用では **odds_snapshots.csv ベース**の発火時 EV を信頼する(daily_predict.py は既にそうなっている)
-- backtest ROI 130% を実利益の前提に置くのは危険。snap データの蓄積を待つ
-- 関連: `scripts/odds_snapshot_eval.py` / Codex audit (`Opinion/CodexOpinion.md` 2026-04-30 エントリ)
+- 本 doc の数字は依然「closing odds backtest ROI」と読み替える(実発火と乖離あり)
+- 実発火 odds の方が ROI は **30pt 程度低い**(132% → 105%)= drift の影響は実在
+- ただし「崩壊」ではない: live でも 100% 超を維持(n=16 と小標本だが)
+- **実運用では daily_predict.py が発火時 odds で動くので、期待値は backtest 132% より
+  低めの 100-110% 程度を見込むべき**
+- 関連: `scripts/odds_snapshot_eval.py`、`Opinion/CodexOpinion.md` (2026-04-30 / 05-04
+  エントリ)、`Opinion/baseline_audit/2026-05-04_code_bug_review.md`
 
 cutoff 感度分析(2024-01〜06、4 thr スイープ)では月勝率は cutoff invariant で安定。
-selection bias は二次的、主犯は closing odds drift(Codex 観点 A・D)。
+selection bias は二次的、closing odds drift(観点 A・D)が主因の 1 つだが、
+バグ修正後の live 数字を見ると「崩壊」というほどの drift ではない。
 詳細: `Opinion/baseline_audit/proposal_cutoff_sensitivity.py`
 
 ---
