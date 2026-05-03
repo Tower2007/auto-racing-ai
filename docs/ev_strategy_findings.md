@@ -5,6 +5,20 @@
 walk-forward LightGBM 予測を使って「期待値ベースで複勝を選別すれば ROI > 100% にできるか」を 5 段階で検証した記録。
 **結論: closing odds backtest では複勝 top-1 に robust な edge が観測された(cutoff 2024-01〜06 を全て試しても thr=1.50 近傍の月次全勝が崩れない)。実発火 odds で測ると ROI 132% → ~105%(2026-05-04 時点 n=16 と小標本)で完全な「崩壊」ではないが、closing odds backtest 数字を実運用期待値に置くのは依然危険。live / paper 検証の蓄積待ち(2026-04-30 Codex audit + 2026-05-04 P1 バグ修正後の odds_snapshot_eval で確認)。**
 
+## 期待値の再定義「情報の鮮度料」フレーム(2026-05-04 Gemini oversight 反映)
+
+backtest 132.5% と live 発火時 snap 105.0% の 27.5pt 差は **「崩壊」ではなく
+「情報の鮮度料(コスト)」** と捉える(Gemini oversight review 2026-05-04)。
+
+- closing odds は市場が情報を最も織り込んだ最終点 = 効率値
+- 発火時 odds(約 5 分前)は織り込みが甘い時点 = まだ非効率の余地あり
+- 実発火 odds で測ると ROI は下がる。これは drift というより
+  **「鮮度の差」を市場効率化が回収するコスト**
+- backtest 132.5% は **理論的最大値**、105.0% は **現時点の実効値**
+- 今後の戦略評価は実効値 ~105% をベースにする(132% は前提に置かない)
+
+---
+
 ## ⚠️ Closing odds 問題(2026-04-30 追加 / 2026-05-04 P1 バグ修正反映)
 
 本 doc 全体の数字は **closing odds (= 後日 API で取得した最終オッズ) backtest** に基づく。
@@ -37,6 +51,34 @@ cutoff 感度分析(2024-01〜06、4 thr スイープ)では月勝率は cutoff 
 selection bias は二次的、closing odds drift(観点 A・D)が主因の 1 つだが、
 バグ修正後の live 数字を見ると「崩壊」というほどの drift ではない。
 詳細: `Opinion/baseline_audit/proposal_cutoff_sensitivity.py`
+
+## 🛑 Phase A 停止基準(2026-05-04 Gemini oversight 反映)
+
+サンクコストに配慮しない、感情を排除した停止条件を以下 3 つ設定:
+
+| 停止条件 | 閾値 | 評価周期 |
+|---|---|---|
+| **累積 ROI 停止** | 直近 50 picks(`daily_predict_picks.csv` の確定済)で ROI < 90% | picks_audit 月次 |
+| **連敗 / DD 停止** | 過去最大 DD(backtest 上の最悪月損益相当)を 20% 更新 | picks_audit 月次 |
+| **市場効率化停止** | `live_EV` < `close_EV` 逆転、または drift 平均が -1.0pt 以下を 1 ヶ月継続 | odds_snapshot_eval 週次 |
+
+いずれかが発動したら **Phase A 運用を停止** し、原因切り分けに入る:
+- (i) モデル劣化(再訓練で復旧?)
+- (ii) 市場効率化(edge 喪失で撤退判断)
+- (iii) 一時的ノイズ(様子見継続判断)
+
+実装は `picks_audit.py` の拡張で対応予定(週次レポートに警告フラグを追加)。
+当初は仕様だけ docs に明記、実装は live n が 50 を超えた時点で起動。
+
+## 🌐 長期リスク: 市場効率化のジレンマ(2026-05-04 Gemini oversight 反映)
+
+「auto は市場が薄いから edge が残る」という前提に立っているが、
+**AI 予想自体が市場参加者** である以上、横流通で edge は消える可能性あり:
+
+- auto / boat / keiba の AI が同じ EV-based 手法を取れば、共通の選別が市場を歪め edge を食い合う
+- 現状 auto-racing-ai は private repo + 個人運用なので外部流通の余地は薄い
+- ただし手法を公開した時点や、姉妹プロジェクト経由で類似手法が広がれば edge 喪失加速
+- 上記「市場効率化停止」基準で機械的に検出可能
 
 ---
 
