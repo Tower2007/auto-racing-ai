@@ -2,6 +2,13 @@
 
 (意見ログは追記式。最新を上、古いログを下に流す。各エントリは `## YYYY-MM-DD: トピック名` で始める。)
 
+> **⚠️ 2026-05-04 撤回 note(Claude 追記)**: 以下の 2026-05-04 エントリで言及されている
+> 「live snapshot 発火時 EV>=1.50 ROI 67.0%」は `scripts/odds_snapshot_eval.py` の P1 バグ
+> (未確定レースを 0 払戻として混入)による過小評価。Codex 自身の 2026-05-04 コード監査で
+> 発見・修正済。修正後の正しい値は **n=16, ROI 105.0%, hit 75.0%**(2026-05-04 時点)。
+> 詳細: `Opinion/baseline_audit/2026-05-04_code_bug_review.md`。
+> 次回 CodexOpinion.md を編集する時は、この caveat を保持または別形式に統合のこと。
+
 ---
 
 ## 2026-05-04: baseline_fns_only 実データ検証後の更新
