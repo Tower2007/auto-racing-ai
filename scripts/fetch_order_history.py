@@ -8,11 +8,17 @@
     python scripts/fetch_order_history.py --since 7d
         # 直近 7 日 (= today-7 〜 today)
 
-事前準備:
+cookie ソース (--cookie-source):
+    firefox (default): Firefox の cookie store から autorace.jp 用 cookie を直接取得
+                       → Firefox に vote.autorace.jp ログインしっぱなしで永続動作
+    chrome / edge:     Chromium 系。ただし v127+ AppBound 暗号化で `browser_cookie3` が
+                       読めないケース有 (Windows)。Firefox 推奨。
+    env:               .env.vote の VOTE_AUTORACE_COOKIE を使用 (旧方式、cookie 期限あり)
+
+事前準備 (env 方式の場合のみ):
     .env.vote に VOTE_AUTORACE_COOKIE=... を設定。
     取得方法: vote.autorace.jp ログイン後、F12 → Network → api.autorace.jp/graphql
               → Request Headers → Cookie 値を全部コピー。
-              cookie 期限切れ時はエラーで気付くので再ログインして更新。
 
 API 仕様:
     POST https://api.autorace.jp/graphql
@@ -99,7 +105,7 @@ query ($openDay: ISO8601Date, $velCode: String, $raceNum: Int, $page: Int, $per:
 """
 
 
-def load_cookie() -> str:
+def load_cookie_from_env() -> str:
     """`.env.vote` から VOTE_AUTORACE_COOKIE 値を取得。"""
     if not ENV_VOTE.exists():
         sys.exit(f"error: {ENV_VOTE} が無い。README 参照して cookie 設定してください。")
@@ -108,6 +114,45 @@ def load_cookie() -> str:
         if line.startswith("VOTE_AUTORACE_COOKIE="):
             return line.split("=", 1)[1]
     sys.exit("error: VOTE_AUTORACE_COOKIE が .env.vote に無い")
+
+
+def load_cookie_from_browser(browser: str) -> str:
+    """Chrome/Firefox/Edge の cookie store から autorace.jp ドメインの cookie を取得。"""
+    try:
+        import browser_cookie3
+    except ImportError:
+        sys.exit("error: browser_cookie3 が未インストール。\n"
+                 "  pip install browser_cookie3")
+    fn_map = {
+        "chrome": browser_cookie3.chrome,
+        "firefox": browser_cookie3.firefox,
+        "edge": browser_cookie3.edge,
+    }
+    if browser not in fn_map:
+        sys.exit(f"error: 未対応の cookie source: {browser}")
+    try:
+        cj = fn_map[browser](domain_name="autorace.jp")
+    except Exception as e:
+        sys.exit(
+            f"error: {browser} cookie 読み取り失敗: {e}\n"
+            f"ヒント: {browser} 起動中は cookie DB がロックされる場合あり。\n"
+            f"        ブラウザを完全終了してから再実行してください。"
+        )
+    pairs = [f"{c.name}={c.value}" for c in cj
+             if "autorace.jp" in (c.domain or "")]
+    if not pairs:
+        sys.exit(
+            f"error: {browser} に autorace.jp の cookie が見つからない。\n"
+            f"vote.autorace.jp にブラウザでログインしてから再実行してください。"
+        )
+    return "; ".join(pairs)
+
+
+def load_cookie(source: str) -> str:
+    """cookie 取得先を切り替え。"""
+    if source == "env":
+        return load_cookie_from_env()
+    return load_cookie_from_browser(source)
 
 
 def post_graphql(cookie: str, query: str, variables: dict) -> dict:
@@ -279,6 +324,9 @@ def main() -> None:
                    help="券種別 pack 詳細も取得 (各 R 1 リクエスト追加)")
     p.add_argument("--summary-csv", type=Path, default=DEFAULT_SUMMARY_CSV)
     p.add_argument("--detail-csv", type=Path, default=DEFAULT_DETAIL_CSV)
+    p.add_argument("--cookie-source", default="firefox",
+                   choices=["chrome", "firefox", "edge", "env"],
+                   help="cookie 取得先 (default: firefox。Chrome は v127+ AppBound 暗号化で読めない)")
     args = p.parse_args()
 
     if args.since:
@@ -292,8 +340,9 @@ def main() -> None:
         from_date = args.from_date
         to_date = args.to_date
 
-    print(f"取得期間: {from_date} 〜 {to_date}", file=sys.stderr)
-    cookie = load_cookie()
+    print(f"取得期間: {from_date} 〜 {to_date} (cookie source: {args.cookie_source})",
+          file=sys.stderr)
+    cookie = load_cookie(args.cookie_source)
 
     print("[1] サマリ取得 ...", file=sys.stderr)
     summaries = fetch_all_summaries(cookie, from_date, to_date)

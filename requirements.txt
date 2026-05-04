@@ -12,3 +12,6 @@ tabulate>=0.9
 # Live prediction app
 streamlit>=1.30
 streamlit-autorefresh>=1.0
+
+# Vote history (browser cookie source)
+browser_cookie3>=0.20
