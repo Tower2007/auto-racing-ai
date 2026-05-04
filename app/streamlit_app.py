@@ -909,8 +909,20 @@ if is_live_mode:
         race_start_dts[r_no] = rs
 
     # ── スマート refresh: 各 R で (-3, +1, +5) min イベントを 1 度ずつ発火 ──
+    # 初回ロード時に過去イベントを大量に発火させて無限 fetch ループしないよう、
+    # session_state 未初期化時は「現時点までの過去イベントを全て発火済」扱いにする
+    # (今 fetch したデータが最新の状態を反映しているため再 fetch は不要)。
     refreshed_key = f"refreshed_set_{target_date}_{venue}"
-    refreshed_set: set = st.session_state.setdefault(refreshed_key, set())
+    if refreshed_key not in st.session_state:
+        initial: set = set()
+        for r_no, race_start in race_start_dts.items():
+            for offset in REFETCH_EVENTS_MIN:
+                ev_at = race_start + dt.timedelta(minutes=offset)
+                if now_dt >= ev_at:
+                    initial.add((r_no, offset))
+        st.session_state[refreshed_key] = initial
+    refreshed_set: set = st.session_state[refreshed_key]
+
     for r_no, race_start in race_start_dts.items():
         for offset in REFETCH_EVENTS_MIN:
             ev_key = (r_no, offset)
