@@ -51,15 +51,18 @@ VEL_CODE_MAP: dict[str, tuple[int, str]] = {
     "006": (6, "sanyou"),
 }
 
-# betType (GraphQL enum) → 日本語ラベル + 短縮名 (CSV 用)
+# betType (GraphQL enum) → (日本語ラベル, 短縮コード)。
+# 短縮コードは autorace.jp 公式 API (data/payouts.csv) と統一。
+# 確認済: FUKUSHOU / SANRENTAN / SANRENFUKU
+# 未確認 (推定): TANSHOU / NISHARENPUKU / NISHARENTAN / WIDE
 BET_TYPE_MAP: dict[str, tuple[str, str]] = {
-    "TANSHOU":   ("単勝", "rtw"),
-    "FUKUSHOU":  ("複勝", "rfw"),
-    "RENPUKU2":  ("二車連", "rt2"),  # 推定
-    "RENTAN2":   ("二車単", "rf2"),  # 推定
-    "WIDE":      ("ワイド", "wid"),
-    "RENPUKU3":  ("三連複", "rf3"),  # 推定
-    "RENTAN3":   ("三連単", "rt3"),  # 推定
+    "TANSHOU":      ("単勝",   "tns"),
+    "FUKUSHOU":     ("複勝",   "fns"),
+    "NISHARENPUKU": ("二車連", "rfw"),  # 推定 (autorace 公式: 二車連=rfw)
+    "NISHARENTAN":  ("二車単", "rtw"),  # 推定 (autorace 公式: 二車単=rtw)
+    "WIDE":         ("ワイド", "wid"),
+    "SANRENFUKU":   ("三連複", "rf3"),
+    "SANRENTAN":    ("三連単", "rt3"),
 }
 
 # GraphQL queries (HAR から抽出した本番クエリそのまま)
@@ -187,8 +190,13 @@ def summaries_to_rows(summaries: list[dict]) -> list[dict]:
             continue
         place_code, place_name = VEL_CODE_MAP[vel]
         bet = int(s.get("spentCash", 0)) + int(s.get("spentPoints", 0))
-        refund = int(s.get("hitAmount", 0)) + int(s.get("henkanCash", 0)) \
+        # refund = 的中払戻 + 返金 (失格・取消) + 特払い
+        refund = (
+            int(s.get("hitAmount", 0))
+            + int(s.get("henkanCash", 0))
             + int(s.get("henkanPoints", 0))
+            + int(s.get("tokubaraiAmount", 0))
+        )
         rows.append({
             "date": s["openDay"],
             "place_code": place_code,
