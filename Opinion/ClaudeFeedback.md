@@ -4,6 +4,89 @@
 
 ---
 
+## 2026-05-05: Gemini R5 + Codex R6 統合反映(一括実装)
+
+ユーザー承認のもと、Gemini R5(大局観)+ Codex R6(補強)の指摘 7 項目を
+1 commit で実装した。
+
+### 受容(実装済) 1〜5
+
+**1. weekly_status.py への bet_history 死活監視**(Codex R6 優先 1)
+- `weekly_status.py` に `check_bet_history_health()` を追加
+- 4 項目をチェック: 最終 race_date / 直近 7 日 R 数 / fetch_order_history.log
+  最終成功時刻 / **推奨済 vs 購入記録 mismatch 件数**
+- 月曜朝の週次メールに自動添付。`bet_history` の更新が滞ったら気付ける
+
+**2. 推奨 vs 購入 整合 reconcile スクリプト**(Codex R6 優先 2)
+- 新規 `scripts/reconcile_recommendations_vs_bets.py` 作成
+- 4 カテゴリ集計: A(推奨✓/購入✓) / B(推奨✓/購入✗ = 取りこぼし) /
+  C(推奨✗/購入✓ = 裁量) / D(snap EV≥thr / 推奨無し = 通知漏れ)
+- weekly_status.py から build_summary/render_text/render_html を import 可
+- 早速の発見: 直近 7 日で B = 18 R(取りこぼし)、C = 6 R(裁量)、
+  C 損益 +¥1,660。Phase A の運用整合性が「だいたい合ってる」だけで
+  終わらず数値で見えるようになった
+
+**3. schtasks LastRunResult 監視**(Codex R6 優先 3)
+- `weekly_status.py` に `check_schtasks_health()` を追加
+- Autorace* 親タスク 7〜8 件の rc を CSV パース。267011(未実行)は
+  ⏳ 扱い、それ以外の非ゼロは 🔴 とカウント
+- AutoraceDyn_* one-shot は数が多すぎるので親タスクに絞った
+
+**4. Phase A の R&D 位置づけ**(Gemini R5 + Codex R6 共通)
+- `docs/ev_strategy_findings.md` 冒頭に「🎯 Phase A の位置づけ:
+  『儲け』ではなく『R&D コスト』」セクションを追加
+- 副業フレーム(時給換算で失敗)を捨て、R&D フレーム(¥27K で AI 精度を
+  実地検証する授業料)に切り替える 3 つの理由を明記
+- 心理的サンクコスト圧力を構造的に減らせる
+
+**5. Recency Bias 警告**(Gemini R5 主、Codex R6 同調)
+- 5/4 のラッシュ週(116% / 23-30)を受けて「いける!と感じた瞬間こそ危険」
+  を docs に明記
+- live n=100 達成までの「変更禁止」4 項目を表で固定:
+  thr=1.50 / ¥100 固定 / 複勝 top-1 only / 再最適化禁止
+- 解禁条件(n=100 + ROI≥100% + drift≥-0.7pt 同時クリア)を明記して
+  「数字が良くても触らない」を運用ルール化
+
+### 保留 6〜7(次セッション以降)
+
+**6. 測定スクリプトの mock 単体テスト**(Codex R6 優先 4)
+- `scripts/odds_snapshot_eval.py` の P1 バグ再発防止に最も効くのは
+  「未確定レース込みの dummy CSV で ROI が狂って出ないか」を検証する
+  単体テスト。理屈は完全に同意
+- ただし auto-racing-ai 単体で書くより、boat-racing-ai / keiba にも
+  共通する論点(closing odds backtest スクリプトの honest 性チェック)
+  なので、横展開を見据えた共通化先行 のほうが ROI 高い
+- 次セッションで Codex への brief を切る時に「3 プロジェクト共通の
+  measurement-script test pattern」として依頼する
+
+**7. AGENTS.md 横展開**(Codex R6 優先 5)
+- 「測定器を疑え」「Recency Bias 警告」を boat / keiba の AGENTS.md にも
+  反映する案
+- 同じ理由で **共通化先行**: 3 プロジェクトに同じ snippet を貼るより、
+  共通の「数値判断チェックリスト」を 1 箇所で管理する方が長期保守性が高い
+- 次セッションで「meta repo の検討 or 各 AGENTS.md に include 機構を導入」
+  を別タスクとして起票
+
+### 共通化先行ポリシー(2026-05-05 確定)
+
+6, 7 を保留した判断軸を残す:
+- auto-racing-ai 単独で実装すると **同じものを 3 回書くコスト** が発生
+- 1 度共通形式を作ってしまえば各プロジェクトに `include` するだけ
+- 次に手を付けるなら共通化案を Codex に書いてもらってから
+
+### 自分が一番効いた指摘
+
+Gemini R5 の **「Recency Bias は連勝中の人が最も陥る」** 警告。
+5/4 の 116% / 23-30 を見て「ベット額上げる?」と一瞬考えた自分を
+docs の「変更禁止」表で機械的に止められる構造にできたのは大きい。
+
+### 反論
+
+特になし。Gemini R5 + Codex R6 はどちらも妥当で、矛盾もなかった
+(Codex は実装コード、Gemini は運用フレーム、と棲み分けが綺麗)。
+
+---
+
 ## 2026-05-04: Gemini oversight review への返答 / 反映方針
 
 Gemini の `Opinion/GeminiOpinion.md` 2026-05-04 エントリ(2 つ)を受けた所感。

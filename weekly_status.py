@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -137,6 +138,250 @@ def extract_errors(log_lines: list[str]) -> list[str]:
         if m and int(m.group(1)) > 0:
             out.append(l)
     return out
+
+
+def check_bet_history_health(days: int = 7) -> dict:
+    """bet_history 死活監視(Codex R6 提案)。
+
+    4 項目を返す:
+      - last_date: bet_history.csv の最新 race_date
+      - recent_r_count: 直近 N 日に bet_history へ記録された R 数
+      - log_last_success: fetch_order_history.log の最終 END exit=0 時刻
+      - missing_picks: 直近 N 日で daily_predict_picks にあるが
+        bet_history に対応行が無い (date, place_code, race_no) の件数
+        (= 推奨が出たのに購入記録が無いケース、取りこぼし監視)
+    """
+    out: dict = {
+        "last_date": None,
+        "recent_r_count": 0,
+        "log_last_success": None,
+        "missing_picks": 0,
+        "missing_picks_details": [],
+        "warnings": [],
+    }
+
+    bh_p = DATA / "bet_history.csv"
+    if bh_p.exists() and bh_p.stat().st_size > 0:
+        bh = pd.read_csv(bh_p)
+        if not bh.empty and "date" in bh.columns:
+            bh["date"] = pd.to_datetime(bh["date"], errors="coerce")
+            bh = bh.dropna(subset=["date"])
+            if not bh.empty:
+                out["last_date"] = bh["date"].max().date().isoformat()
+                cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=days)
+                recent = bh[bh["date"] >= cutoff]
+                out["recent_r_count"] = int(len(recent))
+    else:
+        out["warnings"].append("bet_history.csv が無い")
+
+    log_p = DATA / "fetch_order_history.log"
+    if log_p.exists():
+        try:
+            with open(log_p, "r", encoding="utf-8", errors="replace") as f:
+                tail = f.readlines()[-200:]
+            for line in reversed(tail):
+                m = re.search(r"=== (\S+) END exit=0 ===", line)
+                if m:
+                    out["log_last_success"] = m.group(1)
+                    break
+        except Exception as e:
+            out["warnings"].append(f"fetch_order_history.log 読込失敗: {e}")
+    else:
+        out["warnings"].append("fetch_order_history.log が無い")
+
+    # 推奨 vs 購入: picks にあって bet_history に無い件数
+    picks_p = DATA / "daily_predict_picks.csv"
+    if picks_p.exists() and picks_p.stat().st_size > 0 and bh_p.exists():
+        try:
+            picks = pd.read_csv(picks_p)
+            picks["race_date"] = pd.to_datetime(picks["race_date"], errors="coerce")
+            picks = picks.dropna(subset=["race_date"])
+            cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=days)
+            picks = picks[picks["race_date"] >= cutoff]
+            if not picks.empty:
+                bh_local = pd.read_csv(bh_p)
+                bh_local["date"] = pd.to_datetime(bh_local["date"], errors="coerce")
+                bh_keys = set(
+                    zip(
+                        bh_local["date"].dt.date.astype(str),
+                        bh_local["place_code"].astype(int),
+                        bh_local["race_no"].astype(int),
+                    )
+                )
+                pick_keys = picks[["race_date", "place_code", "race_no"]].drop_duplicates()
+                # has_result = race_results にデータあり(= 当日が過ぎている)
+                res_p = DATA / "race_results.csv"
+                if res_p.exists():
+                    res = pd.read_csv(res_p, usecols=["race_date", "place_code"]).drop_duplicates()
+                    res["race_date"] = pd.to_datetime(res["race_date"])
+                    res_set = set(zip(res["race_date"].dt.date, res["place_code"].astype(int)))
+                else:
+                    res_set = set()
+                missing = []
+                for _, row in pick_keys.iterrows():
+                    d = row["race_date"].date()
+                    pc = int(row["place_code"])
+                    rn = int(row["race_no"])
+                    # 結果未確定の R は判定保留
+                    if (d, pc) not in res_set:
+                        continue
+                    if (d.isoformat(), pc, rn) not in bh_keys:
+                        missing.append((d.isoformat(), pc, rn))
+                out["missing_picks"] = len(missing)
+                out["missing_picks_details"] = missing[:10]
+        except Exception as e:
+            out["warnings"].append(f"missing picks 計算失敗: {e}")
+
+    return out
+
+
+def check_schtasks_health() -> dict:
+    """schtasks LastRunResult 監視(Codex R6 提案)。
+
+    Autorace* タスクの最終実行結果を取得し、0 以外を異常として返す。
+    Windows 環境のみ動作、それ以外では空 dict を返す。
+    """
+    out: dict = {"tasks": [], "ng_count": 0, "warnings": []}
+    if sys.platform != "win32":
+        return out
+    try:
+        # /v 詳細表示 + /fo CSV で機械可読化
+        proc = subprocess.run(
+            ["schtasks", "/query", "/fo", "CSV", "/v"],
+            capture_output=True, text=True, timeout=30,
+            encoding="cp932", errors="replace",
+        )
+        if proc.returncode != 0:
+            out["warnings"].append(f"schtasks 失敗 rc={proc.returncode}")
+            return out
+        from io import StringIO
+        df = pd.read_csv(StringIO(proc.stdout), low_memory=False)
+        # 列名は LANG により変わるので厳密一致せず substring で探す
+        name_col = next((c for c in df.columns if "TaskName" in c or "タスク名" in c), None)
+        result_col = next((c for c in df.columns if "Last Result" in c or "前回の結果" in c), None)
+        last_run_col = next((c for c in df.columns if "Last Run" in c or "前回の実行" in c), None)
+        if not name_col or not result_col:
+            out["warnings"].append("schtasks 列名解析失敗")
+            return out
+        df = df[df[name_col].astype(str).str.contains("Autorace", case=False, na=False)]
+        # Dyn_* one-shot は数が多く、定常監視は親タスクのみ対象にする
+        keep_prefixes = (
+            "AutoraceDailyIngest",
+            "AutoraceDynamicScheduler",
+            "AutoraceWeeklyRetrain",
+            "AutoraceWeeklyStatus",
+            "AutoraceDailyOrderHistory",
+            "AutoraceMorningPredict",
+            "AutoraceNoonPredict",
+            "AutoraceEveningPredict",
+        )
+        for _, row in df.iterrows():
+            raw_name = str(row[name_col]).strip().lstrip("\\")
+            if not raw_name.startswith(keep_prefixes):
+                continue
+            try:
+                rc = int(row[result_col])
+            except (ValueError, TypeError):
+                rc = -1
+            last_run = str(row[last_run_col]) if last_run_col else ""
+            entry = {"name": raw_name, "result": rc, "last_run": last_run}
+            out["tasks"].append(entry)
+            if rc != 0 and rc != 267011:  # 267011 = まだ実行されていない (allowed)
+                out["ng_count"] += 1
+    except FileNotFoundError:
+        out["warnings"].append("schtasks 未検出")
+    except Exception as e:
+        out["warnings"].append(f"schtasks 例外: {e}")
+    return out
+
+
+def render_health_text(bh: dict, st: dict) -> str:
+    lines = []
+    lines.append("【🩺 死活監視】")
+    if bh.get("last_date"):
+        lines.append(f"  bet_history 最終日: {bh['last_date']}  / 直近 7 日 R 数: {bh['recent_r_count']}")
+    else:
+        lines.append("  bet_history: データなし")
+    lines.append(f"  fetch_order_history 最終成功: {bh.get('log_last_success') or '不明'}")
+    miss = bh.get("missing_picks", 0)
+    if miss > 0:
+        lines.append(f"  ⚠️ 推奨済 / 購入記録なし: {miss} R(取りこぼし or 手動スキップ)")
+        for d, pc, rn in bh.get("missing_picks_details", []):
+            lines.append(f"     - {d} 場{pc} R{rn}")
+    else:
+        lines.append("  ✅ 推奨済 → 全件 bet_history と整合")
+    for w in bh.get("warnings", []):
+        lines.append(f"  ⚠️ {w}")
+
+    if st.get("tasks"):
+        lines.append("")
+        lines.append(f"  schtasks Autorace* {len(st['tasks'])} 件 / NG {st['ng_count']} 件")
+        for t in st["tasks"]:
+            mark = "✅" if t["result"] == 0 else ("⏳" if t["result"] == 267011 else "🔴")
+            lines.append(f"    {mark} {t['name']:34s} rc={t['result']:>6} last_run={t['last_run']}")
+    for w in st.get("warnings", []):
+        lines.append(f"  ⚠️ schtasks: {w}")
+    return "\n".join(lines)
+
+
+def render_health_html(bh: dict, st: dict) -> str:
+    BORDER = '"border-collapse:collapse; border-color:#bbb; font-family:Arial,sans-serif; font-size:13px;"'
+    TH = '"background:#e8e8e8; padding:6px 10px; border:1px solid #bbb; text-align:center;"'
+    TD = '"padding:6px 10px; border:1px solid #ddd; text-align:left;"'
+    TD_R = '"padding:6px 10px; border:1px solid #ddd; text-align:right;"'
+
+    miss = bh.get("missing_picks", 0)
+    health_color = "#2e7d32" if (miss == 0 and st.get("ng_count", 0) == 0) else "#c62828"
+    parts = [f'<h3 style="color:{health_color}; margin:18px 0 8px 0;">🩺 死活監視</h3>']
+    parts.append(f'<table border="1" cellpadding="6" cellspacing="0" style={BORDER}>')
+    parts.append(f'<tr><th style={TH}>項目</th><th style={TH}>値</th></tr>')
+    parts.append(
+        f'<tr><td style={TD}>bet_history 最終日</td>'
+        f'<td style={TD_R}>{bh.get("last_date") or "(なし)"}</td></tr>'
+    )
+    parts.append(
+        f'<tr style="background:#fafafa;"><td style={TD}>直近 7 日 R 数</td>'
+        f'<td style={TD_R}>{bh.get("recent_r_count", 0)}</td></tr>'
+    )
+    parts.append(
+        f'<tr><td style={TD}>fetch_order_history 最終成功</td>'
+        f'<td style={TD_R}>{bh.get("log_last_success") or "不明"}</td></tr>'
+    )
+    miss_color = "#c62828" if miss > 0 else "#2e7d32"
+    parts.append(
+        f'<tr style="background:#fafafa;"><td style={TD}>推奨済 / 購入記録なし</td>'
+        f'<td style={TD_R}><b style="color:{miss_color}">{miss} R</b></td></tr>'
+    )
+    parts.append("</table>")
+    if bh.get("missing_picks_details"):
+        parts.append('<ul style="margin:6px 0 0 18px; color:#c62828; font-size:12px;">')
+        for d, pc, rn in bh["missing_picks_details"]:
+            parts.append(f"<li>{d} 場{pc} R{rn}</li>")
+        parts.append("</ul>")
+
+    if st.get("tasks"):
+        parts.append('<h4 style="margin:14px 0 6px 0;">schtasks 状態</h4>')
+        parts.append(f'<table border="1" cellpadding="6" cellspacing="0" style={BORDER}>')
+        parts.append(
+            f'<tr><th style={TH}>task</th><th style={TH}>rc</th>'
+            f'<th style={TH}>last_run</th></tr>'
+        )
+        for i, t in enumerate(st["tasks"]):
+            alt = ' style="background:#fafafa;"' if i % 2 == 1 else ""
+            rc = t["result"]
+            mark = "✅" if rc == 0 else ("⏳" if rc == 267011 else "🔴")
+            color = "#2e7d32" if rc == 0 else ("#888" if rc == 267011 else "#c62828")
+            parts.append(
+                f"<tr{alt}>"
+                f'<td style={TD}>{mark} {t["name"]}</td>'
+                f'<td style={TD_R}><span style="color:{color}">{rc}</span></td>'
+                f'<td style={TD_R}>{t["last_run"]}</td>'
+                f"</tr>"
+            )
+        parts.append("</table>")
+    for w in (bh.get("warnings", []) + ["schtasks: " + w for w in st.get("warnings", [])]):
+        parts.append(f'<p style="color:#e65100; margin:4px 0; font-size:12px;">⚠️ {w}</p>')
+    return "\n".join(parts)
 
 
 def render_text(summary: dict, days: list[dict], errors: list[str]) -> str:
@@ -296,6 +541,20 @@ def main() -> None:
     text = render_text(summary, days, errors)
     html = render_html(summary, days, errors)
 
+    # 死活監視(Codex R6 提案: bet_history + schtasks)
+    try:
+        bh_health = check_bet_history_health(args.days)
+        st_health = check_schtasks_health()
+        text += "\n\n" + render_health_text(bh_health, st_health)
+        health_html = render_health_html(bh_health, st_health)
+        html = html.replace(
+            '<hr style="border:none;',
+            health_html + '\n<hr style="border:none;',
+            1,
+        )
+    except Exception as e:
+        text += f"\n\n(死活監視スキップ: {e})"
+
     # 全期間累積成績(daily_predict と同じソース・フォーマット)
     try:
         from daily_predict import (
@@ -331,6 +590,24 @@ def main() -> None:
             )
         except Exception as e:
             text += f"\n\n(picks 監査スキップ: {e})"
+
+    # 推奨 vs 購入 整合監査(Codex R6 提案・優先 2)
+    try:
+        from reconcile_recommendations_vs_bets import (
+            build_summary as _rec_build,
+            render_text as _rec_text,
+            render_html as _rec_html,
+        )
+        rec = _rec_build(args.days)
+        text += "\n\n" + _rec_text(rec)
+        rec_html = _rec_html(rec)
+        html = html.replace(
+            '<hr style="border:none;',
+            rec_html + '\n<hr style="border:none;',
+            1,
+        )
+    except Exception as e:
+        text += f"\n\n(推奨 vs 購入 監査スキップ: {e})"
 
     # 実購入損益サマリ (bet_history.csv ベース)
     try:
