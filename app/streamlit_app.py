@@ -893,9 +893,16 @@ if is_live_mode:
             continue
         try:
             hh, mm = map(int, str(time_str).split(":"))
+            # ミッドナイト "24:30" / "25:00" 表記正規化
+            day_offset = 0
+            if hh >= 24:
+                hh -= 24
+                day_offset = 1
+            rs = dt.datetime.combine(
+                today_d + dt.timedelta(days=day_offset), dt.time(hh, mm)
+            )
         except (ValueError, AttributeError):
             continue
-        rs = dt.datetime.combine(today_d, dt.time(hh, mm))
         # 深夜跨ぎ補正
         if rs < now_dt - dt.timedelta(hours=12):
             rs += dt.timedelta(days=1)
@@ -1036,7 +1043,13 @@ if is_live_mode:
         if start_time_str:
             try:
                 hh, mm = map(int, str(start_time_str).split(":"))
-                race_start_dt = dt.datetime.combine(jst_today(), dt.time(hh, mm))
+                day_offset = 0
+                if hh >= 24:
+                    hh -= 24
+                    day_offset = 1
+                race_start_dt = dt.datetime.combine(
+                    jst_today() + dt.timedelta(days=day_offset), dt.time(hh, mm)
+                )
                 if race_start_dt < now - dt.timedelta(hours=12):
                     race_start_dt += dt.timedelta(days=1)
                 # 発走 -5min から発走時刻まで (発走後はもう推奨対象外)
