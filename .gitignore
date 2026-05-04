@@ -54,3 +54,5 @@ desktop.ini
 # Build
 dist/
 build/
+.env.vote
+data/*.har
