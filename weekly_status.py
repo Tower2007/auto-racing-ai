@@ -406,12 +406,30 @@ def check_schtasks_health() -> dict:
     return out
 
 
+def _overall_health(bh: dict, st: dict) -> str:
+    """bet_history と schtasks の観測系異常を NG > WARN > OK で集約(R9)。
+
+    R8 までは bh.status と st.ng_count しか見ておらず、st.warnings(例:
+    schtasks 失敗 rc=1)を握りつぶして OK 表示する不具合があった。
+    R9 で warnings も WARN 以上に昇格する。
+    """
+    if bh.get("status") == "NG":
+        return "NG"
+    if any(lv == "NG" for lv, _ in bh.get("alerts", [])):
+        return "NG"
+    if bh.get("status") == "WARN":
+        return "WARN"
+    if st.get("ng_count", 0) > 0:
+        return "WARN"
+    if st.get("warnings"):
+        return "WARN"
+    return "OK"
+
+
 def render_health_text(bh: dict, st: dict) -> str:
     lines = []
     status_emoji = {"OK": "🟢", "WARN": "🟡", "NG": "🔴"}
-    overall = bh.get("status", "OK")
-    if st.get("ng_count", 0) > 0 and overall == "OK":
-        overall = "WARN"
+    overall = _overall_health(bh, st)
     lines.append(f"【🩺 死活監視】 {status_emoji.get(overall, '')} {overall}")
     if bh.get("last_date"):
         lines.append(f"  bet_history 最終日: {bh['last_date']}  / 直近 7 日 R 数: {bh['recent_r_count']}")
@@ -422,9 +440,15 @@ def render_health_text(bh: dict, st: dict) -> str:
     for level, msg in bh.get("alerts", []):
         prefix = {"NG": "🔴 NG", "WARN": "🟡 WARN", "INFO": "ℹ️  INFO"}.get(level, level)
         lines.append(f"  {prefix}: {msg}")
-    if bh.get("missing_picks_details"):
+    # R9: 明細は overall != OK もしくは streak ≥ 3 のときだけ表示
+    show_details = (overall != "OK") or (bh.get("no_bet_streak_days", 0) >= 3)
+    if show_details and bh.get("missing_picks_details"):
         for d, pc, rn in bh["missing_picks_details"]:
             lines.append(f"     - {d} 場{pc} R{rn}")
+    elif bh.get("missing_picks", 0) > 0:
+        lines.append(
+            f"     (明細省略: 全体 OK のため。詳細は scripts/reconcile_recommendations_vs_bets.py)"
+        )
     if not bh.get("alerts"):
         lines.append("  ✅ 全項目正常")
 
@@ -448,9 +472,7 @@ def render_health_html(bh: dict, st: dict) -> str:
     TD_R = '"padding:6px 10px; border:1px solid #ddd; text-align:right;"'
 
     miss = bh.get("missing_picks", 0)
-    overall = bh.get("status", "OK")
-    if st.get("ng_count", 0) > 0 and overall == "OK":
-        overall = "WARN"
+    overall = _overall_health(bh, st)
     status_color = {"OK": "#2e7d32", "WARN": "#e65100", "NG": "#c62828"}.get(overall, "#444")
     status_emoji = {"OK": "🟢", "WARN": "🟡", "NG": "🔴"}.get(overall, "")
     parts = [
@@ -484,11 +506,18 @@ def render_health_html(bh: dict, st: dict) -> str:
         f'<td style={TD_R}><b style="color:{miss_color}">{miss} R</b></td></tr>'
     )
     parts.append("</table>")
-    if bh.get("missing_picks_details"):
+    # R9: 明細は overall != OK もしくは streak ≥ 3 のときだけ表示
+    show_details = (overall != "OK") or (bh.get("no_bet_streak_days", 0) >= 3)
+    if show_details and bh.get("missing_picks_details"):
         parts.append('<ul style="margin:6px 0 0 18px; color:#c62828; font-size:12px;">')
         for d, pc, rn in bh["missing_picks_details"]:
             parts.append(f"<li>{d} 場{pc} R{rn}</li>")
         parts.append("</ul>")
+    elif miss > 0:
+        parts.append(
+            '<p style="color:#888; font-size:11px; margin:4px 0;">'
+            '(明細省略: 全体 OK のため。詳細は <code>scripts/reconcile_recommendations_vs_bets.py</code>)</p>'
+        )
 
     if st.get("tasks"):
         parts.append('<h4 style="margin:14px 0 6px 0;">schtasks 状態</h4>')
@@ -678,6 +707,8 @@ def main() -> None:
     html = render_html(summary, days, errors)
 
     # 死活監視(Codex R6 提案: bet_history + schtasks)
+    bh_health: dict = {}
+    st_health: dict = {}
     try:
         bh_health = check_bet_history_health(args.days)
         st_health = check_schtasks_health()
@@ -770,12 +801,28 @@ def main() -> None:
     ok_count = sum(1 for d in days if d["status"] == "OK")
     fail_count = len(days) - ok_count
     if errors:
-        status = "🔴NG"
+        ingest_status = "🔴NG"
     elif fail_count >= 4:
-        status = "🟡WARN"
+        ingest_status = "🟡WARN"
     else:
-        status = "🟢OK"
-    subject = f"[autorace] 週次 {today} {status} (OK {ok_count}/{len(days)})"
+        ingest_status = "🟢OK"
+
+    # R9: subject に health overall(bet_history + schtasks)を反映
+    # 上で計算した bh_health / st_health を再利用(二重呼び出しを避ける)
+    try:
+        if bh_health or st_health:
+            health_overall = _overall_health(bh_health, st_health)
+        else:
+            health_overall = "?"
+    except Exception:
+        health_overall = "?"
+    health_emoji = {"OK": "🟢", "WARN": "🟡", "NG": "🔴", "?": "❔"}.get(
+        health_overall, "❔"
+    )
+    subject = (
+        f"[autorace] 週次 {today} ingest={ingest_status} "
+        f"health={health_emoji}{health_overall} (OK {ok_count}/{len(days)})"
+    )
 
     send_email(subject=subject, body=text, html=html)
 

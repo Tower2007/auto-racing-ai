@@ -4,6 +4,77 @@
 
 ---
 
+## 2026-05-05: Codex R9 反映(R8 実装の観測系穴埋め)
+
+R8 commit 反映後の Codex audit で 3 点指摘あり。優先 1 点(P2)が「R8 の目的を
+裏切る」明確なバグだったので即修正。残り 2 点も同 commit に同梱。
+
+### P2 → 完全修正(必須)
+
+**問題**: `render_health_text/html` が `bh.status` と `st.ng_count` のみ参照し、
+`st.warnings`(例: `schtasks 失敗 rc=1`)を握りつぶして 🟢 OK 表示していた。
+さらにメール subject も ingest 系しか反映せず、bet_history NG / schtasks
+WARN/NG が件名に出ない。R8 で「観測系異常を見逃さない」と謳って実装した
+本人がそのチェックを抜かしている矛盾。
+
+**修正**:
+- `_overall_health(bh, st)` ヘルパを新設、NG > WARN > OK で集約
+- `bh.alerts` に NG が混入していれば NG、`st.ng_count > 0` または
+  `st.warnings` 非空 なら WARN に昇格
+- `render_health_text/html` 両方で使用、subject にも `health=🟡WARN` の形で反映
+- 検証: schtasks 模擬失敗を注入 → overall=WARN を確認。bh NG 注入 → overall=NG
+
+### P3-a → 受容
+
+**問題**: 全体 OK のときも `missing_picks_details` を最大 10 行常時表示、
+古い未購入 R がずらっと並んで weekly mail が太る(R7 の「weekly は薄く」と
+矛盾)。
+
+**修正**:
+- `show_details = (overall != "OK") or (no_bet_streak_days >= 3)`
+- OK 時は `(明細省略: 全体 OK のため。詳細は scripts/...)` に置換
+- 異常時 or 連続 3 日以上の購入 0 のときだけ展開
+
+### P3-b → 部分受容(将来 TODO 化)
+
+**問題**: reconcile が R 単位でしか照合しておらず、推奨が 6 号車 複勝でも
+ユーザーが同 R で 3 号車 三連単を買えば「A=推奨かつ購入済」に分類される。
+「推奨内容と購入内容の整合」と読むと過大に一致して見える。
+
+**修正**:
+- 即時: docstring 冒頭に「⚠️ R 単位の照合(車番・券種は照合しない)」を明記
+- 即時: weekly mail compact 表示にも「[R 単位]」「[R 単位 / 車番・券種は別]」を表示
+- 将来 TODO: `Opinion/codex_briefs/pick_level_reconcile_proposal.md` に
+  pick-level reconcile の詳細仕様を保存。`bet_history_detail.csv` の
+  car_no + bet_type を使う実装方針、4 カテゴリ命名案、横展開を含めた依頼文。
+  共通化先行ポリシーで mock test と同タイミングで Codex に依頼予定
+
+### Codex 環境での schtasks 失敗について
+
+> schtasks だけ Codex 実行環境では ERROR: The system cannot find the path specified.
+
+これは P2 の修正で自動的に「subject に WARN が出る」ように対応された。
+ただし Codex の実行環境では schtasks 自体が path 不在で動かないだけで、
+本番(no28a の Windows)では正常動作するはず。本番 weekly メールで health=🟢OK
+が出ていれば正常、health=🟡WARN なら schtasks 周りを再確認する運用フロー。
+
+### 反論
+
+なし。R9 は R8 の自分の実装の穴(WARN を握りつぶす条件分岐)を
+正面から指摘してくれた。書いた本人だと気付きにくい類のバグで、Codex の
+3 周目 audit が機能している証拠。
+
+### 反省
+
+R6→R7→R8→R9 の 4 回繰り返しで気付いたパターン:
+- 自分は「実装が動く」までは丁寧だが、「異常時に正しく騒ぐか」のテストが甘い
+- 今後は新しい監視機構を入れるたびに **「異常注入テスト」** を 1 回は手動で
+  回す(`bh.status='NG'` を fake 注入して subject まで NG が伝播するか確認)
+- mock test 横展開(共通化先行で次回 Codex 依頼)はこのパターンを構造的に
+  防ぐ手立てになる
+
+---
+
 ## 2026-05-05: Codex R8 微調整反映(R7 実装の境界条件)
 
 R7 commit (2225751) の運用品質を上げる 2 点の Codex 補足を反映。

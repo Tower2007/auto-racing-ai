@@ -1,5 +1,13 @@
 """推奨候補 vs 実購入の照合(Codex R6 提案・優先 2 / R7 で独立スクリプト化)
 
+⚠️ R 単位の照合(車番・券種は照合しない)
+  本スクリプトは race_date × place_code × race_no の 3 キーでのみ突き合わせる。
+  推奨が 6 号車 複勝でも、ユーザーが同 R で 3 号車 三連単を買えば「A=推奨かつ購入済」
+  に分類される。Phase A の運用監視(レース単位の取りこぼし検知)としては許容だが、
+  「推奨内容と購入内容の整合」を厳密に問うなら bet_history_detail.csv の
+  car_no + bet_type まで含めた pick-level reconcile が別途必要。
+  → 将来 TODO: Opinion/codex_briefs/pick_level_reconcile_proposal.md
+
 Phase A の運用整合性を 4 カテゴリで分解する(R7 命名に統一):
 
   recommended_and_bought         (A): 推奨 ✓ / 購入 ✓ — 通常運用
@@ -307,7 +315,7 @@ def render_compact_text(s: dict) -> str:
     period = f"直近 {s['days']} 日" if s["days"] else "全期間"
     sign = "+" if s["c_pnl_total"] >= 0 else ""
     line1 = (
-        f"📐 推奨 vs 購入 ({period}, thr={s['threshold']}): "
+        f"📐 推奨 vs 購入 [R 単位] ({period}, thr={s['threshold']}): "
         f"A={s['a_ok']} / B={s['b_missed']} / C={s['c_discretion']} / D={s['d_unsent_above_thr']}"
     )
     line2 = (
@@ -330,7 +338,7 @@ def render_compact_html(s: dict) -> str:
     return (
         f'<h3 style="color:#444; margin:18px 0 6px 0;">📐 推奨 vs 購入 '
         f'<span style="font-weight:normal; color:#888; font-size:12px;">'
-        f'({period}, thr={s["threshold"]})</span></h3>'
+        f'[R 単位 / 車番・券種は別] ({period}, thr={s["threshold"]})</span></h3>'
         f'<p style="margin:4px 0; font-size:13px;">'
         f'{cell(s["a_ok"], "A 通常", "#2e7d32")} &nbsp;/&nbsp; '
         f'{cell(s["b_missed"], "B 取りこぼし", "#c62828")} &nbsp;/&nbsp; '
