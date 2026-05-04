@@ -185,7 +185,7 @@ def check_bet_history_health(days: int = 7) -> dict:
     else:
         try:
             with open(log_p, "r", encoding="utf-8", errors="replace") as f:
-                tail = f.readlines()[-500:]
+                tail = f.readlines()[-2000:]
             # 最終成功時刻
             for line in reversed(tail):
                 m = re.search(r"=== (\S+) END exit=0 ===", line)
@@ -203,22 +203,36 @@ def check_bet_history_health(days: int = 7) -> dict:
                     pass
             else:
                 out["alerts"].append(("WARN", "fetch_order_history 成功記録が無い"))
-            # error / 認証失敗 / cookie 検出 (直近 200 行)
-            recent_log = "".join(tail[-200:])
+
+            # R8: error 検出は「最後の START 以降」のブロック内のみ。
+            # 過去の解決済みエラーで永遠に NG になる問題を回避。
+            last_start_idx = None
+            for i in range(len(tail) - 1, -1, -1):
+                if re.search(r"=== \S+ START\b", tail[i]):
+                    last_start_idx = i
+                    break
+            if last_start_idx is None:
+                # START マーカが無い古い形式 → 直近 200 行を fallback
+                last_block = "".join(tail[-200:])
+            else:
+                last_block = "".join(tail[last_start_idx:])
+
             ng_patterns = [
                 (r"\bauth(?:entication)?\s*fail", "認証失敗"),
                 (r"\b401\b", "401 Unauthorized"),
                 (r"\b403\b", "403 Forbidden"),
                 (r"cookie.*(expir|invalid|missing|失効|期限切れ)", "cookie 失効"),
                 (r"login.*(fail|require|必要)", "ログイン要求"),
-                (r"^Traceback", "Python tracebask"),
+                (r"^Traceback", "Python traceback"),
                 (r"\bERROR\b", "ERROR ログ"),
             ]
             seen = set()
             for pat, label in ng_patterns:
-                if re.search(pat, recent_log, re.IGNORECASE | re.MULTILINE) and label not in seen:
+                if re.search(pat, last_block, re.IGNORECASE | re.MULTILINE) and label not in seen:
                     seen.add(label)
-                    out["alerts"].append(("NG", f"fetch_order_history.log: {label} を検出"))
+                    out["alerts"].append((
+                        "NG", f"fetch_order_history.log (最後の START 以降): {label} を検出"
+                    ))
         except Exception as e:
             out["alerts"].append(("WARN", f"fetch_order_history.log 読込失敗: {e}"))
 
@@ -250,23 +264,51 @@ def check_bet_history_health(days: int = 7) -> dict:
                 else:
                     res_set = set()
                 missing = []
-                pick_dates_with_no_bets = set()
+                # 日別の集計: その日に推奨が居て bet が 1 件でもあれば「購入あり」、
+                # 推奨が居て bet が 0 件なら「全 R 購入なし」と扱う(R8: 連続日数判定用)
+                bh_dates = set(bh_local["date"].dt.date.astype(str)) if not bh_local.empty else set()
+                picks_per_day: dict[str, int] = {}
+                bought_per_day: dict[str, int] = {}
                 for _, row in pick_keys.iterrows():
                     d = row["race_date"].date()
                     pc = int(row["place_code"])
                     rn = int(row["race_no"])
                     if (d, pc) not in res_set:
                         continue
-                    if (d.isoformat(), pc, rn) not in bh_keys:
-                        missing.append((d.isoformat(), pc, rn))
-                        pick_dates_with_no_bets.add(d.isoformat())
+                    d_str = d.isoformat()
+                    picks_per_day[d_str] = picks_per_day.get(d_str, 0) + 1
+                    if (d_str, pc, rn) in bh_keys:
+                        bought_per_day[d_str] = bought_per_day.get(d_str, 0) + 1
+                    else:
+                        missing.append((d_str, pc, rn))
                 out["missing_picks"] = len(missing)
                 out["missing_picks_details"] = missing[:10]
+
+                # R8: 「推奨はあったが bet が 0」の日が連続している数を数える
+                # 直近の推奨があった日(picks_per_day のキー)を新しい順に並べ、
+                # bought_per_day == 0 の連続を数える
+                sorted_days = sorted(picks_per_day.keys(), reverse=True)
+                no_bet_streak = 0
+                for d_str in sorted_days:
+                    if bought_per_day.get(d_str, 0) == 0:
+                        no_bet_streak += 1
+                    else:
+                        break
+                out["no_bet_streak_days"] = no_bet_streak
+
                 if missing:
-                    out["alerts"].append((
-                        "INFO",
-                        f"推奨済 / 購入記録なし {len(missing)} R(ユーザー不在 or 手動 skip の可能性)"
-                    ))
+                    if no_bet_streak >= 3:
+                        out["alerts"].append((
+                            "WARN",
+                            f"推奨あり / 購入 0 が {no_bet_streak} 日連続 "
+                            f"(計 {len(missing)} R)— 運用継続意思を確認"
+                        ))
+                    else:
+                        out["alerts"].append((
+                            "INFO",
+                            f"推奨済 / 購入記録なし {len(missing)} R "
+                            f"(連続 {no_bet_streak} 日、ユーザー不在 or 手動 skip の可能性)"
+                        ))
         except Exception as e:
             out["alerts"].append(("WARN", f"missing picks 計算失敗: {e}"))
 
