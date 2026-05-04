@@ -1,11 +1,11 @@
-"""推奨候補 vs 実購入の照合(Codex R6 提案・優先 2)
+"""推奨候補 vs 実購入の照合(Codex R6 提案・優先 2 / R7 で独立スクリプト化)
 
-Phase A の運用整合性を 4 カテゴリで分解する:
+Phase A の運用整合性を 4 カテゴリで分解する(R7 命名に統一):
 
-  A. 推奨 ✓ / 購入 ✓: 通常運用
-  B. 推奨 ✓ / 購入 ✗: 取りこぼし(ユーザー不在 / 締切超過 / オッズ急落 / 手動スキップ)
-  C. 推奨 ✗ / 購入 ✓: 裁量購入 / 誤購入 / 別戦略
-  D. snapshot EV ≥ thr / 推奨なし: retry 失敗 / dedup / 閾値跨ぎ
+  recommended_and_bought         (A): 推奨 ✓ / 購入 ✓ — 通常運用
+  recommended_not_bought         (B): 推奨 ✓ / 購入 ✗ — 取りこぼし
+  bought_not_recommended         (C): 推奨 ✗ / 購入 ✓ — 裁量 / 誤購入 / 別戦略
+  snapshot_signal_not_recommended(D): snap EV ≥ thr / 推奨無し — 通知漏れ / 閾値跨ぎ
 
 ソース:
   - data/daily_predict_picks.csv  (推奨候補・通知ログ)
@@ -13,11 +13,15 @@ Phase A の運用整合性を 4 カテゴリで分解する:
   - data/odds_snapshots.csv       (発火時 odds スナップショット)
 
 Standalone 実行:
-  python scripts/reconcile_recommendations_vs_bets.py            # 直近 7 日
+  python scripts/reconcile_recommendations_vs_bets.py                 # 直近 7 日
   python scripts/reconcile_recommendations_vs_bets.py --days 30
   python scripts/reconcile_recommendations_vs_bets.py --all
+  python scripts/reconcile_recommendations_vs_bets.py --csv-out data/reconcile.csv
 
-weekly_status.py から build_summary() / render_text() / render_html() を import 可能。
+CSV 出力には manual_reason 列を予約(後から手で埋める運用、初期値は空文字)。
+
+weekly_status.py からは build_summary() + render_compact_text/html() を import:
+weekly では件数のみ表示し、詳細は本スクリプトを単独実行することで確認する。
 """
 
 from __future__ import annotations
@@ -97,7 +101,45 @@ def _load_snapshots(days: int | None, threshold: float) -> pd.DataFrame:
     return df
 
 
-def build_summary(days: int | None = 7, threshold: float = EV_THRESHOLD) -> dict:
+CATEGORIES = {
+    "A": "recommended_and_bought",
+    "B": "recommended_not_bought",
+    "C": "bought_not_recommended",
+    "D": "snapshot_signal_not_recommended",
+}
+
+
+def build_rows(days: int | None = 7, threshold: float = EV_THRESHOLD) -> pd.DataFrame:
+    """4 カテゴリを 1 つの DataFrame に正規化(CSV 出力用)。
+
+    列: race_date, place_code, race_no, category, manual_reason
+    manual_reason は空文字で予約(後から手で埋める運用)。
+    """
+    s = build_summary(days, threshold, _internal_keys=True)
+    frames = []
+    for cat, keys_df in [
+        ("A", s["_a_keys"]),
+        ("B", s["_b_keys"]),
+        ("C", s["_c_keys"]),
+        ("D", s["_d_keys"]),
+    ]:
+        if keys_df is None or keys_df.empty:
+            continue
+        f = keys_df.copy()
+        f["category"] = CATEGORIES[cat]
+        f["category_short"] = cat
+        frames.append(f)
+    if not frames:
+        return pd.DataFrame(columns=RACE_KEY + ["category", "category_short", "manual_reason"])
+    out = pd.concat(frames, ignore_index=True)
+    out["manual_reason"] = ""
+    out = out[["race_date", "place_code", "race_no",
+               "category_short", "category", "manual_reason"]]
+    return out.sort_values(["race_date", "place_code", "race_no", "category_short"]).reset_index(drop=True)
+
+
+def build_summary(days: int | None = 7, threshold: float = EV_THRESHOLD,
+                   _internal_keys: bool = False) -> dict:
     """4 カテゴリの集計を返す。"""
     picks = _load_picks(days)
     bets = _load_bets(days)
@@ -146,7 +188,7 @@ def build_summary(days: int | None = 7, threshold: float = EV_THRESHOLD) -> dict
     c_pnl = bets.merge(c, on=RACE_KEY, how="inner") if not c.empty and not bets.empty \
         else pd.DataFrame()
 
-    return {
+    out = {
         "days": days,
         "threshold": threshold,
         "n_picks": int(len(picks_keys)),
@@ -161,6 +203,12 @@ def build_summary(days: int | None = 7, threshold: float = EV_THRESHOLD) -> dict
         "d_details": d.head(10).to_dict("records") if not d.empty else [],
         "c_pnl_total": int(c_pnl["profit"].sum()) if not c_pnl.empty else 0,
     }
+    if _internal_keys:
+        out["_a_keys"] = a
+        out["_b_keys"] = b
+        out["_c_keys"] = c
+        out["_d_keys"] = d
+    return out
 
 
 def render_text(s: dict) -> str:
@@ -254,11 +302,54 @@ def render_html(s: dict) -> str:
     return "\n".join(parts)
 
 
+def render_compact_text(s: dict) -> str:
+    """weekly mail に載せる 1〜2 行の要約版(R7: 詳細は外す)。"""
+    period = f"直近 {s['days']} 日" if s["days"] else "全期間"
+    sign = "+" if s["c_pnl_total"] >= 0 else ""
+    line1 = (
+        f"📐 推奨 vs 購入 ({period}, thr={s['threshold']}): "
+        f"A={s['a_ok']} / B={s['b_missed']} / C={s['c_discretion']} / D={s['d_unsent_above_thr']}"
+    )
+    line2 = (
+        f"  (A=通常 / B=取りこぼし / C=裁量 {sign}¥{s['c_pnl_total']:,} / D=通知漏れ"
+        f" — 詳細は scripts/reconcile_recommendations_vs_bets.py)"
+    )
+    return line1 + "\n" + line2
+
+
+def render_compact_html(s: dict) -> str:
+    """weekly mail HTML 用の 1 行サマリ + 凡例。"""
+    period = f"直近 {s['days']} 日" if s["days"] else "全期間"
+    sign = "+" if s["c_pnl_total"] >= 0 else ""
+    pnl_color = "#2e7d32" if s["c_pnl_total"] >= 0 else "#c62828"
+
+    def cell(n: int, label: str, color_if_nonzero: str = "#888") -> str:
+        c = color_if_nonzero if n > 0 else "#888"
+        return f'<b style="color:{c}">{label}={n}</b>'
+
+    return (
+        f'<h3 style="color:#444; margin:18px 0 6px 0;">📐 推奨 vs 購入 '
+        f'<span style="font-weight:normal; color:#888; font-size:12px;">'
+        f'({period}, thr={s["threshold"]})</span></h3>'
+        f'<p style="margin:4px 0; font-size:13px;">'
+        f'{cell(s["a_ok"], "A 通常", "#2e7d32")} &nbsp;/&nbsp; '
+        f'{cell(s["b_missed"], "B 取りこぼし", "#c62828")} &nbsp;/&nbsp; '
+        f'{cell(s["c_discretion"], "C 裁量", "#e65100")} &nbsp;/&nbsp; '
+        f'{cell(s["d_unsent_above_thr"], "D 通知漏れ", "#e65100")}'
+        f'</p>'
+        f'<p style="margin:2px 0; font-size:12px; color:#666;">'
+        f'C 損益: <span style="color:{pnl_color}">{sign}¥{s["c_pnl_total"]:,}</span>'
+        f' &nbsp;|&nbsp; 詳細: <code>scripts/reconcile_recommendations_vs_bets.py</code></p>'
+    )
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--days", type=int, default=7)
     p.add_argument("--all", action="store_true")
     p.add_argument("--threshold", type=float, default=EV_THRESHOLD)
+    p.add_argument("--csv-out", type=str, default=None,
+                   help="4 カテゴリの明細を CSV に出力(manual_reason 列を予約)")
     args = p.parse_args()
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -268,6 +359,13 @@ def main() -> None:
     days = None if args.all else args.days
     s = build_summary(days, args.threshold)
     print(render_text(s))
+
+    if args.csv_out:
+        rows = build_rows(days, args.threshold)
+        out_path = Path(args.csv_out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        rows.to_csv(out_path, index=False, encoding="utf-8-sig")
+        print(f"\n[csv-out] {len(rows)} rows → {out_path}")
 
 
 if __name__ == "__main__":

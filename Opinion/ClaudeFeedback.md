@@ -4,6 +4,65 @@
 
 ---
 
+## 2026-05-05: Codex R7 補強反映(R6 実装の改善)
+
+R6 実装を user 経由で Codex に見せたところ、R7 で 4 点の補強提案が来た。
+全て妥当だったので 1 commit で反映した(commit 877ba1c の続き)。
+
+### 反映内容
+
+**1. bet_history health に WARN/NG 分類追加**
+- R6 実装は項目を並べているだけで判定が無かった
+- R7 で 5 段階の判定基準を導入:
+  - bet_history.csv 不在 / 最終取得日 > today-2 / log 最終成功 > 48h → **WARN**
+  - log に error / 認証失敗 / cookie 失効 / 401 / 403 / Traceback → **NG**
+  - 推奨あり / 購入 0 件 → **INFO**(NG ではない、ユーザー不在の可能性)
+- 全体ステータスは NG > WARN > OK で集約、🔴/🟡/🟢 表示
+
+**2. schtasks: 列名ローカライズ対策 + raw snapshot 保存**
+- R6 実装は substring 検出 (`"TaskName" in c or "タスク名" in c`) で半分対応済
+- R7 で堅牢化: `find_col(*needles)` ヘルパで複数候補を try、失敗時に列名を
+  warning に出して原因切り分け可能に
+- Autorace* タスク全件 raw を `data/schtasks_snapshot.csv` に書き出し、
+  weekly mail に snapshot path を記載。判定が誤った時に手動で確認できる
+
+**3. reconcile を weekly から分離(件数のみに圧縮)**
+- これは私の実装ミス。R6 で詳細(B/D 明細)を weekly mail に入れたら長すぎた
+- R7 で `render_compact_text/html()` を新設し、weekly では:
+  ```
+  📐 推奨 vs 購入 (直近 7 日, thr=1.5): A=19 / B=18 / C=6 / D=0
+    (A=通常 / B=取りこぼし / C=裁量 +¥1,660 / D=通知漏れ — 詳細は ...)
+  ```
+  の 2 行のみ。詳細は standalone 実行で見る運用に変更
+- 命名も Codex 提案に統一:
+  `recommended_and_bought` / `recommended_not_bought` /
+  `bought_not_recommended` / `snapshot_signal_not_recommended`
+- `--csv-out PATH` で 4 カテゴリ明細を CSV 出力(`manual_reason` 列予約)。
+  運用が進んだら手で「ユーザー不在」「3点BUY」などラベル付けしていく形
+
+**4. docs に運用ルール 4 行を冒頭追加**
+- 私の R6 docs は表が立派すぎて、肝心な運用ルールが埋もれていた
+- R7 で冒頭に 4 行サマリ:
+  1. Phase A は収益化ではなく live 検証
+  2. live n=100 picks まで thr / 金額 / 券種を固定
+  3. 5/4 の好成績を根拠に拡張しない
+  4. 停止基準は事前定義し、事後に動かさない
+- 既存の R&D / Recency Bias / 停止基準セクションは「この 4 行を支える具体仕様」
+  として残す
+
+### 自分の反省
+
+「reconcile 詳細を weekly に入れる」のは典型的な「実装した本人だけが嬉しい」
+パターン。weekly mail は「異常があった時だけ目に入る」設計が正しく、詳細は
+オンデマンドで見るべき。Codex R7 の **「件数だけでいい」「理由欄は manual_reason
+を後から足せる形で」** という運用視点が刺さった。
+
+### 反論
+
+特になし。R7 は実装済 R6 の改善案で、4 点とも妥当だった。
+
+---
+
 ## 2026-05-05: Gemini R5 + Codex R6 統合反映(一括実装)
 
 ユーザー承認のもと、Gemini R5(大局観)+ Codex R6(補強)の指摘 7 項目を
