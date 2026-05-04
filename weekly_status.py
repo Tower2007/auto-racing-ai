@@ -332,6 +332,21 @@ def main() -> None:
         except Exception as e:
             text += f"\n\n(picks 監査スキップ: {e})"
 
+    # 実購入損益サマリ (bet_history.csv ベース)
+    try:
+        from bet_history_summary import build_summary as _bh_build
+        bh = _bh_build(args.days)
+        if bh is not None:
+            bh_text, bh_html = bh
+            text += "\n\n" + bh_text
+            html = html.replace(
+                '<hr style="border:none;',
+                bh_html + '\n<hr style="border:none;',
+                1,
+            )
+    except Exception as e:
+        text += f"\n\n(実購入損益スキップ: {e})"
+
     print(text)
 
     if args.no_email:
