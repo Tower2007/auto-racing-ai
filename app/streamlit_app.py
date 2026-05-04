@@ -182,8 +182,15 @@ def race_status(start_time_str: str | None, now: dt.datetime,
     if not start_time_str:
         return ("❓ 不明", "発走時刻未取得")
     try:
-        hh, mm = start_time_str.split(":")
-        start_dt = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+        hh, mm = map(int, start_time_str.split(":"))
+        # ミッドナイト "24:04" / "25:30" 表記を翌日扱いに正規化
+        day_offset = 0
+        if hh >= 24:
+            hh -= 24
+            day_offset = 1
+        start_dt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if day_offset:
+            start_dt += dt.timedelta(days=day_offset)
     except Exception:
         return ("❓ 不明", f"時刻形式不正: {start_time_str}")
     is_past = start_dt < now
@@ -960,8 +967,8 @@ if is_live_mode:
         sec_since_last = (now_dt - last_event_dt).total_seconds() if last_event_dt else 1e9
         is_hot = sec_to_next <= HOT_WINDOW_MIN * 60 or sec_since_last <= HOT_WINDOW_MIN * 60
         if is_hot:
-            rerun_interval_ms = 30_000
-            rerun_caption = "ホット帯: 30 秒毎に画面更新"
+            rerun_interval_ms = 60_000
+            rerun_caption = "ホット帯: 60 秒毎に画面更新"
         else:
             rerun_interval_ms = 120_000
             rerun_caption = "2 分毎に画面更新"
@@ -1000,8 +1007,14 @@ if is_live_mode:
         if not st_str:
             continue
         try:
-            hh, mm = st_str.split(":")
-            start_dt = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+            hh, mm = map(int, st_str.split(":"))
+            day_offset = 0
+            if hh >= 24:
+                hh -= 24
+                day_offset = 1
+            start_dt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if day_offset:
+                start_dt += dt.timedelta(days=day_offset)
             if start_dt > now:
                 mins_to = int((start_dt - now).total_seconds() / 60)
                 if next_race_min is None or mins_to < next_race_min:
