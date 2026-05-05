@@ -875,8 +875,10 @@ with st.sidebar:
 target_ts = pd.Timestamp(target_date)
 
 if is_live_mode:
-    # API 再取得イベント: R 毎に発走 (-3min, +1min, +5min) の 3 タイミング
-    REFETCH_EVENTS_MIN = [-3, 1, 5]  # 発走時刻からのオフセット (分)
+    # API 再取得イベント: R 毎に発走 (-3min, 0min, +6min) の 3 タイミング。
+    # 0min = レース開始時、+6min = 結果反映待ち余裕込み。
+    # 起動時・場所変更時・更新ボタンは別経路で fetch される (cache miss / 手動 clear)。
+    REFETCH_EVENTS_MIN = [-3, 0, 6]  # 発走時刻からのオフセット (分)
     HOT_WINDOW_MIN = 5               # この範囲に最近イベントがあれば「ホット」帯
 
     # 更新ボタン
