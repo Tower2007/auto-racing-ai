@@ -45,15 +45,23 @@ def load_eval_set() -> pd.DataFrame:
 
     df["pred_rank"] = df.groupby(RACE_KEY)["pred"].rank(method="min", ascending=False)
 
-    # 月リストを前半(校正)・後半(評価)に動的分割
+    # 校正/評価境界は固定(2026-05-06 audit 反映、データ追加で境界が動かないように)。
+    # 旧: months[:half] / months[half:] → データ月数次第で境界が動き、過去レポートの
+    # baseline_fns_only や policy 比較数字が静かに変わる問題があった。
+    # 詳細: Opinion/ml_logic_audit/2026-05-06_ml_logic_audit.md 1 番目の finding。
+    CALIB_CUTOFF = "2024-04"
     months = sorted(df["test_month"].unique())
     if len(months) < 2:
         raise SystemExit("test_month が 2 ヶ月未満で校正/評価分割できません")
-    half = len(months) // 2
-    calib_months = months[:half]
-    eval_months = months[half:]
-    print(f"[calib] {calib_months[0]} - {calib_months[-1]} ({len(calib_months)} months)")
-    print(f"[eval ] {eval_months[0]} - {eval_months[-1]} ({len(eval_months)} months)")
+    calib_months = [m for m in months if m < CALIB_CUTOFF]
+    eval_months = [m for m in months if m >= CALIB_CUTOFF]
+    if not calib_months or not eval_months:
+        raise SystemExit(
+            f"CALIB_CUTOFF={CALIB_CUTOFF} で分割できません "
+            f"(months: {months[0]}〜{months[-1]})"
+        )
+    print(f"[calib] {calib_months[0]} - {calib_months[-1]} ({len(calib_months)} months) [< {CALIB_CUTOFF} 固定]")
+    print(f"[eval ] {eval_months[0]} - {eval_months[-1]} ({len(eval_months)} months) [>= {CALIB_CUTOFF} 固定]")
 
     calib = df[df["test_month"].isin(calib_months)]
     eval_df = df[df["test_month"].isin(eval_months)].copy()

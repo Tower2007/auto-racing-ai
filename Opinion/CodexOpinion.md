@@ -9,6 +9,38 @@
 > 詳細: `Opinion/baseline_audit/2026-05-04_code_bug_review.md`。
 > 次回 CodexOpinion.md を編集する時は、この caveat を保持または別形式に統合のこと。
 
+> **⚠️ 2026-05-06 後退 note(Claude 追記、Codex 同意済)**: 以下の 2026-05-06 エントリ
+> および `Opinion/ml_logic_audit/audit_results.md` で観測された
+> `this_year_win_count` の巨大 diff(API=17 vs 再計算=120、exact match 10.7%)は
+> **Claude の独立追加検証で再計算側の前提ミス** と確定。
+> - Claude 検証 1: 同選手の `total_win_count` は時系列で完全単調非減少
+>   (269,161 ペアで減少 0)= race_stats は as-of-race-date snapshot で clean
+> - Claude 検証 2: `this_year_win_count` は月別平均 1月 0.02 → 12月 0.49 で
+>   ちゃんと年初リセット、選手 3307 で 1/2=0 → 12/31=17 を確認
+> リーク証拠としては **採用しない**。Codex 本人も 2026-05-06 のやり取りで
+> 「再計算側の player_code/開催粒度/同日複数走あたりのズレで、撤回寄り」と
+> 同意済。詳細: `Opinion/ml_logic_audit/2026-05-06_claude_audit_review.md`。
+> 次回 Codex 監査時はこの note を保持または該当エントリに統合のこと。
+
+---
+
+## 2026-05-06: ML予想ロジックの穴監査
+
+ユーザー依頼により、メインプロジェクトは変更せず `Opinion/ml_logic_audit/` 配下で軽量監査を実施した。
+
+結論: **モデル本体の致命的リークは現時点で未発見**。`ml/walkforward_morning.py` は `year_month < test_month` で訓練し、テスト月を分離している。`MORNING_EXCLUDE` も試走系と `ai_expect_code` を除外しており、結果列や target 列が production feature に混入している形跡はなかった。
+
+ただし、評価周辺に直すべき穴がある。最大は `scripts/ev_3point_buy.py` / `scripts/ev_3point_monthly.py` の calibration split が「月リストの前半/後半」で動的に決まる点。データが増えると境界がずれ、`baseline_fns_only` や 3点BUY policy の過去数字が静かに変わる。Phase A を固定仮説として追うなら、policy 系も `CALIB_CUTOFF = "2024-04"` 固定に寄せるべき。
+
+また、`ml/train_production.py` の `production_calib` metrics は calibrator を fit した同じ OOF 全体で計算した in-sample 診断値なので、honest 評価値として引用しない方がよい。live 用 calibrator としては妥当だが、評価指標は cutoff split / rolling calibration で別に出すべき。
+
+target 整合性では、36,039 finished races のうち `target_top3` 数が期待値と違う R が 26、`target_win` が 1 着 1 人になっていない R が 13 あった。特殊裁定・同着・失格絡みと思われ、規模は全体の 0.1% 未満。ROI 主張を壊すほどではないが、複勝モデルの target を厳密化するなら `payouts.csv` の `fns` 払戻対象から `target_fns_hit` を作って比較するとよい。
+
+監査成果物:
+- `Opinion/ml_logic_audit/audit_ml_logic.py`
+- `Opinion/ml_logic_audit/audit_results.md`
+- `Opinion/ml_logic_audit/2026-05-06_ml_logic_audit.md`
+
 ---
 
 ## 2026-05-04: baseline_fns_only 実データ検証後の更新

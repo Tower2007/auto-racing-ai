@@ -4,6 +4,151 @@
 
 ---
 
+## 2026-05-06: ML audit 反映(優先度 1〜3 を honest 化のみで実装)
+
+ML logic audit(Codex + Claude)で出た改善案のうち、**Recency Bias 警告と整合する
+範囲**(本番モデル / thr=1.50 を変えない、measurement と docs の honest 化のみ)を
+1 commit で実装。
+
+### 実装内容
+
+**1. policy split を CALIB_CUTOFF="2024-04" 固定**(Codex 提案、必須)
+- 対象: `scripts/ev_3point_buy.py:48-59`, `scripts/ev_3point_monthly.py:41-52`
+- 旧: `months[:half] / months[half:]` でデータ追加 → 境界が動く
+- 新: `CALIB_CUTOFF = "2024-04"` 固定、分割不能時は SystemExit
+- `ev_3point_policy_sim.py` は `ev_3point_buy.load_eval_set` 経由でカスケード
+- スモーク確認: calib 24mo (2022-04〜2024-03) / eval 25mo (2024-04〜2026-04)
+  で過去レポート同期
+
+**2. production_calib metrics を fit_data_diagnostic + honest_split に分離**
+(Codex 提案、推奨)
+- 対象: `ml/train_production.py:fit_calibration()`
+- 旧: 全 OOF で fit + 同データで eval(in-sample 値を `calib_auc` として表示)
+- 新:
+  - `fit_data_diagnostic`: in-sample 値、note で「honest 評価値ではない」と明記
+  - `honest_split`: cutoff=2024-04 で fit/eval 分離した honest 値
+  - 旧キー `n_calib/raw_auc/calib_auc/raw_logloss/calib_logloss` は後方互換のため
+    残置(`_legacy_keys_note` で deprecated 表記)
+  - 終了 log は honest と in-sample の両方を出す
+- スモーク確認: honest_split で raw_auc=0.8157, calib_auc=0.8156, n_eval=114,218。
+  in-sample との差はわずか(isotonic は ranking AUC を変えないので想定通り)
+
+**3. docs に「edge 源泉 = 1 番人気 fade」を仮説として明記**(Claude 追加、推奨)
+- `docs/ev_strategy_findings.md` 冒頭に「🧭 戦略 edge の構造仮説」セクション新設
+- 内容:
+  - 1 番人気 overround 0.76(中位人気は 0.91〜0.98)を表で提示
+  - 仮説: pred_top1 + EV>=1.50 = 1 番人気の人気バイアスを fade する戦略
+  - 含意: 「1 番人気以外を選別」する改善案は edge を消す方向 → 採用しない
+  - 停止基準 `live_EV < close_EV 逆転` は overround 監視装置と等価
+- **「将来も不変」とは書かず**、「現時点で観測される歪み」「市場効率化で消える
+  可能性」を必ずペアで記載(Codex 助言の通り)
+
+### 着手しなかった項目
+
+- target_top3 の特殊レース 26+13 → target_fns_hit 化(Codex 4): 優先低、live n=50 まで保留
+- early stopping 後の refit (Codex 5): モデル変更を伴うので live n=100 まで保留
+
+これらは Phase A 運用ルール「live n=100 picks までモデル変更禁止」と整合させた判断。
+着手したのは backtest 数値・docs の honest 化のみで、本番モデル / thr=1.50 / 複勝
+top-1 only の戦略は不変。
+
+### 自分が一番納得した点
+
+priority 3(edge 源泉セクション)が一番効いた。これまで「auto は薄い edge がある」
+で済ませていた 漠然とした認識が、**「1 番人気 overround 0.76 を fade している」**
+という具体的な構造仮説に置換された。この仮説は:
+- 戦略改善の方向性チェック装置(逆方向なら却下)
+- 停止基準の意味づけ(overround 薄まり = edge 喪失)
+として、運用判断の anchor になる。
+
+### 反論
+
+なし。Codex 助言「『将来も不変』とは書かない」を docs に正しく反映できた(と思う)。
+万一書き過ぎていたら次の audit で指摘してもらう。
+
+---
+
+## 2026-05-06: ML 予想ロジック独立監査(Codex 監査の補強)
+
+ユーザー依頼で Codex の `Opinion/ml_logic_audit/2026-05-06_ml_logic_audit.md`
+を読んだ上で、独立に 8 項目の追加検証を実施。**メインプロジェクトは未編集**。
+
+### 結論
+
+Codex の核心結論「モデル本体に致命的リークはない」を **独立検証で補強できた**。
+特に Codex が「強い疑い」と濁した点(`this_year_win_count` 10.7% exact match)は
+**再計算側のバグ濃厚** で、API 値はリセット挙動が正しいことを確認。
+
+### 独立検証で出た強い positive 発見
+
+1. **race_stats は as-of-race-date snapshot で確定 clean** — 同選手の
+   `total_win_count` を時系列順で並べた **269,161 ペアで減少 0** = 完全単調非減少。
+   後日 snapshot ではない = temporal leakage の最重要 sanity が clean
+2. **this_year_win_count もリセット正常** — 月別平均 1月 0.02 → 12月 0.49。
+   選手 3307 の 2025 年で 1/2 = 0 → 12/31 = 17 を確認
+3. **walk-forward の test_month と race_date 不一致 = 0**
+4. **categorical encoding が月別で安定**(月毎再訓練でも符号化実質一致)
+
+### Claude 追加 finding(Codex に + 1)
+
+**戦略 edge の源泉 = 1 番人気の overround 0.76**
+
+| win_rank | win_hit | implied_win_prob | overround_factor |
+|---:|---:|---:|---:|
+| 1 | 0.464 | 0.610 | **0.760** |
+| 2 | 0.219 | 0.230 | 0.951 |
+| 3〜6 | - | - | 0.91〜0.98 |
+
+中位人気は控除率 30% 通りなのに、**1 番人気だけ 0.76** = ファン投票で 1 番人気に
+売れすぎている(boat と同じ現象)。Phase A の `pred_top1 + EV>=1.50` が
+edge を取れる構造的根拠が初めて数値で見えた。
+
+これにより:
+- Phase A の戦略改善案が「1 番人気以外の選別」に向くと筋違いになる
+- 停止基準 `live_EV < close_EV 逆転` は 1 番人気 overround が 0.85+ に
+  薄まったときに発火する設計と整合(Gemini R5 の「市場効率化のジレンマ」と接続)
+
+### Codex finding すべて同意
+
+| Codex finding | 緊急度 |
+|---|---|
+| policy split を CALIB_CUTOFF="2024-04" に固定 | **必須** |
+| production_calib metrics を honest 別測 | 推奨 |
+| target_top3 特殊レース 26+13 (target_fns_hit 化) | 低 |
+| early stopping 後の refit | 低 |
+
+### 注意点(リークではない)
+
+- NaN 数 10 行は新人/復帰で hit rate 低い → drop bias ではない(LightGBM は NaN
+  natively 扱う)
+- graduation_code に新値が test に出る → LightGBM unknown category 処理で軽微
+
+### Recency Bias 警告との整合
+
+修正は **コード変更が live n=100 まで禁止** だが、上記は:
+- 1 (policy split): 評価スクリプトの境界固定 = backtest 数値の honest 化のみ。
+  本番モデルや戦略 thr=1.50 は不変なので **着手 OK**
+- 2 (calib metrics): 表示の honest 化のみ、**着手 OK**
+- 3 (docs に edge 源泉): docs だけ、**着手 OK**
+- 4-5: モデル変更を伴うので live n=100 まで保留
+
+### 自分が一番納得した点
+
+「auto は薄い edge がある」と漠然と言ってきたが、**何の歪みを利用しているのか**
+が初めて数値で見えたこと(1 番人気 overround 0.76 を fade)。
+
+これは構造的(オッズ生成の人気バイアス)= 持続性高いが、AI 予想が市場参加者に
+なれば overround は薄まり edge 消失する。Gemini R5 の「市場効率化のジレンマ」
+と完全に整合。
+
+### 成果物(全て Opinion/ 配下、メインは未編集)
+
+- `Opinion/ml_logic_audit/claude_audit_extra.py` — 8 項目の独立検証スクリプト
+- `Opinion/ml_logic_audit/claude_audit_results.md` — 検証生データ
+- `Opinion/ml_logic_audit/2026-05-06_claude_audit_review.md` — 評価メモ本体
+
+---
+
 ## 2026-05-05: Codex R9 反映(R8 実装の観測系穴埋め)
 
 R8 commit 反映後の Codex audit で 3 点指摘あり。優先 1 点(P2)が「R8 の目的を

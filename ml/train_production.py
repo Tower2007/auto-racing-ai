@@ -123,22 +123,81 @@ def train_full(X: pd.DataFrame, y: pd.Series, dates: pd.Series) -> tuple[lgb.Boo
 
 
 def fit_calibration() -> tuple[IsotonicRegression, dict]:
-    """walk-forward 予測(過去の honest 予測)から isotonic を fit。"""
+    """walk-forward 予測(過去の honest 予測)から isotonic を fit。
+
+    metrics は 2 系統に分離して記録(2026-05-06 audit 反映):
+      - fit_data_diagnostic: OOF 全体で fit + 同じデータで eval(in-sample 診断値)。
+        live 用 calibrator としては妥当だが honest 評価値ではないので診断扱い。
+      - honest_split: test_month < CALIB_CUTOFF で fit、>= CALIB_CUTOFF で eval。
+        校正性能の honest な評価指標。calib_auc/logloss を引用するならこちら。
+    """
     pq = DATA / "walkforward_predictions_morning_top3.parquet"
     if not pq.exists():
         # fallback: 直前モデル
         pq = DATA / "walkforward_predictions_top3.parquet"
         logger.warning("morning preds not found, falling back to %s", pq.name)
     df = pd.read_parquet(pq)
+
+    # live 用 calibrator(全 OOF で fit、本番予測時に呼ばれる側)
     iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
     iso.fit(df["pred"].values, df["target_top3"].values)
     p_calib = iso.transform(df["pred"].values)
-    metrics = {
+    fit_data_diagnostic = {
         "n_calib": int(len(df)),
         "raw_auc": float(roc_auc_score(df["target_top3"], df["pred"])),
         "calib_auc": float(roc_auc_score(df["target_top3"], p_calib)),
         "raw_logloss": float(log_loss(df["target_top3"], df["pred"].clip(1e-6, 1-1e-6))),
         "calib_logloss": float(log_loss(df["target_top3"], p_calib.clip(1e-6, 1-1e-6))),
+        "note": (
+            "in-sample (fit data 上の診断値)。honest 評価値として引用しないこと。"
+            "校正性能の評価指標は honest_split を見ること。"
+        ),
+    }
+
+    # honest 評価(cutoff split)
+    CALIB_CUTOFF = "2024-04"
+    honest_split: dict = {"cutoff": CALIB_CUTOFF}
+    try:
+        calib_df = df[df["test_month"] < CALIB_CUTOFF]
+        eval_df = df[df["test_month"] >= CALIB_CUTOFF]
+        if len(calib_df) > 0 and len(eval_df) > 0:
+            iso_honest = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+            iso_honest.fit(calib_df["pred"].values, calib_df["target_top3"].values)
+            p_eval_calib = iso_honest.transform(eval_df["pred"].values)
+            honest_split.update({
+                "n_calib": int(len(calib_df)),
+                "n_eval": int(len(eval_df)),
+                "raw_auc": float(roc_auc_score(eval_df["target_top3"], eval_df["pred"])),
+                "calib_auc": float(roc_auc_score(eval_df["target_top3"], p_eval_calib)),
+                "raw_logloss": float(log_loss(
+                    eval_df["target_top3"], eval_df["pred"].clip(1e-6, 1-1e-6))),
+                "calib_logloss": float(log_loss(
+                    eval_df["target_top3"], p_eval_calib.clip(1e-6, 1-1e-6))),
+                "note": (
+                    f"honest: fit on test_month < {CALIB_CUTOFF}, "
+                    f"eval on test_month >= {CALIB_CUTOFF}"
+                ),
+            })
+        else:
+            honest_split["error"] = (
+                f"分割不能: calib n={len(calib_df)}, eval n={len(eval_df)}"
+            )
+    except Exception as e:
+        honest_split["error"] = f"honest 分割計算失敗: {e}"
+
+    metrics = {
+        "fit_data_diagnostic": fit_data_diagnostic,
+        "honest_split": honest_split,
+        # 後方互換: 旧キー(in-sample 値)を残しつつ、deprecated note を付ける
+        "n_calib": fit_data_diagnostic["n_calib"],
+        "raw_auc": fit_data_diagnostic["raw_auc"],
+        "calib_auc": fit_data_diagnostic["calib_auc"],
+        "raw_logloss": fit_data_diagnostic["raw_logloss"],
+        "calib_logloss": fit_data_diagnostic["calib_logloss"],
+        "_legacy_keys_note": (
+            "n_calib/raw_auc/calib_auc/raw_logloss/calib_logloss は in-sample 値で "
+            "後方互換のため残置。新しいコードは fit_data_diagnostic か honest_split を参照。"
+        ),
     }
     return iso, metrics
 
@@ -182,8 +241,19 @@ def main():
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
     logger.info("Saved: %s, %s, %s", model_path.name, calib_path.name, meta_path.name)
-    logger.info("Train AUC=%.4f, Valid AUC=%.4f, Calib AUC=%.4f",
-                train_metrics["train_auc"], train_metrics["valid_auc"], calib_metrics["calib_auc"])
+    honest = calib_metrics.get("honest_split", {})
+    if "calib_auc" in honest:
+        logger.info(
+            "Train AUC=%.4f, Valid AUC=%.4f, Calib AUC (honest)=%.4f / (in-sample)=%.4f",
+            train_metrics["train_auc"], train_metrics["valid_auc"],
+            honest["calib_auc"], calib_metrics["fit_data_diagnostic"]["calib_auc"],
+        )
+    else:
+        logger.info(
+            "Train AUC=%.4f, Valid AUC=%.4f, Calib AUC (in-sample only)=%.4f",
+            train_metrics["train_auc"], train_metrics["valid_auc"],
+            calib_metrics["fit_data_diagnostic"]["calib_auc"],
+        )
 
 
 if __name__ == "__main__":

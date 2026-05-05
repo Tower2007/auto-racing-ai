@@ -38,14 +38,20 @@ def load_eval_picks() -> tuple[pd.DataFrame, list[str]]:
     ).dropna(subset=["place_odds_min"])
     df["pred_rank"] = df.groupby(RACE_KEY)["pred"].rank(method="min", ascending=False)
 
+    # 校正/評価境界は固定(2026-05-06 audit 反映、データ追加で境界が動かないように)
+    CALIB_CUTOFF = "2024-04"
     months = sorted(df["test_month"].unique())
     if len(months) < 2:
         raise SystemExit("test_month が 2 ヶ月未満で校正/評価分割できません")
-    half = len(months) // 2
-    calib_months = months[:half]
-    eval_months = months[half:]
-    print(f"[calib] {calib_months[0]} - {calib_months[-1]} ({len(calib_months)} months)")
-    print(f"[eval ] {eval_months[0]} - {eval_months[-1]} ({len(eval_months)} months)")
+    calib_months = [m for m in months if m < CALIB_CUTOFF]
+    eval_months = [m for m in months if m >= CALIB_CUTOFF]
+    if not calib_months or not eval_months:
+        raise SystemExit(
+            f"CALIB_CUTOFF={CALIB_CUTOFF} で分割できません "
+            f"(months: {months[0]}〜{months[-1]})"
+        )
+    print(f"[calib] {calib_months[0]} - {calib_months[-1]} ({len(calib_months)} months) [< {CALIB_CUTOFF} 固定]")
+    print(f"[eval ] {eval_months[0]} - {eval_months[-1]} ({len(eval_months)} months) [>= {CALIB_CUTOFF} 固定]")
 
     calib = df[df["test_month"].isin(calib_months)]
     eval_df = df[df["test_month"].isin(eval_months)].copy()
