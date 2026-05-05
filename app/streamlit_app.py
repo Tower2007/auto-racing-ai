@@ -131,7 +131,7 @@ def get_autorace_client():
     return AutoraceClient()
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(show_spinner=False)
 def fetch_today_open_venues() -> list[tuple[int, bool]]:
     """Hold/Today API で本日開催 + 中止でない場の (place_code, is_finished) リストを返す。
 
@@ -158,7 +158,7 @@ def fetch_today_open_venues() -> list[tuple[int, bool]]:
     return sorted(out, key=lambda x: (x[1], x[0]))
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(show_spinner=False)
 def fetch_race_start_times(date_str: str, pc: int) -> dict[int, str]:
     """R 毎の発走予定時刻 'HH:MM' を返す。Program/Print ページから取得。"""
     try:
@@ -204,7 +204,7 @@ def race_status(start_time_str: str | None, now: dt.datetime,
     return ("🔮 前売予想", f"前売オッズ・発走まで {int(minutes_to_start)} 分")
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(show_spinner=False)
 def fetch_live_day(date_str: str, pc: int) -> dict:
     """1 場 12 R 分の状態+予測+結果を取得。
     戻り値: {race_no: {has_odds, has_result, source, top_cars, df, refund_info}}
