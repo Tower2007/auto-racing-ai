@@ -61,8 +61,8 @@ backfill.py            # 過去データ一括取得
 daily_ingest.py        # 日次データ収集オーケストレータ(catchup 2)
 daily_predict.py       # 当日対象場の EV ベース買い候補メール送信
                        # (--races / --suppress-noresult-email 対応で 1R 単位呼出可)
-dynamic_scheduler.py   # 各レース発走 30 分前に daily_predict を 1R 単位で
-                       # 起動する schtasks one-shot を毎朝生成
+dynamic_scheduler.py   # 各レース発走 LEAD_MIN (現在 5) 分前に daily_predict を
+                       # 1R 単位で起動する schtasks one-shot を毎朝生成
 weekly_status.py       # 週次ステータスメール
 gmail_notify.py        # Gmail SMTP 送信
 scripts/
@@ -81,8 +81,8 @@ reports/               # 各種分析レポート(commit 対象)
 | タスク | 時刻 | 内容 |
 |---|---|---|
 | `AutoraceDailyIngest` | 毎日 06:30 | データ収集 (catchup 2 日) |
-| `AutoraceDynamicScheduler` | 毎日 07:00 | `python dynamic_scheduler.py`: Program/Print ページから各場 R 毎の発走時刻を取得し、各レース発走 30 分前の `AutoraceDyn_{venue}_R{n}` one-shot を 12 R × 場数ぶん登録(冪等、毎日再生成) |
-| `AutoraceDyn_{venue}_R{n}` | 各レース発走 30 分前(動的) | `python daily_predict.py --venues {pc} --races {n} --suppress-noresult-email`: 1 R 単位で予測、候補ありのみメール送信 |
+| `AutoraceDynamicScheduler` | 毎日 07:00 | `python dynamic_scheduler.py`: Program/Print ページから各場 R 毎の発走時刻を取得し、各レース発走 `LEAD_MIN` 分前 (現在 5 分前) の `AutoraceDyn_{venue}_R{n}` one-shot を 12 R × 場数ぶん登録(冪等、毎日再生成) |
+| `AutoraceDyn_{venue}_R{n}` | 各レース発走 LEAD_MIN 分前(現在 5 分前、動的) | `python daily_predict.py --venues {pc} --races {n} --suppress-noresult-email`: 1 R 単位で予測、候補ありのみメール送信。`daily_predict` 側 NaN/near-miss retry (60s × 2) で実質 -3 分まで救済され、最終メール送信は -5〜-3 分の幅 |
 | `AutoraceWeeklyRetrain` | 毎日曜 03:00 | 本番モデル再学習 |
 | `AutoraceWeeklyStatus` | 毎月曜 07:30 | 週次ステータス報告 |
 | `AutoraceFetchOrderHistory` | 毎日 02:30 | `python scripts/daily_fetch_order_history.py`: vote.autorace.jp の購入履歴を `--since 2d --detail --cookie-source firefox` で取得し `data/bet_history.csv` / `bet_history_detail.csv` にマージ。失敗時のみ Gmail 通知。Firefox の vote.autorace.jp ログイン状態を維持しておくこと(cookie 失効時は再ログインで復活) |
@@ -91,7 +91,8 @@ reports/               # 各種分析レポート(commit 対象)
 - 発走時刻取得: `/race_info/Program/Print/{venueKey}/{YYYY-MM-DD}` から R 毎の発走予定時刻を HTML スクレイプ。12 R 全て掲載されるので推定ではなく実時刻ベースで登録。
   - 取得失敗時のみ fallback: Hold/Today の `(nowRaceNo, raceStartTime)` を anchor、`liveEndTime − 5 min` を R12 とした線形補間。`liveStartTime`(放送開始、R1 より約 30 分早い)は更なる fallback。
   - 深夜跨ぎ(R 番号順に時刻が前 R より早くなる)は +1 日として処理。
-- 各レース発走 30 分前で one-shot 発火 → そのレースの 1 R 分だけ predict
+- 各レース発走 `LEAD_MIN` 分前 (現在 5 分前、`dynamic_scheduler.py:LEAD_MIN`) で one-shot 発火 → そのレースの 1 R 分だけ predict
+  - LEAD_MIN は 30→15→10→5 と段階的に短縮 (2026-05-01)。10 分前段階では複勝オッズが late money 前で EV 上ブレし、確定時に閾値割れする drift bias が観測されたため。信号鮮度を最優先して 5 分前へ短縮。daily_predict 側 60s × 2 retry で最悪 -3 分まで救済 → 投票時間 3 分確保。
 - `--suppress-noresult-email`: 候補なしの R はメールスキップ(候補ありの R のみ通知)
 - 当日中止・全 fallback 失敗の場は登録スキップ
 - 冪等: 既存 `AutoraceDyn_*` を全削除してから再登録、同日中の手動再走 OK
