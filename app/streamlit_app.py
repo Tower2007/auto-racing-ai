@@ -303,23 +303,22 @@ def fetch_live_day(date_str: str, pc: int) -> dict:
                         X = align_features(feat, meta)
                         feat["pred"] = model.predict(X)
                         feat["pred_calib"] = iso.transform(feat["pred"].values)
-                        # 異常 odds センチネル除外 (daily_predict.py と同じ 3 条件)
+                        # 異常 odds センチネル除外 (daily_predict.py と同じ 2 条件)
                         #   1. max > 50: 1.0/183 等の過渡期 snapshot
                         #   2. max/min > 20: 異常な広がり
-                        #   3. min < 1.1 AND max < 1.1: 1.0/1.0 等のセンチネル
-                        #      (1.0 配当は autorace 元返しルールで実在する正規値だが、
-                        #       min=max=1.0 (両方が下限) は API 計算待ちの可能性、
-                        #       仮に正規でも EV<=1.0<thr で結論変わらず、安全側に倒す)
+                        # 旧条件 3 (min<1.1 AND max<1.1) は 2026-05-06 R7 live で誤検出と
+                        # 判明したため削除(三連複 4-5-6 odds 1.0 で ¥100 払戻されており、
+                        # 1.0-1.0 は本命集中時の正規元返し圏)。
+                        # 複勝のみ条件 3 で NaN 化されると的中時の payout が抜けて
+                        # ¥100 機会損失となる(R7 6号 で実観測)。
                         import numpy as _np
                         ODDS_MAX_CAP = 50.0
                         ODDS_RATIO_CAP = 20.0
-                        ODDS_MIN_FLOOR = 1.1
                         _omin = feat["place_odds_min"]
                         _omax = feat["place_odds_max"]
                         _anomalous = (
                             (_omax > ODDS_MAX_CAP)
                             | ((_omin > 0) & (_omax / _omin > ODDS_RATIO_CAP))
-                            | ((_omin < ODDS_MIN_FLOOR) & (_omax < ODDS_MIN_FLOOR))
                         )
                         _ev_raw = feat["pred_calib"] * (_omin + _omax) / 2
                         feat["ev_avg_calib"] = _ev_raw.where(~_anomalous, _np.nan)

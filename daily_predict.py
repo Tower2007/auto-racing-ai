@@ -383,25 +383,24 @@ def predict_race(
             X = align_features(feat, meta)
             feat["pred"] = model.predict(X)
             feat["pred_calib"] = iso.transform(feat["pred"].values)
-            # 異常 odds を NaN 化 (3 パターン)。
+            # 異常 odds を NaN 化 (2 パターン)。
             # 異常時は NaN にすることで near-miss retry に再評価させる。
             #   1. max > 50: min=1.0/max=183 のセンチネル
             #      (複勝 odds は実質 30 倍程度が上限)
             #   2. max/min > 20: 過渡期 snapshot (通常は 5x 以内)
-            #   3. min < 1.1 and max < 1.1: 1.0/1.0 等の API センチネル疑い
-            #      (注: 1.0 配当は autorace 元返しルールで実在する正規値だが、
-            #       min=max=1.0 のケースは API センチネル / 計算待ち の可能性も
-            #       ある。仮に正規配当でも EV<=pred<=1.0 で thr=1.50 未満 →
-            #       推奨されないので NaN 化しても結論は変わらない。安全側に倒す)
+            # 旧条件 3 (min<1.1 AND max<1.1) は 2026-05-06 R7 の live データで誤検出
+            # と判明したため削除:
+            #   - R7 三連複 4-5-6 が odds 1.0 で ¥100 払戻されており、1.0-1.0 は
+            #     正規の元返し圏(本命に集中投票時の minimum 保証)
+            #   - 複勝のみ条件 3 で NaN 化されると、的中時 payout 計算が抜ける
+            #   - R7 6号 (3着) の複勝 ¥100 が機会損失として実観測された
             ODDS_MAX_CAP = 50.0
             ODDS_RATIO_CAP = 20.0
-            ODDS_MIN_FLOOR = 1.1
             odds_min = feat["place_odds_min"]
             odds_max = feat["place_odds_max"]
             anomalous = (
                 (odds_max > ODDS_MAX_CAP)
                 | ((odds_min > 0) & (odds_max / odds_min > ODDS_RATIO_CAP))
-                | ((odds_min < ODDS_MIN_FLOOR) & (odds_max < ODDS_MIN_FLOOR))
             )
             ev_raw = feat["pred_calib"] * (odds_min + odds_max) / 2
             feat["ev_avg_calib"] = ev_raw.where(~anomalous, np.nan)
