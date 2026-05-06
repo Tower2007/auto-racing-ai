@@ -383,9 +383,18 @@ def predict_race(
             X = align_features(feat, meta)
             feat["pred"] = model.predict(X)
             feat["pred_calib"] = iso.transform(feat["pred"].values)
-            feat["ev_avg_calib"] = feat["pred_calib"] * (
-                feat["place_odds_min"] + feat["place_odds_max"]
-            ) / 2
+            # 異常 odds (例: min=1.0/max=183 のセンチネル、過渡期 snapshot) を NaN 化。
+            # 複勝 odds は実質 30 倍程度が上限、min/max 比は通常 5x 以内。
+            # 異常時は NaN にすることで near-miss retry に再評価させる。
+            ODDS_MAX_CAP = 50.0
+            ODDS_RATIO_CAP = 20.0
+            odds_min = feat["place_odds_min"]
+            odds_max = feat["place_odds_max"]
+            anomalous = (odds_max > ODDS_MAX_CAP) | (
+                (odds_min > 0) & (odds_max / odds_min > ODDS_RATIO_CAP)
+            )
+            ev_raw = feat["pred_calib"] * (odds_min + odds_max) / 2
+            feat["ev_avg_calib"] = ev_raw.where(~anomalous, np.nan)
             feat["pred_rank"] = feat["pred"].rank(method="min", ascending=False)
 
             top1 = feat[feat["pred_rank"] == 1]

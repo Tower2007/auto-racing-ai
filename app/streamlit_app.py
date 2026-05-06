@@ -303,11 +303,18 @@ def fetch_live_day(date_str: str, pc: int) -> dict:
                         X = align_features(feat, meta)
                         feat["pred"] = model.predict(X)
                         feat["pred_calib"] = iso.transform(feat["pred"].values)
-                        feat["ev_avg_calib"] = (
-                            feat["pred_calib"]
-                            * (feat["place_odds_min"] + feat["place_odds_max"])
-                            / 2
+                        # 異常 odds センチネル除外 (1.0/183 等の過渡期 snapshot 対策)
+                        # daily_predict.py と同じ閾値を維持
+                        import numpy as _np
+                        ODDS_MAX_CAP = 50.0
+                        ODDS_RATIO_CAP = 20.0
+                        _omin = feat["place_odds_min"]
+                        _omax = feat["place_odds_max"]
+                        _anomalous = (_omax > ODDS_MAX_CAP) | (
+                            (_omin > 0) & (_omax / _omin > ODDS_RATIO_CAP)
                         )
+                        _ev_raw = feat["pred_calib"] * (_omin + _omax) / 2
+                        feat["ev_avg_calib"] = _ev_raw.where(~_anomalous, _np.nan)
                         feat["pred_rank"] = feat["pred"].rank(method="min", ascending=False)
                         feat = feat.sort_values("pred_calib", ascending=False)
                         info["df"] = feat
