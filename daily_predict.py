@@ -388,8 +388,11 @@ def predict_race(
             #   1. max > 50: min=1.0/max=183 のセンチネル
             #      (複勝 odds は実質 30 倍程度が上限)
             #   2. max/min > 20: 過渡期 snapshot (通常は 5x 以内)
-            #   3. min < 1.1 or max < 1.1: 1.0/1.0 等のセンチネル
-            #      (複勝の理論最小オッズは 1.1 = 控除率 10%、1.0 はあり得ない)
+            #   3. min < 1.1 and max < 1.1: 1.0/1.0 等の API センチネル疑い
+            #      (注: 1.0 配当は autorace 元返しルールで実在する正規値だが、
+            #       min=max=1.0 のケースは API センチネル / 計算待ち の可能性も
+            #       ある。仮に正規配当でも EV<=pred<=1.0 で thr=1.50 未満 →
+            #       推奨されないので NaN 化しても結論は変わらない。安全側に倒す)
             ODDS_MAX_CAP = 50.0
             ODDS_RATIO_CAP = 20.0
             ODDS_MIN_FLOOR = 1.1
@@ -398,8 +401,7 @@ def predict_race(
             anomalous = (
                 (odds_max > ODDS_MAX_CAP)
                 | ((odds_min > 0) & (odds_max / odds_min > ODDS_RATIO_CAP))
-                | (odds_min < ODDS_MIN_FLOOR)
-                | (odds_max < ODDS_MIN_FLOOR)
+                | ((odds_min < ODDS_MIN_FLOOR) & (odds_max < ODDS_MIN_FLOOR))
             )
             ev_raw = feat["pred_calib"] * (odds_min + odds_max) / 2
             feat["ev_avg_calib"] = ev_raw.where(~anomalous, np.nan)

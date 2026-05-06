@@ -306,8 +306,10 @@ def fetch_live_day(date_str: str, pc: int) -> dict:
                         # 異常 odds センチネル除外 (daily_predict.py と同じ 3 条件)
                         #   1. max > 50: 1.0/183 等の過渡期 snapshot
                         #   2. max/min > 20: 異常な広がり
-                        #   3. min/max < 1.1: 1.0/1.0 等のセンチネル
-                        #      (複勝の理論最小オッズは 1.1)
+                        #   3. min < 1.1 AND max < 1.1: 1.0/1.0 等のセンチネル
+                        #      (1.0 配当は autorace 元返しルールで実在する正規値だが、
+                        #       min=max=1.0 (両方が下限) は API 計算待ちの可能性、
+                        #       仮に正規でも EV<=1.0<thr で結論変わらず、安全側に倒す)
                         import numpy as _np
                         ODDS_MAX_CAP = 50.0
                         ODDS_RATIO_CAP = 20.0
@@ -317,8 +319,7 @@ def fetch_live_day(date_str: str, pc: int) -> dict:
                         _anomalous = (
                             (_omax > ODDS_MAX_CAP)
                             | ((_omin > 0) & (_omax / _omin > ODDS_RATIO_CAP))
-                            | (_omin < ODDS_MIN_FLOOR)
-                            | (_omax < ODDS_MIN_FLOOR)
+                            | ((_omin < ODDS_MIN_FLOOR) & (_omax < ODDS_MIN_FLOOR))
                         )
                         _ev_raw = feat["pred_calib"] * (_omin + _omax) / 2
                         feat["ev_avg_calib"] = _ev_raw.where(~_anomalous, _np.nan)
