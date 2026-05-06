@@ -383,15 +383,23 @@ def predict_race(
             X = align_features(feat, meta)
             feat["pred"] = model.predict(X)
             feat["pred_calib"] = iso.transform(feat["pred"].values)
-            # 異常 odds (例: min=1.0/max=183 のセンチネル、過渡期 snapshot) を NaN 化。
-            # 複勝 odds は実質 30 倍程度が上限、min/max 比は通常 5x 以内。
+            # 異常 odds を NaN 化 (3 パターン)。
             # 異常時は NaN にすることで near-miss retry に再評価させる。
+            #   1. max > 50: min=1.0/max=183 のセンチネル
+            #      (複勝 odds は実質 30 倍程度が上限)
+            #   2. max/min > 20: 過渡期 snapshot (通常は 5x 以内)
+            #   3. min < 1.1 or max < 1.1: 1.0/1.0 等のセンチネル
+            #      (複勝の理論最小オッズは 1.1 = 控除率 10%、1.0 はあり得ない)
             ODDS_MAX_CAP = 50.0
             ODDS_RATIO_CAP = 20.0
+            ODDS_MIN_FLOOR = 1.1
             odds_min = feat["place_odds_min"]
             odds_max = feat["place_odds_max"]
-            anomalous = (odds_max > ODDS_MAX_CAP) | (
-                (odds_min > 0) & (odds_max / odds_min > ODDS_RATIO_CAP)
+            anomalous = (
+                (odds_max > ODDS_MAX_CAP)
+                | ((odds_min > 0) & (odds_max / odds_min > ODDS_RATIO_CAP))
+                | (odds_min < ODDS_MIN_FLOOR)
+                | (odds_max < ODDS_MIN_FLOOR)
             )
             ev_raw = feat["pred_calib"] * (odds_min + odds_max) / 2
             feat["ev_avg_calib"] = ev_raw.where(~anomalous, np.nan)

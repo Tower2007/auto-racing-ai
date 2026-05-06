@@ -303,15 +303,22 @@ def fetch_live_day(date_str: str, pc: int) -> dict:
                         X = align_features(feat, meta)
                         feat["pred"] = model.predict(X)
                         feat["pred_calib"] = iso.transform(feat["pred"].values)
-                        # 異常 odds センチネル除外 (1.0/183 等の過渡期 snapshot 対策)
-                        # daily_predict.py と同じ閾値を維持
+                        # 異常 odds センチネル除外 (daily_predict.py と同じ 3 条件)
+                        #   1. max > 50: 1.0/183 等の過渡期 snapshot
+                        #   2. max/min > 20: 異常な広がり
+                        #   3. min/max < 1.1: 1.0/1.0 等のセンチネル
+                        #      (複勝の理論最小オッズは 1.1)
                         import numpy as _np
                         ODDS_MAX_CAP = 50.0
                         ODDS_RATIO_CAP = 20.0
+                        ODDS_MIN_FLOOR = 1.1
                         _omin = feat["place_odds_min"]
                         _omax = feat["place_odds_max"]
-                        _anomalous = (_omax > ODDS_MAX_CAP) | (
-                            (_omin > 0) & (_omax / _omin > ODDS_RATIO_CAP)
+                        _anomalous = (
+                            (_omax > ODDS_MAX_CAP)
+                            | ((_omin > 0) & (_omax / _omin > ODDS_RATIO_CAP))
+                            | (_omin < ODDS_MIN_FLOOR)
+                            | (_omax < ODDS_MIN_FLOOR)
                         )
                         _ev_raw = feat["pred_calib"] * (_omin + _omax) / 2
                         feat["ev_avg_calib"] = _ev_raw.where(~_anomalous, _np.nan)
