@@ -14,6 +14,10 @@ cookie ソース (--cookie-source):
     chrome / edge:     Chromium 系。ただし v127+ AppBound 暗号化で `browser_cookie3` が
                        読めないケース有 (Windows)。Firefox 推奨。
     env:               .env.vote の VOTE_AUTORACE_COOKIE を使用 (旧方式、cookie 期限あり)
+    playwright:        Playwright で auto-login + cookie 取得 (2026-05-08 導入)。
+                       Firefox cookie が daily 失効する問題を回避できる。
+                       accounts.json (.gitignore 済) に資格情報必要。詳細は
+                       scripts/auto_login_autorace.py 参照。
 
 事前準備 (env 方式の場合のみ):
     .env.vote に VOTE_AUTORACE_COOKIE=... を設定。
@@ -148,10 +152,31 @@ def load_cookie_from_browser(browser: str) -> str:
     return "; ".join(pairs)
 
 
+def load_cookie_from_playwright() -> str:
+    """Playwright で auto-login して cookie 文字列を取得 (2026-05-08 導入)。
+
+    auto_login_autorace.py に処理を委譲。Firefox cookie の daily 失効問題を
+    回避するため、IPO project (sbi_ipo_auto) と同じ pattern。
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        from auto_login_autorace import login_and_get_cookie
+    except ImportError as e:
+        sys.exit(f"error: auto_login_autorace のロード失敗: {e}")
+    try:
+        return login_and_get_cookie()
+    except FileNotFoundError as e:
+        sys.exit(f"error: {e}")
+    except Exception as e:
+        sys.exit(f"error: Playwright auto-login 失敗: {e}")
+
+
 def load_cookie(source: str) -> str:
     """cookie 取得先を切り替え。"""
     if source == "env":
         return load_cookie_from_env()
+    if source == "playwright":
+        return load_cookie_from_playwright()
     return load_cookie_from_browser(source)
 
 
@@ -325,8 +350,10 @@ def main() -> None:
     p.add_argument("--summary-csv", type=Path, default=DEFAULT_SUMMARY_CSV)
     p.add_argument("--detail-csv", type=Path, default=DEFAULT_DETAIL_CSV)
     p.add_argument("--cookie-source", default="firefox",
-                   choices=["chrome", "firefox", "edge", "env"],
-                   help="cookie 取得先 (default: firefox。Chrome は v127+ AppBound 暗号化で読めない)")
+                   choices=["chrome", "firefox", "edge", "env", "playwright"],
+                   help="cookie 取得先 (default: firefox。"
+                        "playwright = Playwright で auto-login + cookie 取得、"
+                        "失効問題を回避できるが accounts.json 必須)")
     args = p.parse_args()
 
     if args.since:

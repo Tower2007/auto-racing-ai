@@ -10,6 +10,9 @@ venv/
 .env
 .env.local
 *.pem
+# 自動ログイン (Playwright) 用機密 / プロファイル
+accounts.json
+profiles/
 
 # Data / logs
 # data/ 以下は基本 ignore だが Streamlit Cloud デプロイ用にモデル/小型 CSV のみ例外

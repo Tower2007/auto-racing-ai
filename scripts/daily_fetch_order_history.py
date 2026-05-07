@@ -1,15 +1,20 @@
 """
 日次 投票履歴取得 (schtasks 用ラッパー)
 -----------------------------------------------------------------------
-fetch_order_history.py を `--since 2d --detail --cookie-source chrome` で呼び、
-失敗時のみ Gmail 通知を送る。schtasks `AutoraceFetchOrderHistory` が毎日 02:30
-に起動する想定。
+fetch_order_history.py を `--since 2d --detail --cookie-source playwright` で
+呼び、失敗時のみ Gmail 通知を送る。schtasks `AutoraceFetchOrderHistory` が
+毎日 02:30 に起動する想定。
+
+2026-05-08 変更: cookie-source default を firefox → playwright に切替。
+Firefox cookie が daily 失効する問題を Playwright auto-login で回避。
+事前準備: accounts.json (.gitignore 済) に vote.autorace.jp 資格情報を記入。
 
 ログ: data/fetch_order_history.log (追記)
 
 使い方:
   python scripts/daily_fetch_order_history.py
   python scripts/daily_fetch_order_history.py --since 7d  # キャッチアップ
+  python scripts/daily_fetch_order_history.py --cookie-source firefox  # 旧方式 fallback
 """
 
 from __future__ import annotations
@@ -48,8 +53,8 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--since", default="2d",
                    help="直近 N 日 (default: 2d、前日+前々日を冪等再取得)")
-    p.add_argument("--cookie-source", default="firefox",
-                   choices=["chrome", "firefox", "edge", "env"])
+    p.add_argument("--cookie-source", default="playwright",
+                   choices=["chrome", "firefox", "edge", "env", "playwright"])
     p.add_argument("--no-detail", action="store_true",
                    help="券種別 pack 詳細を取らない (default: 取る)")
     args = p.parse_args()
@@ -106,8 +111,11 @@ def main() -> int:
             f"finished: {finished}\n\n"
             f"--- stderr ---\n{result.stderr or '(empty)'}\n\n"
             f"--- stdout ---\n{result.stdout or '(empty)'}\n\n"
-            f"よくある原因:\n"
-            f"  - Firefox に vote.autorace.jp のログインが切れている\n"
+            f"よくある原因 (cookie-source={args.cookie_source}):\n"
+            f"  - playwright: accounts.json の ID/PW 誤り、CAPTCHA / 2FA 発動、\n"
+            f"     login フォーム selector のズレ。auto_login_autorace.py を\n"
+            f"     headless=false で手動実行して切り分け。\n"
+            f"  - firefox/chrome/edge: ブラウザの vote.autorace.jp ログイン切れ\n"
             f"     → ブラウザで再ログインすれば次回 02:30 から復活\n"
             f"  - GraphQL スキーマ変更 / ネットワーク障害\n\n"
             f"ログ: {LOG_FILE}\n"

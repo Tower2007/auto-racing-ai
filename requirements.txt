@@ -15,3 +15,7 @@ streamlit-autorefresh>=1.0
 
 # Vote history (browser cookie source)
 browser_cookie3>=0.20
+
+# Auto-login (Playwright で vote.autorace.jp に自動ログイン、2026-05-08 導入)
+# 初回は `playwright install chromium` も必要
+playwright>=1.40

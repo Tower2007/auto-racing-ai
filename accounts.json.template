@@ -1,0 +1,14 @@
+{
+  "_comment": "accounts.json は .gitignore 済の機密ファイル。本ファイルをコピーして accounts.json として保存し、実際の vote.autorace.jp 資格情報を記入してください。",
+  "_security": "PW は平文。Windows ローカルの NTFS 権限で保護される前提。クラウド同期 (OneDrive/Dropbox 等) されるフォルダには置かないこと。",
+  "headless": false,
+  "_headless_note": "初回は false で目視確認。ボット検知が無いと確認できたら true に切替可。SBI は false 固定だが autorace.jp は要動作確認。",
+  "accounts": [
+    {
+      "name": "main",
+      "user_id": "VOTE_AUTORACE_USER_ID",
+      "password": "VOTE_AUTORACE_PASSWORD",
+      "_pin_optional": "もし 4 桁 PIN 等の追加フィールドがあれば 'pin': '1234' を追加"
+    }
+  ]
+}
