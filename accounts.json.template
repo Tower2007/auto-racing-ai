@@ -1,8 +1,10 @@
 {
-  "_comment": "accounts.json は .gitignore 済の機密ファイル。本ファイルをコピーして accounts.json として保存し、実際の vote.autorace.jp 資格情報を記入してください。",
-  "_security": "PW は平文。Windows ローカルの NTFS 権限で保護される前提。クラウド同期 (OneDrive/Dropbox 等) されるフォルダには置かないこと。",
+  "_comment": "accounts.json は .gitignore 済の機密ファイル。本ファイルをコピーして accounts.json として保存し、実際の値を記入してください。",
+  "_security": "PW / secret は平文。Windows ローカルの NTFS 権限で保護される前提。クラウド同期 (OneDrive/Dropbox 等) されるフォルダには置かないこと。",
   "headless": false,
-  "_headless_note": "初回は false で目視確認。ボット検知が無いと確認できたら true に切替可。SBI は false 固定だが autorace.jp は要動作確認。",
+  "_headless_note": "初回は false で目視確認。ボット検知が無いと確認できたら true に切替可。",
+  "buy_secret_key": "REPLACE_WITH_RANDOM_32CHAR_HEX",
+  "_buy_secret_note": "click-to-buy 機構の HMAC 署名鍵。32 文字以上のランダム文字列。生成例: python -c \"import secrets; print(secrets.token_hex(32))\"",
   "accounts": [
     {
       "name": "main",

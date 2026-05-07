@@ -481,12 +481,22 @@ def render_html(picks: pd.DataFrame, today: str, time_label: str, thr: float) ->
     if picks.empty:
         parts.append('<p style="color:#999;">本日この時間帯の候補はありません。</p>')
     else:
+        # click-to-buy URL を生成 (2026-05-08 導入、buy_token + buy_app.py 連携)
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent / "scripts"))
+            from buy_token import build_buy_url as _build_buy_url
+            _buy_enabled = True
+        except Exception:
+            _buy_enabled = False  # buy_secret_key 未設定 等で安全に skip
+
         parts.append(f'<table border="1" cellpadding="6" cellspacing="0" style={BORDER}>')
         parts.append(
             f'<tr><th style={TH}>場</th><th style={TH}>R</th><th style={TH}>車</th>'
             f'<th style={TH}>pred</th><th style={TH}>EV</th>'
             f'<th style={TH}>fns_min</th><th style={TH}>fns_max</th><th style={TH}>tns</th>'
-            f'<th style={TH}>推奨¥</th><th style={TH}>オッズ</th><th style={TH}>投票</th></tr>'
+            f'<th style={TH}>推奨¥</th><th style={TH}>オッズ</th><th style={TH}>投票</th>'
+            + (f'<th style={TH}>1-click</th>' if _buy_enabled else '')
+            + '</tr>'
         )
         BTN_ODDS = (
             '"display:inline-block; padding:5px 10px; background:#1565c0; '
@@ -498,6 +508,12 @@ def render_html(picks: pd.DataFrame, today: str, time_label: str, thr: float) ->
             'color:#ffffff; text-decoration:none; border-radius:4px; '
             'font-weight:bold; font-size:12px;"'
         )
+        BTN_BUY = (
+            '"display:inline-block; padding:5px 10px; background:#2e7d32; '
+            'color:#ffffff; text-decoration:none; border-radius:4px; '
+            'font-weight:bold; font-size:12px;"'
+        )
+        VENUE_JP_MAP_ = {2: "川口", 3: "伊勢崎", 4: "浜松", 5: "飯塚", 6: "山陽"}
         total_rec = 0
         for i, (_, r) in enumerate(picks.iterrows()):
             alt = ' style="background:#fafafa;"' if i % 2 == 1 else ""
@@ -521,8 +537,29 @@ def render_html(picks: pd.DataFrame, today: str, time_label: str, thr: float) ->
                 f'<td style={TD}><b style="color:#1565c0;">¥{rec_yen}</b></td>'
                 f'<td style={TD}><a href="{odds_url}" style={BTN_ODDS}>📊 オッズ</a></td>'
                 f'<td style={TD}><a href="{vote_url}" style={BTN_VOTE}>🎯 投票</a></td>'
-                f'</tr>'
             )
+            if _buy_enabled:
+                # Phase A 制約: 金額 ¥100 固定、複勝 top1 のみ
+                try:
+                    pc = int(r["place_code"])
+                    buy_url = _build_buy_url({
+                        "race_date": today,
+                        "place_code": pc,
+                        "venue": r["venue"],
+                        "venue_jp": VENUE_JP_MAP_.get(pc, "?"),
+                        "race_no": int(r["race_no"]),
+                        "car_no": int(r["car_no"]),
+                        "amount": 100,
+                        "ev": float(r["ev_avg_calib"]),
+                    })
+                    parts.append(
+                        f'<td style={TD}>'
+                        f'<a href="{buy_url}" style={BTN_BUY}>💰 購入</a>'
+                        f'</td>'
+                    )
+                except Exception:
+                    parts.append(f'<td style={TD}>—</td>')
+            parts.append('</tr>')
         parts.append('</table>')
         parts.append(
             f'<p style="margin:12px 0;">計 <b>{len(picks)}</b> 候補'

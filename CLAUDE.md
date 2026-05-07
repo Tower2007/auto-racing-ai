@@ -69,6 +69,13 @@ scripts/
   ev_*.py              # EV 戦略 5 段階検証
   daily_pnl_*.py       # 場・期間別 P&L
   fix_*.py / dq_*.py   # データ品質チェック・修正
+  auto_login_autorace.py  # vote.autorace.jp 自動ログイン (Playwright)
+  buy_token.py         # click-to-buy HMAC token sign/verify
+  execute_purchase.py  # Playwright で投票実行 (--dry-run default)
+  inspect_login_form.py / inspect_purchase_page.py  # 構造調査用 helper
+app/
+  streamlit_app.py     # 予想表示 (port 8501)
+  buy_app.py           # click-to-buy 確認 UI (port 8502)
 data/                  # CSV + production_*.lgb/.pkl/.json (.gitignore)
 docs/                  # 調査結果・戦略まとめ
 reports/               # 各種分析レポート(commit 対象)
