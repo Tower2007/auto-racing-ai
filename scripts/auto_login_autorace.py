@@ -43,9 +43,12 @@ ROOT = Path(__file__).resolve().parent.parent
 ACCOUNTS_PATH = ROOT / "accounts.json"
 PROFILE_DIR = ROOT / "profiles" / "autorace"
 
-# vote.autorace.jp のログインフロー
-# 公式 URL: https://vote.autorace.jp/auth/login (推定、初回確認時に修正の余地)
-LOGIN_URL = "https://vote.autorace.jp/auth/login"
+# vote.autorace.jp のログインフロー (2026-05-08 inspect で確認済)
+# - 公式 URL: https://vote.autorace.jp/login
+# - 入力フィールド: userNumber (半角数字), password (半角英数字)
+# - 規約同意 checkbox 3 個 (全部 check してから submit)
+# - submit ボタン: button[type="submit"] (text "ログインする")
+LOGIN_URL = "https://vote.autorace.jp/login"
 HOME_URL_PREFIX = "https://vote.autorace.jp"
 
 
@@ -118,14 +121,13 @@ async def _login_with_playwright(account: dict, headless: bool = False) -> str:
                                 timeout=30000)
                 await asyncio.sleep(2)
 
-                # フォーム入力
-                # vote.autorace.jp の field name は要確認。下記は一般的な candidate を試す。
+                # フォーム入力 (selector は 2026-05-08 inspect で確定)
                 user_id_filled = False
                 for sel in [
+                    'input[name="userNumber"]',  # vote.autorace.jp の正式名
                     'input[name="userId"]',
                     'input[name="user_id"]',
                     'input[name="memberId"]',
-                    'input[name="member_id"]',
                     'input[type="text"]:visible',
                 ]:
                     try:
@@ -140,8 +142,7 @@ async def _login_with_playwright(account: dict, headless: bool = False) -> str:
                 if not user_id_filled:
                     raise RuntimeError(
                         "ログインフォームの user_id 入力欄が見つかりません。\n"
-                        "ヒント: headless=false で起動して F12 で実際の selector を確認、\n"
-                        "       本スクリプトの sel リストに追加してください。"
+                        "ヒント: scripts/inspect_login_form.py で構造を再確認"
                     )
 
                 pw_filled = False
@@ -161,7 +162,7 @@ async def _login_with_playwright(account: dict, headless: bool = False) -> str:
                 if not pw_filled:
                     raise RuntimeError("password 入力欄が見つかりません。")
 
-                # PIN がある場合
+                # PIN がある場合 (vote.autorace.jp は通常 PIN なし)
                 if "pin" in account:
                     for sel in [
                         'input[name="pin"]',
@@ -177,12 +178,33 @@ async def _login_with_playwright(account: dict, headless: bool = False) -> str:
                         except Exception:
                             continue
 
+                # 規約同意 checkbox を全て check (vote.autorace.jp は 3 個)
+                try:
+                    checkboxes = await page.locator(
+                        'input[type="checkbox"]:visible'
+                    ).all()
+                    if checkboxes:
+                        for i, cb in enumerate(checkboxes):
+                            try:
+                                is_checked = await cb.is_checked()
+                                if not is_checked:
+                                    await cb.check(timeout=2000)
+                                    print(f"[auto_login] checkbox[{i}] checked",
+                                          file=sys.stderr)
+                            except Exception as e:
+                                print(f"[auto_login] checkbox[{i}] check 失敗: {e}",
+                                      file=sys.stderr)
+                except Exception as e:
+                    print(f"[auto_login] checkbox 処理スキップ: {e}",
+                          file=sys.stderr)
+
                 # submit
                 submitted = False
                 for sel in [
                     'button[type="submit"]',
-                    'input[type="submit"]',
+                    'button:has-text("ログインする")',
                     'button:has-text("ログイン")',
+                    'input[type="submit"]',
                 ]:
                     try:
                         await page.click(sel, timeout=3000)
@@ -194,10 +216,10 @@ async def _login_with_playwright(account: dict, headless: bool = False) -> str:
                 if not submitted:
                     raise RuntimeError("ログイン submit ボタンが見つかりません。")
 
-                # ログイン成功を URL 変化で判定
+                # ログイン成功を URL 変化で判定 (login → home へのリダイレクト)
                 try:
                     await page.wait_for_url(
-                        lambda url: "/auth/login" not in url and "login" not in url,
+                        lambda url: "/login" not in url,
                         timeout=15000,
                     )
                 except Exception:
@@ -206,7 +228,7 @@ async def _login_with_playwright(account: dict, headless: bool = False) -> str:
 
                 await asyncio.sleep(2)
 
-                if "login" in page.url.lower():
+                if "/login" in page.url:
                     raise RuntimeError(
                         f"ログイン失敗 (login ページに留まっている): {page.url}\n"
                         "ID/PW 誤り or CAPTCHA / 2FA 発動の可能性。"
