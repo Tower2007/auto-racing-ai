@@ -299,30 +299,30 @@ async def inspect(place_code: int, race_no: int, car_no: int | None,
                 out(f"    html: {html_path}")
 
             # --- Step 10: 複勝タブ click ---
-            # vote.autorace.jp の券種タブは <label> + <input type="radio"> 構造
-            # (button ではない)
+            # vote.autorace.jp には 2 つの 複勝 タブが存在:
+            # (1) 中央オッズ表示タブ: <label><input type="radio">複勝</label> (radio)
+            # (2) 右パネル投票タブ:   <label><input type="checkbox">複勝</label> (checkbox)
+            # (2) を click する必要がある (投票モード切替)。
             out(f"\n[10] 複勝タブ click を試行:")
             clicked_fukushou = False
             try:
+                # 投票パネル(checkbox 型)を優先、見つからなければ generic にフォールバック
                 for sel in [
-                    'label:has-text("複勝")',
+                    # 投票パネルの 複勝 タブ (checkbox を含む label)
+                    'label:has(input[type="checkbox"][name="name"]):has-text("複勝")',
+                    # フォールバック: 順序ベース (右パネルが後ろにある想定)
                     'label.cb:has-text("複勝")',
-                    'button:has-text("複勝")',
-                    'a:has-text("複勝")',
-                    'li:has-text("複勝")',
+                    'label:has-text("複勝")',
                 ]:
                     cnt = await page.locator(sel).count()
                     if cnt > 0:
                         out(f"    候補: {sel} ({cnt} 個)")
                         try:
-                            # 複勝 / 3連複 等が混じる場合 first だと誤クリック懸念
-                            # → text 完全一致を別途試行
-                            target_loc = page.locator(sel).filter(
-                                has_text="複勝"
-                            ).first
+                            # 複数マッチした場合は last (右パネル) を採用
+                            target_loc = page.locator(sel).last
                             await target_loc.click(timeout=5000)
                             clicked_fukushou = True
-                            out(f"    → click OK")
+                            out(f"    → click OK (.last)")
                             await asyncio.sleep(2)
                             break
                         except Exception as e:
