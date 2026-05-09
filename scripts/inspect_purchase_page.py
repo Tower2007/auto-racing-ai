@@ -240,118 +240,181 @@ async def inspect(place_code: int, race_no: int, car_no: int | None,
                 except Exception as e:
                     out(f"    {sel_desc}: error {e}")
 
-            # === Step 10: 複勝タブ → 車番 click → 金額入力 までの探索 ===
-            out("\n[10] 複勝タブ click を試行 (購入フォーム探索):")
+            # === Step 10〜13: 全フロー探索 (複勝 click → 車番 click →
+            #     投票シートに追加 → 投票確認へ click) ===
+            # ⚠️ 最終投票 button は click しない (実銭発生回避)
+            target_car = car_no or 4
+
+            async def _dump_all(label: str, after_idx: int) -> None:
+                """input / button / 状態を簡潔 dump + screenshot。"""
+                out(f"\n[{after_idx}] === {label} 後の状態 ===")
+                inputs_x = await page.locator("input").all()
+                visible_inputs = []
+                for inp in inputs_x:
+                    try:
+                        info = await inp.evaluate(
+                            "(el) => ({name: el.name, id: el.id, type: el.type, "
+                            "value: el.value, checked: el.checked, "
+                            "placeholder: el.placeholder, "
+                            "visible: el.offsetParent !== null})"
+                        )
+                        if info.get("visible"):
+                            visible_inputs.append(info)
+                    except Exception:
+                        continue
+                out(f"    visible input ({len(visible_inputs)} 個):")
+                for i, info in enumerate(visible_inputs[:30]):
+                    out(f"      [{i}] {info}")
+
+                buttons_x = await page.locator("button").all()
+                visible_btns = []
+                for btn in buttons_x:
+                    try:
+                        info = await btn.evaluate(
+                            "(el) => ({type: el.type, id: el.id, "
+                            "text: el.innerText.slice(0,40), "
+                            "disabled: el.disabled, "
+                            "visible: el.offsetParent !== null})"
+                        )
+                        if info.get("visible"):
+                            visible_btns.append(info)
+                    except Exception:
+                        continue
+                out(f"    visible button ({len(visible_btns)} 個):")
+                for i, info in enumerate(visible_btns[:25]):
+                    out(f"      [{i}] {info}")
+
+                out(f"    URL: {page.url}")
+                # screenshot
+                shot = ROOT / "data" / f"inspect_step_{after_idx:02d}_{label}.png"
+                try:
+                    await page.screenshot(path=str(shot), full_page=False)
+                    out(f"    screenshot: {shot}")
+                except Exception as e:
+                    out(f"    screenshot 失敗: {e}")
+                # HTML
+                html_x = await page.content()
+                html_path = ROOT / "data" / f"inspect_step_{after_idx:02d}_{label}.html"
+                html_path.write_text(html_x, encoding="utf-8")
+                out(f"    html: {html_path}")
+
+            # --- Step 10: 複勝タブ click ---
+            out(f"\n[10] 複勝タブ click を試行:")
             clicked_fukushou = False
             try:
-                # 複勝タブの候補
                 for sel in [
                     'button:has-text("複勝")',
                     'a:has-text("複勝")',
                     'li:has-text("複勝")',
                     '[role="tab"]:has-text("複勝")',
-                    '[data-bet-type="fukushou"]',
                 ]:
                     cnt = await page.locator(sel).count()
                     if cnt > 0:
-                        out(f"    複勝候補発見: {sel} ({cnt} 個)")
+                        out(f"    候補: {sel} ({cnt} 個)")
                         try:
                             await page.locator(sel).first.click(timeout=5000)
                             clicked_fukushou = True
                             out(f"    → click OK")
+                            await asyncio.sleep(2)
                             break
                         except Exception as e:
                             out(f"    → click 失敗: {e}")
                 if not clicked_fukushou:
-                    out(f"    複勝タブ見つからず")
-                else:
-                    await asyncio.sleep(3)
-                    after_url = page.url
-                    out(f"    複勝 click 後 URL: {after_url}")
+                    out("    複勝タブ click 不可、フロー中断")
+                    raise RuntimeError("fukushou-click-failed")
+            except RuntimeError:
+                pass
 
-                    # フォーム再 dump
-                    out("\n[11] (複勝 click 後) form 要素:")
-                    forms2 = await page.locator("form").all()
-                    out(f"    form 数: {len(forms2)}")
-                    for i, f in enumerate(forms2):
+            if clicked_fukushou:
+                await _dump_all("after_fukushou_click", 10)
+
+                # --- Step 11: 車番 N click (target_car=4 の対象チェック) ---
+                out(f"\n[11] 車番 {target_car} のチェックを click:")
+                clicked_car = False
+                # 候補 selector を順に試行
+                for sel in [
+                    f'input[type="checkbox"][value="{target_car}"]',
+                    f'input[type="radio"][value="{target_car}"]',
+                    f'label:has-text("{target_car}号") input[type="checkbox"]',
+                    f'tr:has-text("{target_car}号") input[type="checkbox"]',
+                    # 車番テーブルの N 行目をクリックする方式
+                    f'[data-car="{target_car}"]',
+                    f'[data-num="{target_car}"]',
+                ]:
+                    try:
+                        loc = page.locator(sel)
+                        cnt = await loc.count()
+                        if cnt > 0:
+                            out(f"    候補: {sel} ({cnt} 個)")
+                            try:
+                                await loc.first.click(timeout=5000)
+                                clicked_car = True
+                                out(f"    → click OK")
+                                await asyncio.sleep(1)
+                                break
+                            except Exception as e:
+                                out(f"    → click 失敗: {e}")
+                    except Exception:
+                        continue
+                if not clicked_car:
+                    out(f"    車番 {target_car} の selector 見つからず")
+                await _dump_all("after_car_click", 11)
+
+                # --- Step 12: 「投票シートに追加」 click ---
+                out("\n[12] 「投票シートに追加」 click:")
+                added = False
+                for sel in [
+                    'button:has-text("投票シートに追加")',
+                    'button:has-text("追加")',
+                ]:
+                    cnt = await page.locator(sel).count()
+                    if cnt > 0:
+                        out(f"    候補: {sel} ({cnt} 個)")
+                        # ボタンが disabled かチェック
                         try:
-                            info = await f.evaluate(
-                                "(el) => ({action: el.action, method: el.method, "
-                                "id: el.id, name: el.name})"
-                            )
-                            out(f"    [form {i}] {info}")
+                            disabled = await page.locator(sel).first.is_disabled()
+                            if disabled:
+                                out(f"    → disabled (車番未選択 / 金額不正?)、スキップ")
+                                continue
+                            await page.locator(sel).first.click(timeout=5000)
+                            added = True
+                            out(f"    → click OK")
+                            await asyncio.sleep(2)
+                            break
                         except Exception as e:
-                            out(f"    [form {i}] error: {e}")
+                            out(f"    → click 失敗: {e}")
+                await _dump_all("after_add_to_sheet", 12)
 
-                    out("\n[12] (複勝 click 後) input 要素:")
-                    inputs2 = await page.locator("input").all()
-                    out(f"    input 数: {len(inputs2)}")
-                    for i, inp in enumerate(inputs2[:80]):
-                        try:
-                            info = await inp.evaluate(
-                                "(el) => ({name: el.name, id: el.id, type: el.type, "
-                                "value: el.value, placeholder: el.placeholder, "
-                                "visible: el.offsetParent !== null})"
-                            )
-                            out(f"    [{i}] {info}")
-                        except Exception as e:
-                            out(f"    [{i}] error: {e}")
-
-                    out("\n[13] (複勝 click 後) select 要素:")
-                    selects2 = await page.locator("select").all()
-                    out(f"    select 数: {len(selects2)}")
-                    for i, sel in enumerate(selects2):
-                        try:
-                            info = await sel.evaluate(
-                                "(el) => ({name: el.name, id: el.id, "
-                                "options: Array.from(el.options).slice(0,15).map(o => "
-                                "({value: o.value, text: o.text}))})"
-                            )
-                            out(f"    [{i}] name={info['name']} id={info['id']}")
-                            for opt in info.get("options", []):
-                                out(f"        {opt}")
-                        except Exception as e:
-                            out(f"    [{i}] error: {e}")
-
-                    out("\n[14] (複勝 click 後) button 要素:")
-                    buttons2 = await page.locator("button").all()
-                    out(f"    button 数: {len(buttons2)}")
-                    for i, btn in enumerate(buttons2[:40]):
-                        try:
-                            info = await btn.evaluate(
-                                "(el) => ({type: el.type, id: el.id, "
-                                "text: el.innerText.slice(0,40), "
-                                "visible: el.offsetParent !== null})"
-                            )
-                            out(f"    [{i}] {info}")
-                        except Exception as e:
-                            out(f"    [{i}] error: {e}")
-
-                    # 通常投票後 HTML も保存
-                    html2 = await page.content()
-                    DUMP_HTML2 = ROOT / "data" / "purchase_form_dump_after.html"
-                    DUMP_HTML2.write_text(html2, encoding="utf-8")
-                    out(f"\n[15] (複勝 click 後) HTML 保存: {DUMP_HTML2}")
-
-                    # 複勝 / 車番 等の selector ヒット数チェック (再)
-                    out("\n[16] (複勝 click 後) selector ヒント:")
-                    for sel_desc, sel_query in [
-                        ("複勝 (button)", 'button:has-text("複勝")'),
-                        ("複勝 (a/li)", 'a:has-text("複勝"), li:has-text("複勝")'),
-                        ("単勝", 'button:has-text("単勝"), a:has-text("単勝")'),
-                        ("車番セルクス", 'button[data-car], td[data-car], div[data-car]'),
-                        ("number input", 'input[type="number"]'),
-                        ("text input", 'input[type="text"]'),
-                        ("td 全般", 'td'),
-                        ("確定/投票/購入", 'button:has-text("確定"), button:has-text("購入"), button:has-text("投票")'),
+                # --- Step 13: 「投票確認へ」 click (最後の安全な step) ---
+                out("\n[13] 「投票確認へ」 click (確認画面に遷移、実投票はまだ):")
+                confirmed = False
+                if added:
+                    for sel in [
+                        'button:has-text("投票確認へ")',
+                        'button:has-text("確認へ")',
                     ]:
-                        try:
-                            cnt = await page.locator(sel_query).count()
-                            out(f"    {sel_desc}: '{sel_query}' → {cnt} 個")
-                        except Exception as e:
-                            out(f"    {sel_desc}: error {e}")
-            except Exception as e:
-                out(f"    [10] 例外: {e}")
+                        cnt = await page.locator(sel).count()
+                        if cnt > 0:
+                            out(f"    候補: {sel} ({cnt} 個)")
+                            try:
+                                disabled = await page.locator(sel).first.is_disabled()
+                                if disabled:
+                                    out(f"    → disabled、スキップ")
+                                    continue
+                                await page.locator(sel).first.click(timeout=5000)
+                                confirmed = True
+                                out(f"    → click OK")
+                                await asyncio.sleep(3)
+                                break
+                            except Exception as e:
+                                out(f"    → click 失敗: {e}")
+                else:
+                    out("    投票シート追加が失敗のため、確認 click はスキップ")
+
+                if confirmed:
+                    await _dump_all("after_confirm_click", 13)
+                    out("\n⚠️ 確認画面に到達。**最終投票 button は click せず終了**")
+                    out("   ↑ この画面の visible button から最終投票の selector を確認してください")
 
             # 5 秒待って閉じる (目視確認用)
             out("\n[done] 5 秒後にウインドウを閉じます ...")
