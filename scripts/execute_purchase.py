@@ -1,4 +1,4 @@
-"""vote.autorace.jp に Playwright で複勝投票実行 (2026-05-08 導入)。
+"""vote.autorace.jp に Playwright で複勝投票実行 (2026-05-08 導入 / 2026-05-09 本番 selector 実装)。
 
 ⚠️ 重要: 規約解釈は灰色 (memory ml_baseline_findings.md 2026-05-08 参照)。
 本人 click in the loop で「自ら申込む」を満たす設計だが、公式 UI 非経由は
@@ -9,16 +9,24 @@
   - 金額 ≤ ¥1,000 (誤発火による損失上限)
   - 1 token 1 回限り (buy_token.py 側で重複防止)
 
-⚠️ 初期 release (2026-05-08): dry-run mode のみ動作確認済。
-   実購入の selector / form 構造は **未調査**。dry-run で navigate のみ確認後、
-   inspect_purchase_page.py で確認 → execute_purchase.py の TODO 部分を埋める
-   → 慎重に手動テストしてから本番 enable。
+実行フロー (2026-05-09 inspect_purchase_page.py で構造確認済):
+  1. login 状態確認 (永続プロファイル経由)
+  2. /vote?vel_code=NNN&race_num=N に navigate
+  3. #select-bettype 内で 「複勝」 click → ON
+  4. #select-bettype 内で 「３連単」 click → OFF (default active を解除)
+  5. 車番テーブル N 行目 1 列目 (１着列) の label click → 複勝対象として選択
+  6. 「投票シートに追加」 click
+  7. 「投票確認へ」 click → /vote/confirm にナビ
+  8. 「投票する」 click → ★ 実投票 (--dry-run 時はスキップ)
 
 使い方:
-  python scripts/execute_purchase.py --race-date 2026-05-08 --place 6 \\
+  # dry-run (実投票せず確認画面到達のみ、デフォルト動作確認用)
+  python scripts/execute_purchase.py --race-date 2026-05-09 --place 6 \\
     --race 5 --car 4 --amount 100 --dry-run
 
-  --dry-run なし = 実購入 (危険、初期は使わない)
+  # 本番 (実投票発生)
+  python scripts/execute_purchase.py --race-date 2026-05-09 --place 6 \\
+    --race 5 --car 4 --amount 100
 """
 
 from __future__ import annotations
@@ -95,72 +103,171 @@ async def execute_buy(
         page = await context.new_page()
 
         try:
-            # === Step 1: ログイン状態確認 (auto_login_autorace と同じ機構) ===
-            await page.goto("https://vote.autorace.jp/", timeout=30000)
+            # === Step 1: login 状態確認 (永続プロファイル流用) ===
+            await page.goto("https://vote.autorace.jp/",
+                            wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(2)
-            login_link = page.locator(
-                'a:has-text("ログイン"), button:has-text("ログイン")'
-            ).first
-            need_login = (
-                await login_link.count() > 0 and await login_link.is_visible()
-            )
-            if need_login:
-                # 永続プロファイルが切れている場合、auto_login_autorace を呼んで
-                # cookie を更新する手順が必要。ここは初期版では未実装。
+            try:
+                logout_btn = page.locator(
+                    'a:has-text("ログアウト"), button:has-text("ログアウト")'
+                ).first
+                logged_in = (
+                    await logout_btn.count() > 0
+                    and await logout_btn.is_visible()
+                )
+            except Exception:
+                logged_in = False
+            if not logged_in:
                 raise RuntimeError(
                     "ログイン状態が切れています。先に "
                     "scripts/auto_login_autorace.py を実行してから再試行してください。"
                 )
+            print(f"[execute_purchase] logged-in 確認", file=sys.stderr)
 
-            # === Step 2: 投票ページに遷移 ===
-            # ⚠️ TODO: 実際の投票画面 URL pattern は要調査
-            # 候補 1: /race/{velCode}/{YYYY-MM-DD}/R{n}/vote
-            # 候補 2: /vote?velCode=...&date=...&race=...
-            # → 初回は inspect_purchase_page.py を作って実際の URL を確認
+            # === Step 2: 投票画面に navigate ===
             target_url = (
-                f"https://vote.autorace.jp/race/{vel_code}/{race_date}/R{race_no}"
+                f"https://vote.autorace.jp/vote"
+                f"?vel_code={vel_code}&race_num={race_no}"
             )
             print(f"[execute_purchase] navigating to: {target_url}",
                   file=sys.stderr)
-            await page.goto(target_url, timeout=30000)
+            await page.goto(target_url, wait_until="domcontentloaded",
+                            timeout=30000)
             await asyncio.sleep(3)
-
-            current_url = page.url
-            print(f"[execute_purchase] current URL: {current_url}",
+            print(f"[execute_purchase] current URL: {page.url}",
                   file=sys.stderr)
 
-            # === Step 3: 複勝の入力 (要調査) ===
-            # ⚠️ TODO: 以下は仮の selector。実際は要調査:
-            #   - 券種選択タブ ("複勝")
-            #   - 車番選択 (car_no)
-            #   - 金額入力 (¥100)
-            #   - 投票ボタン
+            # /login にリダイレクトされていないか確認
+            if "/login" in page.url:
+                raise RuntimeError(
+                    f"login 画面に redirect されました ({page.url}) — "
+                    "session 切れ"
+                )
 
+            # === Step 3: 複勝タブを ON ===
+            print(f"[execute_purchase] step 3: 複勝 ON",
+                  file=sys.stderr)
+            try:
+                fukushou = page.locator(
+                    '#select-bettype label:has-text("複勝")'
+                ).first
+                await fukushou.click(timeout=5000)
+                await asyncio.sleep(1.5)
+            except Exception as e:
+                raise RuntimeError(f"複勝 click 失敗: {e}")
+
+            # === Step 4: ３連単タブを OFF (default active を解除) ===
+            print(f"[execute_purchase] step 4: ３連単 OFF (deselect)",
+                  file=sys.stderr)
+            try:
+                sanrentan = page.locator(
+                    '#select-bettype label:has-text("３連単")'
+                ).first
+                if await sanrentan.count() > 0:
+                    await sanrentan.click(timeout=5000)
+                    await asyncio.sleep(1.5)
+            except Exception as e:
+                # deselect 失敗は致命的ではない (元から OFF だった可能性)
+                print(f"[execute_purchase] ３連単 deselect 失敗(継続): {e}",
+                      file=sys.stderr)
+
+            # === Step 5: 車番 N の １着列 (= 複勝対象) を click ===
+            print(f"[execute_purchase] step 5: 車番 {car_no} click",
+                  file=sys.stderr)
+            try:
+                car_label = page.locator(
+                    f'table:has(th:has-text("１着")) tbody '
+                    f'tr:nth-child({car_no}) td:nth-child(1) label'
+                ).first
+                await car_label.click(timeout=5000)
+                await asyncio.sleep(1)
+            except Exception as e:
+                raise RuntimeError(f"車番 {car_no} click 失敗: {e}")
+
+            # === Step 6: 「投票シートに追加」 click ===
+            print(f"[execute_purchase] step 6: 投票シートに追加",
+                  file=sys.stderr)
+            try:
+                add_btn = page.locator(
+                    'button:has-text("投票シートに追加")'
+                ).first
+                if await add_btn.is_disabled():
+                    raise RuntimeError(
+                        "投票シートに追加が disabled (車番未選択 / 締切超過 / 不正)"
+                    )
+                await add_btn.click(timeout=5000)
+                await asyncio.sleep(2)
+            except Exception as e:
+                raise RuntimeError(f"投票シートに追加 click 失敗: {e}")
+
+            # === Step 7: 「投票確認へ」 click → /vote/confirm に遷移 ===
+            print(f"[execute_purchase] step 7: 投票確認へ",
+                  file=sys.stderr)
+            try:
+                confirm_btn = page.locator(
+                    'button:has-text("投票確認へ")'
+                ).first
+                if await confirm_btn.is_disabled():
+                    raise RuntimeError("投票確認へ が disabled")
+                await confirm_btn.click(timeout=5000)
+                await asyncio.sleep(3)
+                if "/confirm" not in page.url:
+                    print(
+                        f"[execute_purchase] 警告: 確認画面 URL が予想と違う: {page.url}",
+                        file=sys.stderr,
+                    )
+            except Exception as e:
+                raise RuntimeError(f"投票確認へ click 失敗: {e}")
+
+            # === Step 8: 「投票する」 click ★ 実投票発生 ===
             if dry_run:
-                # dry-run mode: 実際の投票はせず、画面到達のみ確認
+                # dry-run mode: 確認画面で停止、実投票せず終了
                 print(
-                    f"[execute_purchase] dry-run: would buy "
-                    f"複勝 {car_no}号 ¥{amount} at {current_url}",
+                    f"[execute_purchase] dry-run: 確認画面まで到達、"
+                    f"「投票する」 click はスキップ",
                     file=sys.stderr,
                 )
-                # 5 秒待ってから window 閉じる (目視確認用)
-                await asyncio.sleep(5)
+                await asyncio.sleep(3)  # 目視用
                 return {
                     "success": True,
                     "dry_run": True,
-                    "url": current_url,
+                    "url": page.url,
                     "message": (
-                        f"dry-run OK: navigated to {current_url}, "
-                        f"would buy 複勝 {car_no}号 ¥{amount}"
+                        f"dry-run OK: 確認画面到達 ({page.url})、"
+                        f"複勝 {car_no}号 ¥{amount} 投票画面表示済"
                     ),
                 }
 
-            # === Step 4: 実購入 (未実装) ===
-            raise NotImplementedError(
-                "実購入ロジック (form 入力・確認モーダル・投票実行) は未実装。\n"
-                "scripts/inspect_purchase_page.py で vote.autorace.jp の購入画面構造を\n"
-                "調査してから execute_purchase.py の TODO 部分を実装してください。"
-            )
+            print(f"[execute_purchase] step 8: 投票する (実投票)",
+                  file=sys.stderr)
+            try:
+                vote_btn = page.locator(
+                    'button:has-text("投票する")'
+                ).first
+                if await vote_btn.count() == 0:
+                    raise RuntimeError("「投票する」 button が見つからない")
+                if await vote_btn.is_disabled():
+                    raise RuntimeError("「投票する」が disabled (締切超過?)")
+                await vote_btn.click(timeout=5000)
+                # 投票完了画面 / 結果メッセージを待つ
+                await asyncio.sleep(5)
+                final_url = page.url
+                print(
+                    f"[execute_purchase] 投票完了 (URL: {final_url})",
+                    file=sys.stderr,
+                )
+            except Exception as e:
+                raise RuntimeError(f"投票する click 失敗: {e}")
+
+            return {
+                "success": True,
+                "dry_run": False,
+                "url": page.url,
+                "message": (
+                    f"投票完了: 複勝 {car_no}号 ¥{amount} "
+                    f"@ {race_date} place_code={place_code} R{race_no}"
+                ),
+            }
 
         finally:
             try:
