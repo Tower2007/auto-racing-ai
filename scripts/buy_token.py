@@ -124,6 +124,31 @@ def is_consumed(sig: str) -> bool:
     return False
 
 
+def _get_tailscale_ip() -> str | None:
+    """Tailscale CLI で自分の Tailscale IPv4 を取得 (失敗時 None)。"""
+    import subprocess
+    candidates = [
+        "tailscale",
+        r"C:\Program Files\Tailscale\tailscale.exe",
+        r"C:\Program Files (x86)\Tailscale\tailscale.exe",
+    ]
+    for cmd in candidates:
+        try:
+            r = subprocess.run(
+                [cmd, "ip", "-4"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                ip = r.stdout.strip().splitlines()[0].strip()
+                if ip.startswith("100."):  # Tailscale CGNAT 範囲
+                    return ip
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+        except Exception:
+            continue
+    return None
+
+
 def get_lan_ip() -> str:
     """LAN IP を検出 (UDP socket trick で 8.8.8.8 への route から自分の IP を取得)。"""
     import socket
@@ -138,18 +163,46 @@ def get_lan_ip() -> str:
     return ip
 
 
+def get_host_ip() -> str:
+    """購入 URL に使うホスト IP を決定 (優先順位):
+
+    1. accounts.json の "host_ip" が設定されていればそれ
+       (Tailscale IP / 公開 IP / LAN IP を手動指定可)
+    2. Tailscale CLI で自動検出 (100.x.y.z)
+    3. LAN IP fallback (192.168.x.y 等)
+    """
+    # (1) accounts.json 手動指定
+    if ACCOUNTS_PATH.exists():
+        try:
+            with ACCOUNTS_PATH.open(encoding="utf-8") as f:
+                config = json.load(f)
+            host_ip = config.get("host_ip", "").strip()
+            if host_ip and not host_ip.startswith("REPLACE"):
+                return host_ip
+        except Exception:
+            pass
+
+    # (2) Tailscale 自動検出
+    ts_ip = _get_tailscale_ip()
+    if ts_ip:
+        return ts_ip
+
+    # (3) LAN IP fallback
+    return get_lan_ip()
+
+
 def build_buy_url(payload: dict, host: str | None = None,
                    port: int = 8502) -> str:
     """購入確認画面 (buy_app.py) への URL を返す。
 
     Args:
         payload: race_date / place_code / race_no / car_no / amount / ev / venue_jp
-        host: None なら LAN IP 自動検出
+        host: None なら get_host_ip() で自動決定 (accounts.json > Tailscale > LAN)
         port: buy_app の port (default 8502)
     """
     b64, sig = sign(payload)
     if host is None:
-        host = get_lan_ip()
+        host = get_host_ip()
     return f"http://{host}:{port}/?p={b64}&s={sig}"
 
 
@@ -174,3 +227,7 @@ if __name__ == "__main__":
     print(f"verified: {verified}")
     url = build_buy_url(test_payload)
     print(f"url: {url}")
+    print(f"host_ip 決定経路:")
+    ts = _get_tailscale_ip()
+    print(f"  tailscale ip -4 → {ts!r}")
+    print(f"  LAN IP fallback → {get_lan_ip()!r}")

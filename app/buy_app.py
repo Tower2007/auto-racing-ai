@@ -3,18 +3,20 @@
 メールの「💰 購入する」ボタンから token 付き URL でアクセスされる。
 1. token 検証 (HMAC + 期限 + 消費済チェック)
 2. レース情報 + 推奨内容を表示
-3. 「✅ 購入する」ボタンで scripts/execute_purchase.py を起動
-4. 結果表示
+3. PIN 認証 (accounts.json に "pin" 設定時のみ、未設定なら skip)
+4. 「✅ 購入する」ボタンで scripts/execute_purchase.py を起動
+5. 結果表示
 
 使い方:
   streamlit run app/buy_app.py --server.port 8502 --server.address 0.0.0.0
 
-  → 同 LAN の端末から http://<LAN-IP>:8502/?p=<payload>&s=<sig> で確認画面へ
+  → 同 LAN / Tailscale 内の端末から http://<HOST-IP>:8502/?p=<payload>&s=<sig>
 
 設計メモ:
-  - --server.address 0.0.0.0 でスマホからも LAN 内アクセス可
+  - --server.address 0.0.0.0 でスマホからも LAN / Tailscale 内アクセス可
   - port 8502 (メイン streamlit_app.py は 8501)
   - dry-run mode は execute_purchase.py 側で制御
+  - PIN は出先からの URL 流出時の最終防衛 (Tailscale 暗号化 + token + PIN の 3 層)
 """
 
 from __future__ import annotations
@@ -30,8 +32,24 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
 VENUE_JP_MAP = {2: "川口", 3: "伊勢崎", 4: "浜松", 5: "飯塚", 6: "山陽"}
+ACCOUNTS_PATH = ROOT / "accounts.json"
 
 st.set_page_config(page_title="autorace 購入確認", page_icon="💰", layout="centered")
+
+
+def _load_pin() -> str:
+    """accounts.json から PIN を読む (未設定なら空文字 = PIN 認証 skip)。"""
+    if not ACCOUNTS_PATH.exists():
+        return ""
+    try:
+        with ACCOUNTS_PATH.open(encoding="utf-8") as f:
+            config = json.load(f)
+        accounts = config.get("accounts", [])
+        if accounts:
+            return str(accounts[0].get("pin", "")).strip()
+    except Exception:
+        pass
+    return ""
 
 
 def _import_token_module():
@@ -124,9 +142,30 @@ dry_run = st.checkbox(
     ),
 )
 
+# PIN 認証 (accounts.json に pin 設定時のみ表示)
+expected_pin = _load_pin()
+pin_input = ""
+if expected_pin:
+    st.write("")
+    pin_input = st.text_input(
+        "🔢 PIN (4 桁)",
+        type="password",
+        max_chars=8,
+        help=(
+            "accounts.json で設定した PIN を入力。"
+            "URL 流出時の最終防衛(Tailscale 暗号化 + token + PIN の 3 層)。"
+        ),
+    )
+
 st.write("")
 
 if st.button("✅ 購入する", type="primary", use_container_width=True):
+    # PIN 認証チェック (設定時のみ)
+    if expected_pin and pin_input != expected_pin:
+        st.error("🚫 PIN が一致しません")
+        bt.log_token(payload, sig=sig, status="failed",
+                     note="PIN mismatch")
+        st.stop()
     # 消費としてマーク (実行前に記録、再 click 防止)
     bt.log_token(payload, sig=sig,
                  status="consumed" if not dry_run else "dry_run",
@@ -173,7 +212,8 @@ if st.button("✅ 購入する", type="primary", use_container_width=True):
             st.code(result.stderr or result.stdout or "(no output)")
 
 st.write("---")
+_pin_label = "PIN 認証 ON" if expected_pin else "PIN 認証 OFF (accounts.json で 'pin' 設定で有効化)"
 st.caption(
     "© autorace-ai click-to-buy &nbsp;|&nbsp; "
-    "🛡️ token 1 回限り / Phase A 推奨のみ / 金額 ¥100 固定 (server side validation)"
+    f"🛡️ token 1 回限り / Phase A 推奨のみ / 金額 ¥100 固定 / {_pin_label}"
 )

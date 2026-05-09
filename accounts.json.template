@@ -4,13 +4,16 @@
   "headless": false,
   "_headless_note": "初回は false で目視確認。ボット検知が無いと確認できたら true に切替可。",
   "buy_secret_key": "REPLACE_WITH_RANDOM_32CHAR_HEX",
-  "_buy_secret_note": "click-to-buy 機構の HMAC 署名鍵。32 文字以上のランダム文字列。生成例: python -c \"import secrets; print(secrets.token_hex(32))\"",
+  "_buy_secret_note": "click-to-buy の HMAC 署名鍵。生成例: python -c \"import secrets; print(secrets.token_hex(32))\"",
+  "host_ip": "",
+  "_host_ip_note": "(任意) 購入確認 URL に使うホスト IP。空欄なら Tailscale CLI で自動検出 → 失敗時 LAN IP fallback。出先スマホ運用時は Tailscale IP (例: '100.85.32.41') を手動指定すると確実。",
   "accounts": [
     {
       "name": "main",
       "user_id": "VOTE_AUTORACE_USER_ID",
       "password": "VOTE_AUTORACE_PASSWORD",
-      "_pin_optional": "もし 4 桁 PIN 等の追加フィールドがあれば 'pin': '1234' を追加"
+      "pin": "",
+      "_pin_note": "(任意) click-to-buy 確認画面で要求される 4 桁 PIN。空欄なら PIN 認証 OFF。出先からの URL 流出時の最終防衛、設定推奨。"
     }
   ]
 }
