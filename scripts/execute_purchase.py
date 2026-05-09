@@ -421,6 +421,42 @@ def main() -> None:
     except Exception:
         pass
 
+    # === 緊急 fail-safe (2026-05-09 Codex P1 指摘で暫定無効化) ===
+    # Codex review の P1-P3 で以下の本番安全性問題が指摘された:
+    #   P1: 確認画面で券種・車番・場/R を構造的に検証していない
+    #   P1: token の race_date が実投票 URL に検証されていない (TTL 24h)
+    #   P2: 投票完了確認なしで success
+    #   P2: token 消費が atomic でない
+    # 修正完了までは本番モードを無効化し、--dry-run のみ動作可能とする。
+    # 修正ロードマップ: Opinion/codex_briefs/execute_purchase_hardening.md (予定)
+    if not args.dry_run:
+        print(
+            "[execute_purchase] ⚠️ 本番モードは現在 暫定無効化 されています。",
+            file=sys.stderr,
+        )
+        print(
+            "[execute_purchase] 理由: Codex review (2026-05-09) で本番安全性に "
+            "P1-P3 の指摘あり (確認画面の券種/車番/日付検証なし、投票完了確認なし、"
+            "token consume の atomic 性なし、金額 validation 不足)。",
+            file=sys.stderr,
+        )
+        print(
+            "[execute_purchase] 修正完了まで --dry-run のみ動作可能です。",
+            file=sys.stderr,
+        )
+        print(
+            json.dumps({
+                "success": False,
+                "dry_run": False,
+                "error": "live_purchase_disabled_pending_codex_fixes",
+                "message": (
+                    "本番モードは Codex P1-P3 修正完了まで暫定無効化中。"
+                    "--dry-run を付けて再実行してください。"
+                ),
+            }, ensure_ascii=False, indent=2)
+        )
+        sys.exit(2)
+
     try:
         result = asyncio.run(execute_buy(
             args.race_date, args.place, args.race, args.car, args.amount,
