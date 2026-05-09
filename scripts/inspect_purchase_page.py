@@ -298,35 +298,50 @@ async def inspect(place_code: int, race_no: int, car_no: int | None,
                 html_path.write_text(html_x, encoding="utf-8")
                 out(f"    html: {html_path}")
 
-            # --- Step 10: 複勝タブ click ---
-            # vote.autorace.jp には 2 つの 複勝 タブが存在:
-            # (1) 中央オッズ表示タブ: <label><input type="radio">複勝</label> (radio)
-            # (2) 右パネル投票タブ:   <label><input type="checkbox">複勝</label> (checkbox)
-            # (2) を click する必要がある (投票モード切替)。
-            out(f"\n[10] 複勝タブ click を試行:")
+            # --- Step 10: 投票パネルで 複勝 ON / 3連単 OFF にする ---
+            # 投票パネル (#select-bettype) は「複数の券種を同時 active」設計。
+            # 初期は ３連単 が RED、他は gray。
+            # 複勝 only にするには:
+            #   (a) 複勝 click → active 追加 (３連単 + 複勝 両方 active)
+            #   (b) ３連単 click → deselect (複勝のみ active)
+            # ⚠️ HTML 内の数字は全角 (３連単 / １着 等)。selector も全角で書く。
+            out(f"\n[10] 投票パネル: 複勝 ON + ３連単 OFF を試行")
             clicked_fukushou = False
             try:
-                # 投票パネル(checkbox 型)を優先、見つからなければ generic にフォールバック
-                for sel in [
-                    # 投票パネルの 複勝 タブ (checkbox を含む label)
-                    'label:has(input[type="checkbox"][name="name"]):has-text("複勝")',
-                    # フォールバック: 順序ベース (右パネルが後ろにある想定)
-                    'label.cb:has-text("複勝")',
-                    'label:has-text("複勝")',
-                ]:
-                    cnt = await page.locator(sel).count()
+                # (a) 複勝 click
+                fukushou_loc = page.locator(
+                    '#select-bettype label:has-text("複勝")'
+                ).first
+                cnt = await fukushou_loc.count()
+                if cnt > 0:
+                    await fukushou_loc.click(timeout=5000)
+                    clicked_fukushou = True
+                    out(f"    複勝 click OK")
+                    await asyncio.sleep(1.5)
+                else:
+                    out(f"    #select-bettype 内に 複勝 が見つからない")
+
+                # (b) ３連単 click (全角3)
+                if clicked_fukushou:
+                    sanrentan_loc = page.locator(
+                        '#select-bettype label:has-text("３連単")'
+                    ).first
+                    cnt = await sanrentan_loc.count()
                     if cnt > 0:
-                        out(f"    候補: {sel} ({cnt} 個)")
-                        try:
-                            # 複数マッチした場合は last (右パネル) を採用
-                            target_loc = page.locator(sel).last
-                            await target_loc.click(timeout=5000)
-                            clicked_fukushou = True
-                            out(f"    → click OK (.last)")
-                            await asyncio.sleep(2)
-                            break
-                        except Exception as e:
-                            out(f"    → click 失敗: {e}")
+                        await sanrentan_loc.click(timeout=5000)
+                        out(f"    ３連単 click OK (deselect)")
+                        await asyncio.sleep(1.5)
+                    else:
+                        out(f"    #select-bettype 内に ３連単 が見つからない")
+                        # 半角でもう一度試す
+                        sanrentan_loc2 = page.locator(
+                            '#select-bettype label:has-text("3連単")'
+                        ).first
+                        if await sanrentan_loc2.count() > 0:
+                            await sanrentan_loc2.click(timeout=5000)
+                            out(f"    3連単 click OK (半角でヒット)")
+                            await asyncio.sleep(1.5)
+
                 if not clicked_fukushou:
                     out("    複勝タブ click 不可、フロー中断")
                     raise RuntimeError("fukushou-click-failed")
@@ -336,18 +351,17 @@ async def inspect(place_code: int, race_no: int, car_no: int | None,
             if clicked_fukushou:
                 await _dump_all("after_fukushou_click", 10)
 
-                # --- Step 11: 車番 N click (target_car=4 の対象チェック) ---
-                out(f"\n[11] 車番 {target_car} のチェックを click:")
+                # --- Step 11: 車番 N の 「１着」列 click ---
+                # 複勝モードでは「１着」列(col 1) が「対象選択」として機能。
+                # selector: チェックボックス table の N 行目 1 列目の input
+                # ※ 全角１ (１)
+                out(f"\n[11] 車番 {target_car} の １着列 (複勝対象) click:")
                 clicked_car = False
-                # 候補 selector を順に試行
                 for sel in [
-                    f'input[type="checkbox"][value="{target_car}"]',
-                    f'input[type="radio"][value="{target_car}"]',
-                    f'label:has-text("{target_car}号") input[type="checkbox"]',
-                    f'tr:has-text("{target_car}号") input[type="checkbox"]',
-                    # 車番テーブルの N 行目をクリックする方式
-                    f'[data-car="{target_car}"]',
-                    f'[data-num="{target_car}"]',
+                    f'table:has(th:has-text("１着")) tbody tr:nth-child({target_car}) td:nth-child(1) input[type="checkbox"]',
+                    f'table:has(th:has-text("１着")) tbody tr:nth-child({target_car}) td:nth-child(1) label',
+                    # フォールバック (半角 1着)
+                    f'table:has(th:has-text("1着")) tbody tr:nth-child({target_car}) td:nth-child(1) input[type="checkbox"]',
                 ]:
                     try:
                         loc = page.locator(sel)
