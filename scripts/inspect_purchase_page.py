@@ -299,20 +299,28 @@ async def inspect(place_code: int, race_no: int, car_no: int | None,
                 out(f"    html: {html_path}")
 
             # --- Step 10: 複勝タブ click ---
+            # vote.autorace.jp の券種タブは <label> + <input type="radio"> 構造
+            # (button ではない)
             out(f"\n[10] 複勝タブ click を試行:")
             clicked_fukushou = False
             try:
                 for sel in [
+                    'label:has-text("複勝")',
+                    'label.cb:has-text("複勝")',
                     'button:has-text("複勝")',
                     'a:has-text("複勝")',
                     'li:has-text("複勝")',
-                    '[role="tab"]:has-text("複勝")',
                 ]:
                     cnt = await page.locator(sel).count()
                     if cnt > 0:
                         out(f"    候補: {sel} ({cnt} 個)")
                         try:
-                            await page.locator(sel).first.click(timeout=5000)
+                            # 複勝 / 3連複 等が混じる場合 first だと誤クリック懸念
+                            # → text 完全一致を別途試行
+                            target_loc = page.locator(sel).filter(
+                                has_text="複勝"
+                            ).first
+                            await target_loc.click(timeout=5000)
                             clicked_fukushou = True
                             out(f"    → click OK")
                             await asyncio.sleep(2)
