@@ -239,6 +239,104 @@ async def inspect(place_code: int, race_no: int, car_no: int | None,
                 except Exception as e:
                     out(f"    {sel_desc}: error {e}")
 
+            # === Step 10: 「通常投票」をクリックして次の画面の構造も dump ===
+            out("\n[10] 「通常投票」ボタンを click して次の画面構造を dump:")
+            try:
+                normal_vote_btn = page.locator(
+                    'button:has-text("通常投票")'
+                ).first
+                if await normal_vote_btn.count() > 0:
+                    await normal_vote_btn.click(timeout=5000)
+                    await asyncio.sleep(3)
+                    after_url = page.url
+                    out(f"    通常投票 click 後 URL: {after_url}")
+
+                    # フォーム再 dump
+                    out("\n[11] (通常投票後) form 要素:")
+                    forms2 = await page.locator("form").all()
+                    out(f"    form 数: {len(forms2)}")
+                    for i, f in enumerate(forms2):
+                        try:
+                            info = await f.evaluate(
+                                "(el) => ({action: el.action, method: el.method, "
+                                "id: el.id, name: el.name})"
+                            )
+                            out(f"    [form {i}] {info}")
+                        except Exception as e:
+                            out(f"    [form {i}] error: {e}")
+
+                    out("\n[12] (通常投票後) input 要素:")
+                    inputs2 = await page.locator("input").all()
+                    out(f"    input 数: {len(inputs2)}")
+                    for i, inp in enumerate(inputs2[:80]):
+                        try:
+                            info = await inp.evaluate(
+                                "(el) => ({name: el.name, id: el.id, type: el.type, "
+                                "value: el.value, placeholder: el.placeholder, "
+                                "visible: el.offsetParent !== null})"
+                            )
+                            out(f"    [{i}] {info}")
+                        except Exception as e:
+                            out(f"    [{i}] error: {e}")
+
+                    out("\n[13] (通常投票後) select 要素:")
+                    selects2 = await page.locator("select").all()
+                    out(f"    select 数: {len(selects2)}")
+                    for i, sel in enumerate(selects2):
+                        try:
+                            info = await sel.evaluate(
+                                "(el) => ({name: el.name, id: el.id, "
+                                "options: Array.from(el.options).slice(0,15).map(o => "
+                                "({value: o.value, text: o.text}))})"
+                            )
+                            out(f"    [{i}] name={info['name']} id={info['id']}")
+                            for opt in info.get("options", []):
+                                out(f"        {opt}")
+                        except Exception as e:
+                            out(f"    [{i}] error: {e}")
+
+                    out("\n[14] (通常投票後) button 要素:")
+                    buttons2 = await page.locator("button").all()
+                    out(f"    button 数: {len(buttons2)}")
+                    for i, btn in enumerate(buttons2[:40]):
+                        try:
+                            info = await btn.evaluate(
+                                "(el) => ({type: el.type, id: el.id, "
+                                "text: el.innerText.slice(0,40), "
+                                "visible: el.offsetParent !== null})"
+                            )
+                            out(f"    [{i}] {info}")
+                        except Exception as e:
+                            out(f"    [{i}] error: {e}")
+
+                    # 通常投票後 HTML も保存
+                    html2 = await page.content()
+                    DUMP_HTML2 = ROOT / "data" / "purchase_form_dump_after.html"
+                    DUMP_HTML2.write_text(html2, encoding="utf-8")
+                    out(f"\n[15] (通常投票後) HTML 保存: {DUMP_HTML2}")
+
+                    # 複勝 / 車番 等の selector ヒット数チェック (再)
+                    out("\n[16] (通常投票後) selector ヒント:")
+                    for sel_desc, sel_query in [
+                        ("複勝 (button)", 'button:has-text("複勝")'),
+                        ("複勝 (a/li)", 'a:has-text("複勝"), li:has-text("複勝")'),
+                        ("単勝", 'button:has-text("単勝"), a:has-text("単勝")'),
+                        ("車番セルクス", 'button[data-car], td[data-car], div[data-car]'),
+                        ("number input", 'input[type="number"]'),
+                        ("text input", 'input[type="text"]'),
+                        ("td 全般", 'td'),
+                        ("確定/投票/購入", 'button:has-text("確定"), button:has-text("購入"), button:has-text("投票")'),
+                    ]:
+                        try:
+                            cnt = await page.locator(sel_query).count()
+                            out(f"    {sel_desc}: '{sel_query}' → {cnt} 個")
+                        except Exception as e:
+                            out(f"    {sel_desc}: error {e}")
+                else:
+                    out("    「通常投票」ボタンが見つからない")
+            except Exception as e:
+                out(f"    [10] 例外: {e}")
+
             # 5 秒待って閉じる (目視確認用)
             out("\n[done] 5 秒後にウインドウを閉じます ...")
             await asyncio.sleep(5)
