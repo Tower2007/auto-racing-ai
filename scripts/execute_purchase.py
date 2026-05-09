@@ -35,6 +35,7 @@ import argparse
 import asyncio
 import json
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -124,6 +125,51 @@ async def execute_buy(
                 )
             print(f"[execute_purchase] logged-in 確認", file=sys.stderr)
 
+            # === Step 1.5: カートクリア (前回 dry-run 残骸対策) ===
+            print(f"[execute_purchase] step 1.5: 既存カートクリア",
+                  file=sys.stderr)
+            try:
+                # confirm 画面の dialog (確認 prompt 等) は自動 accept
+                page.on(
+                    'dialog',
+                    lambda d: asyncio.create_task(d.accept()),
+                )
+                confirm_url = (
+                    f"https://vote.autorace.jp/vote/confirm"
+                    f"?vel_code={vel_code}&race_num={race_no}"
+                )
+                await page.goto(confirm_url, wait_until="domcontentloaded",
+                                timeout=30000)
+                await asyncio.sleep(2)
+                # /login にリダイレクトされてないか確認
+                if "/login" in page.url:
+                    raise RuntimeError(
+                        f"login 画面に redirect されました ({page.url}) — "
+                        "session 切れ"
+                    )
+                # 「全削除」 button が visible なら click(カート空でない)
+                delete_btn = page.locator(
+                    'button:has-text("全削除")'
+                ).first
+                if await delete_btn.count() > 0:
+                    try:
+                        await delete_btn.click(timeout=5000)
+                        await asyncio.sleep(2)
+                        print(f"[execute_purchase] カートクリア OK",
+                              file=sys.stderr)
+                    except Exception as e:
+                        print(
+                            f"[execute_purchase] 全削除 click 失敗(継続): {e}",
+                            file=sys.stderr,
+                        )
+                else:
+                    print(f"[execute_purchase] カートは元々空", file=sys.stderr)
+            except RuntimeError:
+                raise
+            except Exception as e:
+                print(f"[execute_purchase] カートクリアスキップ: {e}",
+                      file=sys.stderr)
+
             # === Step 2: 投票画面に navigate ===
             target_url = (
                 f"https://vote.autorace.jp/vote"
@@ -184,6 +230,39 @@ async def execute_buy(
             except Exception as e:
                 raise RuntimeError(f"車番 {car_no} click 失敗: {e}")
 
+            # === Step 5.5: 金額入力を amount/100 に明示 set ===
+            # 「各 [N] 00円」の N を amount//100 に。
+            # default は 1 (=¥100) だが前回テストで 2 等になってる可能性
+            unit_value = str(amount // 100)
+            print(
+                f"[execute_purchase] step 5.5: 金額 input を '{unit_value}' "
+                f"(={amount}円) に reset",
+                file=sys.stderr,
+            )
+            amount_set_ok = False
+            for sel in [
+                'input[type="text"]:visible',
+                'input[type="number"]:visible',
+            ]:
+                try:
+                    amount_input = page.locator(sel).first
+                    if await amount_input.count() > 0:
+                        await amount_input.fill(unit_value, timeout=3000)
+                        await asyncio.sleep(0.5)
+                        amount_set_ok = True
+                        break
+                except Exception as e:
+                    print(
+                        f"[execute_purchase] 金額 set ({sel}) 失敗: {e}",
+                        file=sys.stderr,
+                    )
+            if not amount_set_ok:
+                print(
+                    f"[execute_purchase] 警告: 金額 input が見つからず "
+                    f"default 値で進む",
+                    file=sys.stderr,
+                )
+
             # === Step 6: 「投票シートに追加」 click ===
             print(f"[execute_purchase] step 6: 投票シートに追加",
                   file=sys.stderr)
@@ -218,6 +297,56 @@ async def execute_buy(
                     )
             except Exception as e:
                 raise RuntimeError(f"投票確認へ click 失敗: {e}")
+
+            # === Step 7.5: 確認画面の件数 + 金額チェック ===
+            # 期待: 投票数 1組 1票 / 合計購入額 = amount 円
+            print(
+                f"[execute_purchase] step 7.5: 確認画面の件数 / 金額 check",
+                file=sys.stderr,
+            )
+            # screenshot 保存 (debug 用)
+            try:
+                shot_path = (
+                    ROOT / "data"
+                    / f"execute_step_7_confirm_{int(time.time())}.png"
+                )
+                await page.screenshot(path=str(shot_path), full_page=True)
+                print(f"[execute_purchase] screenshot: {shot_path}",
+                      file=sys.stderr)
+            except Exception as e:
+                print(f"[execute_purchase] screenshot 失敗(継続): {e}",
+                      file=sys.stderr)
+
+            try:
+                page_text = await page.evaluate(
+                    "() => document.body.innerText"
+                )
+            except Exception as e:
+                page_text = ""
+                print(f"[execute_purchase] body.innerText 取得失敗: {e}",
+                      file=sys.stderr)
+
+            # 件数チェック: 「1組」 が含まれていること
+            # 期待文: "投票数 1組 1票" 等
+            if "1組" not in page_text:
+                raise RuntimeError(
+                    f"確認画面に '1組' が見つからない (cart 件数異常)。"
+                    f" body text 抜粋: {page_text[:300]!r}"
+                )
+
+            # 金額チェック: 合計購入額が amount 円であること
+            expected_yen_str = f"{amount}円"
+            if expected_yen_str not in page_text:
+                raise RuntimeError(
+                    f"確認画面に '{expected_yen_str}' が見つからない "
+                    f"(合計金額が想定と違う)。body text 抜粋: "
+                    f"{page_text[:300]!r}"
+                )
+
+            print(
+                f"[execute_purchase] 確認画面 OK: 1組 / {amount}円 を確認",
+                file=sys.stderr,
+            )
 
             # === Step 8: 「投票する」 click ★ 実投票発生 ===
             if dry_run:
