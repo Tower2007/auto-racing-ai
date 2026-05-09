@@ -80,6 +80,26 @@ if not args.dry_run:
 3. memory `ml_baseline_findings.md` に修正完了記録を追加
 4. 本 brief を Opinion/codex_briefs/ から完了印付きで残す or 別 archive へ移す
 
+## 5 次 review 後の P3 (¥100 テスト後 follow-up)
+
+Codex 5 次 review (2026-05-09) で「P1 残無し、P2 grace を直せば本番解除に近い」
+判定。P2 は反映済 (CLICK_GRACE 30 秒)。残る P3 は ¥100 テスト後の follow-up:
+
+### P3-A: success keyword fallback を受付番号構造まで寄せる
+現状: `SUCCESS_KEYWORDS = ("投票が完了しました", "投票完了", "受付番号",
+"投票を受け付けました")` の単純文字列 match。
+推奨: 受付番号の実体パターン (例: `受付番号\s*[:：]?\s*\w+`) や強い完了文言に
+限定して、断片マッチでの誤成功を更に潰す。
+
+### P3-B: fetch_order_history の library 化
+現状: `fetch_orders()` の下流 `post_graphql()` が認証失敗時に
+`sys.exit(1)` する設計。library として呼ぶ buy_app / execute_purchase 側で
+`except Exception` が捕捉できず、終了が荒くなる。
+推奨: `post_graphql` を sys.exit ではなく専用例外 (例: `AuthError`,
+`GraphQLError`) を raise する形に refactor、cli main 側だけ exit に変換する。
+
+これらは初回 ¥100 テストの後で OK。
+
 ## 関連 commit / file
 
 - `scripts/execute_purchase.py` (main 関数)

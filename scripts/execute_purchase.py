@@ -550,9 +550,16 @@ async def execute_buy(
                 )
 
                 # exact match を探す:
-                #   - 各 order の createdAt が click_started_at 以後
+                #   - createdAt が click_started_at - 30秒 (grace) 以後
                 #   - packs に betType=FUKUSHOU かつ packDeme=str(car_no)
                 #     かつ voteAmount=amount のものがある
+                #
+                # Codex 5 次 review (P2): grace 30秒を入れることで、PC 時計
+                # ↔ サーバ時計のズレ / 秒丸め / 注文生成時刻が click 直前扱い
+                # で取り逃すケースを防ぐ。false-negative (実購入後に失敗扱い)
+                # は運用上紛らわしいため明示的に許容。
+                CLICK_GRACE = _dt.timedelta(seconds=30)
+                lower_bound = click_started_at - CLICK_GRACE
                 matches = []
                 for o in orders:
                     created_str = o.get("createdAt", "")
@@ -566,7 +573,7 @@ async def execute_buy(
                     except Exception:
                         # createdAt parse 失敗は skip (false-positive 防止)
                         continue
-                    if created < click_started_at:
+                    if created < lower_bound:
                         continue
                     for p in o.get("packs", []):
                         bet_type = str(p.get("betType", "")).strip()
