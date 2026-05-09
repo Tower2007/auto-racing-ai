@@ -45,9 +45,30 @@ PROFILE_DIR = ROOT / "profiles" / "autorace"
 # レース詳細ページ: https://vote.autorace.jp/race/{velCode}/{YYYY-MM-DD}/R{n}
 #   ※ 実際の URL pattern は inspect_purchase_page.py で要確認
 VEL_CODE_MAP = {2: "002", 3: "003", 4: "004", 5: "005", 6: "006"}
+VENUE_JP_MAP = {2: "川口", 3: "伊勢崎", 4: "浜松", 5: "飯塚", 6: "山陽"}
 
 # 安全制限 (server-side enforce)
 MAX_AMOUNT_YEN = 1000  # 1 R の最大投資額
+
+# 投票完了 / 失敗判定キーワード (Step 7.6 で使用)
+SUCCESS_KEYWORDS = (
+    "投票が完了しました",
+    "投票完了",
+    "受付番号",
+    "投票を受け付けました",
+)
+FAILURE_KEYWORDS = (
+    "締切",
+    "締め切り",
+    "残高不足",
+    "残高が不足",
+    "エラー",
+    "失敗しました",
+    "購入できません",
+    "投票できません",
+    "認証が必要",
+    "ログインが必要",
+)
 
 
 async def execute_buy(
@@ -326,25 +347,55 @@ async def execute_buy(
                 print(f"[execute_purchase] body.innerText 取得失敗: {e}",
                       file=sys.stderr)
 
-            # 件数チェック: 「1組」 が含まれていること
-            # 期待文: "投票数 1組 1票" 等
-            if "1組" not in page_text:
-                raise RuntimeError(
-                    f"確認画面に '1組' が見つからない (cart 件数異常)。"
-                    f" body text 抜粋: {page_text[:300]!r}"
-                )
+            # P1 hardening: 構造的検証 (券種 / 場 / R / 車番 / 件数 / 金額)
+            import re as _re
+            venue_jp = VENUE_JP_MAP.get(place_code, "?")
+            checks = [
+                (
+                    r"複勝",
+                    "券種が複勝でない (確認画面に '複勝' が無い)",
+                ),
+                (
+                    rf"{_re.escape(venue_jp)}\s*{race_no}\s*R",
+                    f"場/R 不一致 (期待: {venue_jp} {race_no}R)",
+                ),
+                # 「複勝 1組」直後に車番が表示される (HTML では <span>N</span>)
+                # innerText 上では「複勝\n1組\n4」のような表示。
+                # 安全のため複勝〜数字の近接マッチで検証。
+                (
+                    rf"複勝[\s\S]{{0,30}}\b{car_no}\b",
+                    f"車番 {car_no} の表示確認失敗",
+                ),
+                (
+                    r"投票数\s*\n?\s*1組",
+                    "投票数が 1組 でない",
+                ),
+                (
+                    r"1票",
+                    "1票 表記なし (件数異常)",
+                ),
+                (
+                    rf"合計購入額\s*\n?\s*{amount}\s*円",
+                    f"合計購入額が {amount}円 でない",
+                ),
+            ]
 
-            # 金額チェック: 合計購入額が amount 円であること
-            expected_yen_str = f"{amount}円"
-            if expected_yen_str not in page_text:
+            failures: list[str] = []
+            for pattern, errmsg in checks:
+                if not _re.search(pattern, page_text):
+                    failures.append(f"  - {errmsg} (pattern: {pattern})")
+
+            if failures:
                 raise RuntimeError(
-                    f"確認画面に '{expected_yen_str}' が見つからない "
-                    f"(合計金額が想定と違う)。body text 抜粋: "
-                    f"{page_text[:300]!r}"
+                    "確認画面検証失敗:\n"
+                    + "\n".join(failures)
+                    + f"\n  body text 抜粋:\n{page_text[:400]!r}"
                 )
 
             print(
-                f"[execute_purchase] 確認画面 OK: 1組 / {amount}円 を確認",
+                f"[execute_purchase] 確認画面 OK: 複勝 / "
+                f"{venue_jp} {race_no}R / {car_no}号 / 1組1票 / {amount}円 "
+                f"を全て確認",
                 file=sys.stderr,
             )
 
@@ -380,18 +431,78 @@ async def execute_buy(
                 await vote_btn.click(timeout=5000)
                 # 投票完了画面 / 結果メッセージを待つ
                 await asyncio.sleep(5)
-                final_url = page.url
-                print(
-                    f"[execute_purchase] 投票完了 (URL: {final_url})",
-                    file=sys.stderr,
-                )
             except Exception as e:
                 raise RuntimeError(f"投票する click 失敗: {e}")
+
+            # === Step 8.5: 投票完了 / 失敗の判定 (P2 hardening) ===
+            print(
+                f"[execute_purchase] step 8.5: 投票完了 / 失敗の判定",
+                file=sys.stderr,
+            )
+            final_url = page.url
+            try:
+                completion_text = await page.evaluate(
+                    "() => document.body.innerText"
+                )
+            except Exception:
+                completion_text = ""
+
+            # 完了 screenshot 保存
+            try:
+                done_shot = (
+                    ROOT / "data"
+                    / f"execute_step_8_done_{int(time.time())}.png"
+                )
+                await page.screenshot(path=str(done_shot), full_page=True)
+                print(
+                    f"[execute_purchase] done screenshot: {done_shot}",
+                    file=sys.stderr,
+                )
+            except Exception:
+                pass
+
+            # 失敗キーワード検出 (優先)
+            failure_hits = [
+                kw for kw in FAILURE_KEYWORDS if kw in completion_text
+            ]
+            success_hits = [
+                kw for kw in SUCCESS_KEYWORDS if kw in completion_text
+            ]
+            url_changed_to_done = (
+                "/done" in final_url or "/complete" in final_url
+                or "result" in final_url
+            )
+
+            # 失敗キーワードがあれば即 fail
+            if failure_hits:
+                raise RuntimeError(
+                    f"投票失敗検出: {failure_hits} (URL: {final_url})\n"
+                    f"  body text 抜粋: {completion_text[:400]!r}"
+                )
+
+            # 成功根拠: success キーワード or URL 遷移
+            if not success_hits and not url_changed_to_done:
+                raise RuntimeError(
+                    f"投票完了の確認が取れない (success keyword なし、"
+                    f"URL も /done/complete/result 含まず)。"
+                    f"\n  URL: {final_url}"
+                    f"\n  body text 抜粋: {completion_text[:400]!r}"
+                )
+
+            print(
+                f"[execute_purchase] ✅ 投票完了確認: "
+                f"keywords={success_hits} url={final_url}",
+                file=sys.stderr,
+            )
 
             return {
                 "success": True,
                 "dry_run": False,
-                "url": page.url,
+                "url": final_url,
+                "success_evidence": {
+                    "keywords": success_hits,
+                    "url_changed": url_changed_to_done,
+                },
                 "message": (
                     f"投票完了: 複勝 {car_no}号 ¥{amount} "
                     f"@ {race_date} place_code={place_code} R{race_no}"
@@ -420,6 +531,53 @@ def main() -> None:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
+
+    # === P3 hardening: amount validation ===
+    # 100 ≤ amount ≤ 1000 / 100円単位 を強制 (ALLOWED_AMOUNT_MIN/MAX/UNIT)
+    if not (100 <= args.amount <= 1000):
+        print(
+            f"[execute_purchase] ❌ amount {args.amount} は範囲外 (100-1000 期待)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if args.amount % 100 != 0:
+        print(
+            f"[execute_purchase] ❌ amount {args.amount} は 100円単位ではない",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    # === P1 hardening: race_date が JST today と一致するか check ===
+    import datetime as _dt
+    _jst = _dt.timezone(_dt.timedelta(hours=9))
+    today_jst = _dt.datetime.now(_jst).date().isoformat()
+    if args.race_date != today_jst:
+        print(
+            f"[execute_purchase] ❌ race_date={args.race_date} は今日 (JST) "
+            f"={today_jst} ではない。古い token / 別日購入リスクのため abort",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    # place_code / race_no / car_no の値域もここで弾く
+    if args.place not in (2, 3, 4, 5, 6):
+        print(
+            f"[execute_purchase] ❌ place_code {args.place} 不正 (2-6 期待)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if not (1 <= args.race <= 12):
+        print(
+            f"[execute_purchase] ❌ race_no {args.race} 不正 (1-12 期待)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if not (1 <= args.car <= 8):
+        print(
+            f"[execute_purchase] ❌ car_no {args.car} 不正 (1-8 期待)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     # === 緊急 fail-safe (2026-05-09 Codex P1 指摘で暫定無効化) ===
     # Codex review の P1-P3 で以下の本番安全性問題が指摘された:

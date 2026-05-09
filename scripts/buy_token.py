@@ -28,7 +28,75 @@ ROOT = Path(__file__).resolve().parent.parent
 ACCOUNTS_PATH = ROOT / "accounts.json"
 TOKEN_LOG = ROOT / "data" / "buy_tokens.csv"
 
-DEFAULT_TTL_SEC = 24 * 3600  # 24 時間
+DEFAULT_TTL_SEC = 30 * 60  # 30 分 (2026-05-09 Codex P1 hardening: TTL 短縮)
+
+# Phase A 制約 (server-side enforce、payload validation で hard-code)
+ALLOWED_AMOUNT = 100  # ¥100 固定 (Phase A 推奨と同期)
+ALLOWED_AMOUNT_MIN = 100
+ALLOWED_AMOUNT_MAX = 1000
+ALLOWED_AMOUNT_UNIT = 100  # 100 円単位
+
+
+def validate_payload(payload: dict, *, strict_amount: bool = False) -> None:
+    """payload の必須項目と値域を validate (P3 hardening)。
+
+    Args:
+        payload: race_date / place_code / race_no / car_no / amount を含む
+        strict_amount: True なら amount == 100 を強制 (Phase A モード)
+                       False なら 100 ≤ amount ≤ 1000 and amount % 100 == 0
+
+    Raises:
+        ValueError: 不正値
+    """
+    required = ["race_date", "place_code", "race_no", "car_no", "amount"]
+    for k in required:
+        if k not in payload:
+            raise ValueError(f"payload に '{k}' が無い")
+
+    # race_date: YYYY-MM-DD format
+    rd = str(payload["race_date"])
+    try:
+        import datetime as _dt
+        _dt.date.fromisoformat(rd)
+    except Exception:
+        raise ValueError(f"race_date 不正 (YYYY-MM-DD 期待): {rd!r}")
+
+    place = int(payload["place_code"])
+    if place not in (2, 3, 4, 5, 6):
+        raise ValueError(f"place_code 不正 (2-6 期待): {place}")
+
+    race = int(payload["race_no"])
+    if not (1 <= race <= 12):
+        raise ValueError(f"race_no 不正 (1-12 期待): {race}")
+
+    car = int(payload["car_no"])
+    if not (1 <= car <= 8):
+        raise ValueError(f"car_no 不正 (1-8 期待): {car}")
+
+    amount = int(payload["amount"])
+    if strict_amount:
+        if amount != ALLOWED_AMOUNT:
+            raise ValueError(
+                f"amount 不正 (Phase A は {ALLOWED_AMOUNT}円 固定): {amount}"
+            )
+    else:
+        if not (ALLOWED_AMOUNT_MIN <= amount <= ALLOWED_AMOUNT_MAX):
+            raise ValueError(
+                f"amount 範囲外 ({ALLOWED_AMOUNT_MIN}-{ALLOWED_AMOUNT_MAX} 期待): {amount}"
+            )
+        if amount % ALLOWED_AMOUNT_UNIT != 0:
+            raise ValueError(
+                f"amount は {ALLOWED_AMOUNT_UNIT}円単位: {amount}"
+            )
+
+
+def is_today_jst(race_date: str) -> bool:
+    """race_date が JST today と一致するか。"""
+    import datetime as _dt
+    # JST = UTC+9
+    jst = _dt.timezone(_dt.timedelta(hours=9))
+    today_jst = _dt.datetime.now(jst).date().isoformat()
+    return str(race_date) == today_jst
 
 
 def _load_secret() -> bytes:
@@ -112,16 +180,130 @@ def log_token(payload: dict, sig: str, status: str, note: str = "") -> None:
 
 
 def is_consumed(sig: str) -> bool:
-    """token が既に consume / executed されたかチェック (重複購入防止)。"""
+    """token が既に consume / executed / reserved されたかチェック。
+
+    P2 hardening: reserved 状態 (実行中の他リクエスト) も「消費済」扱いに含める。
+    """
     if not TOKEN_LOG.exists():
         return False
     with TOKEN_LOG.open(encoding="utf-8", newline="") as f:
         for row in csv.DictReader(f):
             if row.get("sig") == sig and row.get("status") in (
-                "consumed", "executed",
+                "reserved", "consumed", "executed",
             ):
                 return True
     return False
+
+
+# === P2 hardening: atomic reserve/consume (file lock + check-and-set) ===
+
+LOCK_FILE = TOKEN_LOG.with_suffix(".lock")
+
+
+class _FileLock:
+    """Windows (msvcrt.locking) / Posix (fcntl.flock) 両対応の file lock。
+
+    msvcrt は実装が non-blocking で OSError(`errno=13`) になるので、
+    短い retry loop を入れる。
+    """
+
+    def __init__(self, path: Path, timeout_sec: float = 10.0):
+        self.path = path
+        self.timeout = timeout_sec
+        self._fp = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fp = open(self.path, "a+b")
+        import time as _t
+        deadline = _t.monotonic() + self.timeout
+        try:
+            import msvcrt  # type: ignore
+            while True:
+                try:
+                    msvcrt.locking(self._fp.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if _t.monotonic() > deadline:
+                        raise RuntimeError(
+                            f"file lock timeout ({self.timeout}s) on {self.path}"
+                        )
+                    _t.sleep(0.05)
+        except ImportError:
+            # Posix fallback
+            import fcntl  # type: ignore
+            fcntl.flock(self._fp.fileno(), fcntl.LOCK_EX)
+        return self._fp
+
+    def __exit__(self, *exc):
+        if self._fp is None:
+            return
+        try:
+            import msvcrt  # type: ignore
+            try:
+                # Lock 解放のため seek to start (LK_UNLCK は同 byte)
+                self._fp.seek(0)
+                msvcrt.locking(self._fp.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        except ImportError:
+            try:
+                import fcntl  # type: ignore
+                fcntl.flock(self._fp.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+        try:
+            self._fp.close()
+        except Exception:
+            pass
+
+
+def _read_status(sig: str) -> str | None:
+    """sig に対応する最新 status を返す。複数行あれば最後を採用。"""
+    if not TOKEN_LOG.exists():
+        return None
+    last_status = None
+    with TOKEN_LOG.open(encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            if row.get("sig") == sig:
+                last_status = row.get("status", "")
+    return last_status
+
+
+def reserve_token(payload: dict, sig: str, note: str = "") -> bool:
+    """token を atomic に reserve (check-and-set)。
+
+    P2 hardening: 同 token を複数タブ / 二重 click しても、reserve に成功するのは
+    1 つだけ。reserve 後は execute_purchase が走り、終わり次第
+    mark_executed / mark_failed のいずれかで状態遷移する。
+
+    Returns:
+        True: 初めて reserve した (購入処理に進んでよい)
+        False: 既に reserved/executed/consumed (重複、購入処理してはいけない)
+    """
+    with _FileLock(LOCK_FILE):
+        status = _read_status(sig)
+        if status in ("reserved", "consumed", "executed"):
+            return False
+        log_token(payload, sig=sig, status="reserved", note=note or "atomic reserve")
+        return True
+
+
+def mark_executed(payload: dict, sig: str, note: str = "") -> None:
+    """reserve 後の token を executed として記録。"""
+    with _FileLock(LOCK_FILE):
+        log_token(payload, sig=sig, status="executed", note=note)
+
+
+def mark_failed(payload: dict, sig: str, note: str = "") -> None:
+    """reserve 後の token を failed として記録。再試行可能か方針による。"""
+    with _FileLock(LOCK_FILE):
+        log_token(payload, sig=sig, status="failed", note=note)
+
+
+def mark_dry_run(payload: dict, sig: str, note: str = "") -> None:
+    """dry-run の記録 (consume 扱いしない、過去ログとして残すだけ)。"""
+    log_token(payload, sig=sig, status="dry_run", note=note)
 
 
 def _get_tailscale_ip() -> str | None:

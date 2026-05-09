@@ -81,11 +81,33 @@ except ValueError as e:
     st.title("🚫 トークン検証失敗")
     st.error(f"{e}")
     st.write("以下のいずれかの可能性:")
-    st.write("- 期限切れ (default 24 時間)")
+    st.write("- 期限切れ (default 30 分)")
     st.write("- URL が改ざんされている")
     st.write("- accounts.json の buy_secret_key が変更された")
     bt.log_token(payload={}, sig=sig, status="failed",
                  note=f"verify: {e}")
+    st.stop()
+
+# ===== P3 hardening: payload validation =====
+try:
+    bt.validate_payload(payload, strict_amount=False)
+except ValueError as e:
+    st.title("🚫 payload validation 失敗")
+    st.error(f"{e}")
+    bt.log_token(payload, sig=sig, status="failed",
+                 note=f"payload: {e}")
+    st.stop()
+
+# ===== P1 hardening: race_date が JST today と一致確認 =====
+race_date_payload = str(payload.get("race_date", ""))
+if not bt.is_today_jst(race_date_payload):
+    st.title("🚫 レース日付が今日ではありません")
+    st.error(
+        f"payload race_date={race_date_payload} は今日 (JST) ではありません。"
+    )
+    st.write("古いメールリンクや日付をまたいだ token は使えません。")
+    bt.log_token(payload, sig=sig, status="failed",
+                 note=f"date mismatch: {race_date_payload}")
     st.stop()
 
 # ===== 消費済みチェック =====
@@ -166,10 +188,18 @@ if st.button("✅ 購入する", type="primary", use_container_width=True):
         bt.log_token(payload, sig=sig, status="failed",
                      note="PIN mismatch")
         st.stop()
-    # 消費としてマーク (実行前に記録、再 click 防止)
-    bt.log_token(payload, sig=sig,
-                 status="consumed" if not dry_run else "dry_run",
-                 note="confirmed via buy_app")
+
+    # P2 hardening: atomic reserve (本番のみ)
+    if not dry_run:
+        if not bt.reserve_token(payload, sig=sig,
+                                note="reserved via buy_app"):
+            st.error(
+                "🚫 このトークンは既に予約 / 消費済 (race condition / 二重 click)"
+            )
+            st.stop()
+    else:
+        # dry-run は consume せず、ログだけ残す
+        bt.mark_dry_run(payload, sig=sig, note="dry-run via buy_app")
 
     with st.spinner("Playwright で投票実行中... (Chrome window が開きます)"):
         cmd = [
@@ -191,8 +221,8 @@ if st.button("✅ 購入する", type="primary", use_container_width=True):
             )
         except subprocess.TimeoutExpired:
             st.error("❌ タイムアウト (>180s)")
-            bt.log_token(payload, sig=sig, status="failed",
-                         note="timeout")
+            if not dry_run:
+                bt.mark_failed(payload, sig=sig, note="timeout >180s")
             st.stop()
 
     if result.returncode == 0:
@@ -200,14 +230,17 @@ if st.button("✅ 購入する", type="primary", use_container_width=True):
             st.success("✅ dry-run 完了")
         else:
             st.success("✅ 購入完了")
-            bt.log_token(payload, sig=sig, status="executed",
-                         note=result.stdout[-200:])
+            bt.mark_executed(payload, sig=sig,
+                             note=result.stdout[-200:])
         with st.expander("実行ログ"):
             st.code(result.stdout)
     else:
         st.error(f"❌ 失敗 (exit={result.returncode})")
-        bt.log_token(payload, sig=sig, status="failed",
-                     note=result.stderr[-200:])
+        if not dry_run:
+            bt.mark_failed(payload, sig=sig, note=result.stderr[-200:])
+        else:
+            bt.log_token(payload, sig=sig, status="dry_run_failed",
+                         note=result.stderr[-200:])
         with st.expander("エラー詳細"):
             st.code(result.stderr or result.stdout or "(no output)")
 
