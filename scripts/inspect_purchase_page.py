@@ -41,12 +41,13 @@ DUMP_TXT = ROOT / "data" / "purchase_form_dump.txt"
 VEL_CODE_MAP = {2: "002", 3: "003", 4: "004", 5: "005", 6: "006"}
 VENUE_JP_MAP = {2: "川口", 3: "伊勢崎", 4: "浜松", 5: "飯塚", 6: "山陽"}
 
-# 試行する URL pattern (実際の vote.autorace.jp 構造に合わせて調整可能)
+# 試行する URL pattern (vote.autorace.jp 構造調査済 2026-05-09)
 URL_PATTERNS = [
+    # 実購入画面 (確認済): /vote?vel_code=NNN&race_num=N
+    "https://vote.autorace.jp/vote?vel_code={vel_code}&race_num={race}",
+    # フォールバック: 旧 race info ページ (購入は不可だが構造調査用)
     "https://vote.autorace.jp/race/{vel_code}/{date}/R{race}",
     "https://vote.autorace.jp/vote?velCode={vel_code}&date={date}&raceNum={race}",
-    "https://vote.autorace.jp/vote/{vel_code}/{date}/{race}",
-    "https://vote.autorace.jp/race_info/race?vel={vel_code}&date={date}&race={race}",
 ]
 
 
@@ -239,20 +240,37 @@ async def inspect(place_code: int, race_no: int, car_no: int | None,
                 except Exception as e:
                     out(f"    {sel_desc}: error {e}")
 
-            # === Step 10: 「通常投票」をクリックして次の画面の構造も dump ===
-            out("\n[10] 「通常投票」ボタンを click して次の画面構造を dump:")
+            # === Step 10: 複勝タブ → 車番 click → 金額入力 までの探索 ===
+            out("\n[10] 複勝タブ click を試行 (購入フォーム探索):")
+            clicked_fukushou = False
             try:
-                normal_vote_btn = page.locator(
-                    'button:has-text("通常投票")'
-                ).first
-                if await normal_vote_btn.count() > 0:
-                    await normal_vote_btn.click(timeout=5000)
+                # 複勝タブの候補
+                for sel in [
+                    'button:has-text("複勝")',
+                    'a:has-text("複勝")',
+                    'li:has-text("複勝")',
+                    '[role="tab"]:has-text("複勝")',
+                    '[data-bet-type="fukushou"]',
+                ]:
+                    cnt = await page.locator(sel).count()
+                    if cnt > 0:
+                        out(f"    複勝候補発見: {sel} ({cnt} 個)")
+                        try:
+                            await page.locator(sel).first.click(timeout=5000)
+                            clicked_fukushou = True
+                            out(f"    → click OK")
+                            break
+                        except Exception as e:
+                            out(f"    → click 失敗: {e}")
+                if not clicked_fukushou:
+                    out(f"    複勝タブ見つからず")
+                else:
                     await asyncio.sleep(3)
                     after_url = page.url
-                    out(f"    通常投票 click 後 URL: {after_url}")
+                    out(f"    複勝 click 後 URL: {after_url}")
 
                     # フォーム再 dump
-                    out("\n[11] (通常投票後) form 要素:")
+                    out("\n[11] (複勝 click 後) form 要素:")
                     forms2 = await page.locator("form").all()
                     out(f"    form 数: {len(forms2)}")
                     for i, f in enumerate(forms2):
@@ -265,7 +283,7 @@ async def inspect(place_code: int, race_no: int, car_no: int | None,
                         except Exception as e:
                             out(f"    [form {i}] error: {e}")
 
-                    out("\n[12] (通常投票後) input 要素:")
+                    out("\n[12] (複勝 click 後) input 要素:")
                     inputs2 = await page.locator("input").all()
                     out(f"    input 数: {len(inputs2)}")
                     for i, inp in enumerate(inputs2[:80]):
@@ -279,7 +297,7 @@ async def inspect(place_code: int, race_no: int, car_no: int | None,
                         except Exception as e:
                             out(f"    [{i}] error: {e}")
 
-                    out("\n[13] (通常投票後) select 要素:")
+                    out("\n[13] (複勝 click 後) select 要素:")
                     selects2 = await page.locator("select").all()
                     out(f"    select 数: {len(selects2)}")
                     for i, sel in enumerate(selects2):
@@ -295,7 +313,7 @@ async def inspect(place_code: int, race_no: int, car_no: int | None,
                         except Exception as e:
                             out(f"    [{i}] error: {e}")
 
-                    out("\n[14] (通常投票後) button 要素:")
+                    out("\n[14] (複勝 click 後) button 要素:")
                     buttons2 = await page.locator("button").all()
                     out(f"    button 数: {len(buttons2)}")
                     for i, btn in enumerate(buttons2[:40]):
@@ -313,10 +331,10 @@ async def inspect(place_code: int, race_no: int, car_no: int | None,
                     html2 = await page.content()
                     DUMP_HTML2 = ROOT / "data" / "purchase_form_dump_after.html"
                     DUMP_HTML2.write_text(html2, encoding="utf-8")
-                    out(f"\n[15] (通常投票後) HTML 保存: {DUMP_HTML2}")
+                    out(f"\n[15] (複勝 click 後) HTML 保存: {DUMP_HTML2}")
 
                     # 複勝 / 車番 等の selector ヒット数チェック (再)
-                    out("\n[16] (通常投票後) selector ヒント:")
+                    out("\n[16] (複勝 click 後) selector ヒント:")
                     for sel_desc, sel_query in [
                         ("複勝 (button)", 'button:has-text("複勝")'),
                         ("複勝 (a/li)", 'a:has-text("複勝"), li:has-text("複勝")'),
@@ -332,8 +350,6 @@ async def inspect(place_code: int, race_no: int, car_no: int | None,
                             out(f"    {sel_desc}: '{sel_query}' → {cnt} 個")
                         except Exception as e:
                             out(f"    {sel_desc}: error {e}")
-                else:
-                    out("    「通常投票」ボタンが見つからない")
             except Exception as e:
                 out(f"    [10] 例外: {e}")
 
