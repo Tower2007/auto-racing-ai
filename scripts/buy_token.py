@@ -37,13 +37,14 @@ ALLOWED_AMOUNT_MAX = 1000
 ALLOWED_AMOUNT_UNIT = 100  # 100 円単位
 
 
-def validate_payload(payload: dict, *, strict_amount: bool = False) -> None:
+def validate_payload(payload: dict, *, strict_amount: bool = True) -> None:
     """payload の必須項目と値域を validate (P3 hardening)。
 
     Args:
         payload: race_date / place_code / race_no / car_no / amount を含む
-        strict_amount: True なら amount == 100 を強制 (Phase A モード)
-                       False なら 100 ≤ amount ≤ 1000 and amount % 100 == 0
+        strict_amount: **default True** (Codex 3 次 review):
+                       Phase A の本番入口は amount == 100 固定。
+                       将来の金額拡張は別フェーズで明示的に False にする。
 
     Raises:
         ValueError: 不正値
@@ -99,21 +100,26 @@ def is_today_jst(race_date: str) -> bool:
 
 
 def is_active_race_date(race_date: str) -> bool:
-    """race_date が「現在開催中の日付」(today or today-1 day) として妥当か。
+    """race_date が「現在開催中の日付」として妥当か。
 
-    Codex 2 次 review (2026-05-09) で日跨ぎ問題が指摘された:
-    ミッドナイト R は深夜跨ぎで token 発行(前日 23:50)→ 投票 click(翌 0:10)
-    といったケースがある。今日厳格だと弾かれる。
-
-    そこで JST today または today-1 day を accept、true の race_date 一致は
-    投票画面 / 確認画面の表示日付との構造的検証で担保する。
+    Codex 3 次 review (2026-05-09) で「yesterday 無条件は広い」と指摘:
+    ミッドナイト R の深夜跨ぎ用途に限定すべき。
+    実装:
+      - JST today は常に accept
+      - JST yesterday は **深夜帯 0:00-3:00** にのみ accept
+        (3:00 以降は yesterday を弾く = 寝過ごし or 次の日の朝に古い token を
+         踏むのを防ぐ)
     """
     import datetime as _dt
     jst = _dt.timezone(_dt.timedelta(hours=9))
-    now_jst = _dt.datetime.now(jst).date()
-    today = now_jst.isoformat()
-    yesterday = (now_jst - _dt.timedelta(days=1)).isoformat()
-    return str(race_date) in (today, yesterday)
+    now_jst = _dt.datetime.now(jst)
+    today = now_jst.date().isoformat()
+    if str(race_date) == today:
+        return True
+    yesterday = (now_jst.date() - _dt.timedelta(days=1)).isoformat()
+    if str(race_date) == yesterday and now_jst.hour < 3:
+        return True
+    return False
 
 
 def _load_secret() -> bytes:
