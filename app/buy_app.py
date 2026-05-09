@@ -98,16 +98,18 @@ except ValueError as e:
                  note=f"payload: {e}")
     st.stop()
 
-# ===== P1 hardening: race_date が JST today と一致確認 =====
+# ===== P1 hardening: race_date が「現在開催中の日付」と一致確認 =====
+# 日跨ぎ対応: today_jst または today-1 day を accept (深夜ミッドナイト用)
+# 本当の一致は execute_purchase 側で確認画面の date と構造的に check する
 race_date_payload = str(payload.get("race_date", ""))
-if not bt.is_today_jst(race_date_payload):
-    st.title("🚫 レース日付が今日ではありません")
+if not bt.is_active_race_date(race_date_payload):
+    st.title("🚫 古い race_date のトークン")
     st.error(
-        f"payload race_date={race_date_payload} は今日 (JST) ではありません。"
+        f"payload race_date={race_date_payload} は今日 / 昨日のいずれでもない。"
     )
-    st.write("古いメールリンクや日付をまたいだ token は使えません。")
+    st.write("古いメールリンクや 2 日以上前の token は使えません。")
     bt.log_token(payload, sig=sig, status="failed",
-                 note=f"date mismatch: {race_date_payload}")
+                 note=f"date out of active range: {race_date_payload}")
     st.stop()
 
 # ===== 消費済みチェック =====

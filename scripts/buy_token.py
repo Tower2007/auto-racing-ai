@@ -91,12 +91,29 @@ def validate_payload(payload: dict, *, strict_amount: bool = False) -> None:
 
 
 def is_today_jst(race_date: str) -> bool:
-    """race_date が JST today と一致するか。"""
+    """race_date が JST today と一致するか (厳密版、deprecated 寄り)。"""
     import datetime as _dt
-    # JST = UTC+9
     jst = _dt.timezone(_dt.timedelta(hours=9))
     today_jst = _dt.datetime.now(jst).date().isoformat()
     return str(race_date) == today_jst
+
+
+def is_active_race_date(race_date: str) -> bool:
+    """race_date が「現在開催中の日付」(today or today-1 day) として妥当か。
+
+    Codex 2 次 review (2026-05-09) で日跨ぎ問題が指摘された:
+    ミッドナイト R は深夜跨ぎで token 発行(前日 23:50)→ 投票 click(翌 0:10)
+    といったケースがある。今日厳格だと弾かれる。
+
+    そこで JST today または today-1 day を accept、true の race_date 一致は
+    投票画面 / 確認画面の表示日付との構造的検証で担保する。
+    """
+    import datetime as _dt
+    jst = _dt.timezone(_dt.timedelta(hours=9))
+    now_jst = _dt.datetime.now(jst).date()
+    today = now_jst.isoformat()
+    yesterday = (now_jst - _dt.timedelta(days=1)).isoformat()
+    return str(race_date) in (today, yesterday)
 
 
 def _load_secret() -> bytes:
@@ -215,6 +232,11 @@ class _FileLock:
     def __enter__(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._fp = open(self.path, "a+b")
+        # Codex 2 次 review: lock 前にも seek(0) で「先頭 1 byte をロック」を明示
+        try:
+            self._fp.seek(0)
+        except Exception:
+            pass
         import time as _t
         deadline = _t.monotonic() + self.timeout
         try:

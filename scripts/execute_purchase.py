@@ -347,9 +347,31 @@ async def execute_buy(
                 print(f"[execute_purchase] body.innerText 取得失敗: {e}",
                       file=sys.stderr)
 
-            # P1 hardening: 構造的検証 (券種 / 場 / R / 車番 / 件数 / 金額)
+            # Codex 2 次 review: dry-run 用に body.innerText を保存
+            # (regex の妥当性検証や画面表記の変化追跡に使う)
+            try:
+                txt_path = (
+                    ROOT / "data"
+                    / f"execute_step_7_confirm_{int(time.time())}.txt"
+                )
+                txt_path.write_text(page_text, encoding="utf-8")
+                print(
+                    f"[execute_purchase] body.innerText: {txt_path}",
+                    file=sys.stderr,
+                )
+            except Exception as e:
+                print(f"[execute_purchase] body.innerText 保存失敗: {e}",
+                      file=sys.stderr)
+
+            # P1 hardening: 構造的検証 (券種 / 場 / R / 車番 / 件数 / 金額 / 日付)
             import re as _re
             venue_jp = VENUE_JP_MAP.get(place_code, "?")
+
+            # 確認画面で表示される race_date 形式を構築 (例: "2026/05/09" or "2026-05-09")
+            # vote.autorace.jp は「2026/05/09 浜松 6R」のように slash 区切り表示
+            _y, _m, _d = race_date.split("-")
+            race_date_slash = f"{_y}/{_m}/{_d}"
+
             checks = [
                 (
                     r"複勝",
@@ -359,9 +381,13 @@ async def execute_buy(
                     rf"{_re.escape(venue_jp)}\s*{race_no}\s*R",
                     f"場/R 不一致 (期待: {venue_jp} {race_no}R)",
                 ),
-                # 「複勝 1組」直後に車番が表示される (HTML では <span>N</span>)
-                # innerText 上では「複勝\n1組\n4」のような表示。
-                # 安全のため複勝〜数字の近接マッチで検証。
+                # 日付の構造的一致 (Codex 2 次 review: 日跨ぎ問題対策)
+                # 確認画面の「2026/05/09 浜松 6R」表示と payload race_date が一致
+                (
+                    rf"({_re.escape(race_date)}|{_re.escape(race_date_slash)})",
+                    f"race_date 不一致 (期待: {race_date} or {race_date_slash})",
+                ),
+                # 「複勝 1組」直後に車番が表示される
                 (
                     rf"複勝[\s\S]{{0,30}}\b{car_no}\b",
                     f"車番 {car_no} の表示確認失敗",
@@ -393,7 +419,7 @@ async def execute_buy(
                 )
 
             print(
-                f"[execute_purchase] 確認画面 OK: 複勝 / "
+                f"[execute_purchase] 確認画面 OK: 複勝 / {race_date} / "
                 f"{venue_jp} {race_no}R / {car_no}号 / 1組1票 / {amount}円 "
                 f"を全て確認",
                 file=sys.stderr,
@@ -480,10 +506,84 @@ async def execute_buy(
                     f"  body text 抜粋: {completion_text[:400]!r}"
                 )
 
-            # 成功根拠: success キーワード or URL 遷移
-            if not success_hits and not url_changed_to_done:
+            # === Step 8.6: 投票履歴 (/mypage/order) で server-side 確認 ===
+            # Codex 2 次 review: 完了画面の keyword/URL だけでなく、
+            # 投票履歴に該当 bet が記録されているかを構造的に確認する。
+            # これが取れれば「server-side 成立確定」= success。
+            history_ok = False
+            history_url = "https://vote.autorace.jp/mypage/order"
+            try:
+                print(
+                    f"[execute_purchase] step 8.6: 投票履歴 navigate ({history_url})",
+                    file=sys.stderr,
+                )
+                await page.goto(history_url, wait_until="domcontentloaded",
+                                timeout=20000)
+                await asyncio.sleep(3)
+                history_text = await page.evaluate(
+                    "() => document.body.innerText"
+                )
+                # 履歴に対象 bet が記載されているか check:
+                #   - 場名 + R 番号 (例: "浜松 6R")
+                #   - 複勝 + 車番 (例: "複勝\n6")
+                #   - 金額 (例: "100" 単独)
+                # 履歴ページは新しい順で並ぶので直近 1〜2 件に該当 bet があるはず
+                hist_checks = [
+                    (rf"{_re.escape(venue_jp)}\s*{race_no}\s*R",
+                     f"履歴に {venue_jp} {race_no}R が見つからない"),
+                    (rf"複勝[\s\S]{{0,80}}\b{car_no}\b",
+                     f"履歴に '複勝 {car_no}' の組合せが見つからない"),
+                    (rf"\b{amount}\b",
+                     f"履歴に金額 {amount} が見つからない"),
+                ]
+                hist_failures = [
+                    msg for pat, msg in hist_checks
+                    if not _re.search(pat, history_text)
+                ]
+                if hist_failures:
+                    print(
+                        f"[execute_purchase] ⚠️ 投票履歴での確認失敗:\n  "
+                        + "\n  ".join(hist_failures),
+                        file=sys.stderr,
+                    )
+                    # 履歴 screenshot で検証用の証跡を残す
+                    try:
+                        hist_shot = (
+                            ROOT / "data"
+                            / f"execute_step_8_history_{int(time.time())}.png"
+                        )
+                        await page.screenshot(path=str(hist_shot),
+                                              full_page=True)
+                        hist_txt = (
+                            ROOT / "data"
+                            / f"execute_step_8_history_{int(time.time())}.txt"
+                        )
+                        hist_txt.write_text(history_text, encoding="utf-8")
+                        print(
+                            f"[execute_purchase] history screenshot: {hist_shot}",
+                            file=sys.stderr,
+                        )
+                    except Exception:
+                        pass
+                else:
+                    history_ok = True
+                    print(
+                        f"[execute_purchase] ✅ 投票履歴で server-side 成立確認",
+                        file=sys.stderr,
+                    )
+            except Exception as e:
+                print(
+                    f"[execute_purchase] 投票履歴 check 失敗(継続): {e}",
+                    file=sys.stderr,
+                )
+
+            # 成功根拠の総合判定:
+            # (a) 投票履歴に該当 bet ← 最も強い証拠
+            # (b) success keyword or URL 遷移 ← fallback
+            # どちらも取れなければ failure
+            if not history_ok and not success_hits and not url_changed_to_done:
                 raise RuntimeError(
-                    f"投票完了の確認が取れない (success keyword なし、"
+                    f"投票完了の確認が取れない (履歴 NG / success keyword なし / "
                     f"URL も /done/complete/result 含まず)。"
                     f"\n  URL: {final_url}"
                     f"\n  body text 抜粋: {completion_text[:400]!r}"
@@ -491,7 +591,8 @@ async def execute_buy(
 
             print(
                 f"[execute_purchase] ✅ 投票完了確認: "
-                f"keywords={success_hits} url={final_url}",
+                f"history_ok={history_ok} keywords={success_hits} "
+                f"url={final_url}",
                 file=sys.stderr,
             )
 
@@ -500,6 +601,7 @@ async def execute_buy(
                 "dry_run": False,
                 "url": final_url,
                 "success_evidence": {
+                    "history_ok": history_ok,
                     "keywords": success_hits,
                     "url_changed": url_changed_to_done,
                 },
@@ -547,14 +649,18 @@ def main() -> None:
         )
         sys.exit(2)
 
-    # === P1 hardening: race_date が JST today と一致するか check ===
+    # === P1 hardening: race_date が「現在開催中の日付」(today/yesterday) ===
+    # 日跨ぎ対応 (Codex 2 次 review): ミッドナイト R が深夜跨ぎで翌日扱いに
+    # なるケースを accept。本当の一致は確認画面の date と構造的に check する。
     import datetime as _dt
     _jst = _dt.timezone(_dt.timedelta(hours=9))
-    today_jst = _dt.datetime.now(_jst).date().isoformat()
-    if args.race_date != today_jst:
+    _today = _dt.datetime.now(_jst).date()
+    _allowed = {_today.isoformat(),
+                (_today - _dt.timedelta(days=1)).isoformat()}
+    if args.race_date not in _allowed:
         print(
-            f"[execute_purchase] ❌ race_date={args.race_date} は今日 (JST) "
-            f"={today_jst} ではない。古い token / 別日購入リスクのため abort",
+            f"[execute_purchase] ❌ race_date={args.race_date} は今日 / 昨日 "
+            f"のいずれでもない (allowed: {sorted(_allowed)})。abort",
             file=sys.stderr,
         )
         sys.exit(2)
