@@ -367,22 +367,11 @@ async def execute_buy(
             import re as _re
             venue_jp = VENUE_JP_MAP.get(place_code, "?")
 
-            # 確認画面で表示される race_date 形式 (Codex 3 次 review: 揺れ対応)
-            #   - "2026-05-09" (ISO)
-            #   - "2026/05/09" (slash, ゼロ埋め)
-            #   - "2026/5/9"   (slash, ゼロ埋めなし)
-            #   - "2026年5月9日" (漢字, ゼロ埋めなし)
-            #   - "2026年05月09日" (漢字, ゼロ埋めあり)
-            _y, _m, _d = race_date.split("-")
-            _mi, _di = int(_m), int(_d)
-            date_patterns = [
-                _re.escape(race_date),                       # 2026-05-09
-                _re.escape(f"{_y}/{_m}/{_d}"),               # 2026/05/09
-                _re.escape(f"{_y}/{_mi}/{_di}"),             # 2026/5/9
-                _re.escape(f"{_y}年{_mi}月{_di}日"),         # 2026年5月9日
-                _re.escape(f"{_y}年{_m}月{_d}日"),           # 2026年05月09日
-            ]
-            date_or_pattern = "|".join(f"(?:{p})" for p in date_patterns)
+            # 確認画面の date 照合は外す (Codex 4 次 review):
+            # 既存 PNG では確認画面に日付が可視テキストに出ていない可能性大。
+            # body.innerText に hidden 的に入っているかは次回 dry-run の
+            # data/execute_step_7_confirm_<ts>.txt で確認するまで保留。
+            # 主防御は: TTL 30 分 + yesterday 5 時まで + 場/R/券種/車番/金額。
 
             checks = [
                 (
@@ -392,12 +381,6 @@ async def execute_buy(
                 (
                     rf"{_re.escape(venue_jp)}\s*{race_no}\s*R",
                     f"場/R 不一致 (期待: {venue_jp} {race_no}R)",
-                ),
-                # 日付の構造的一致 (Codex 2-3 次 review)
-                (
-                    date_or_pattern,
-                    f"race_date 不一致 (試行: 2026-05-09 / 2026/05/09 / "
-                    f"2026/5/9 / 漢字 等の形式)",
                 ),
                 # 「複勝 1組」直後に車番が表示される
                 (
@@ -458,6 +441,17 @@ async def execute_buy(
 
             print(f"[execute_purchase] step 8: 投票する (実投票)",
                   file=sys.stderr)
+
+            # Codex 4 次 review: click 直前の時刻を JST aware で記録、
+            # 履歴 exact match の filter 基準にする
+            import datetime as _dt
+            _jst = _dt.timezone(_dt.timedelta(hours=9))
+            click_started_at = _dt.datetime.now(_jst)
+            print(
+                f"[execute_purchase] click_started_at: {click_started_at.isoformat()}",
+                file=sys.stderr,
+            )
+
             try:
                 vote_btn = page.locator(
                     'button:has-text("投票する")'
@@ -518,137 +512,114 @@ async def execute_buy(
                     f"  body text 抜粋: {completion_text[:400]!r}"
                 )
 
-            # === Step 8.6: 投票履歴 (/mypage/order) で server-side 確認 ===
-            # Codex 3 次 review:
-            #   - ページ全体 text で regex match すると 古い同条件 bet で
-            #     false-positive する → 「最新 1 件のブロックのみ」抽出して
-            #     その中で regex 検証する。
+            # === Step 8.6: GraphQL API exact match (Codex 4 次 review) ===
+            # 旧: /mypage/order を navigate して body text regex 検索
+            #     → 古い bet / 散在マッチで false-positive リスク
+            # 新: 既存の fetch_order_history.py の GraphQL API を流用、
+            #     click_started_at 以後の bet を fetch → 完全一致を確認
             history_ok = False
-            history_block_text = ""
-            history_url = "https://vote.autorace.jp/mypage/order"
+            history_match_info = ""
             try:
+                # Playwright session の cookie を抽出 (autorace.jp domain)
+                cookies = await context.cookies()
+                cookie_pairs = [
+                    f"{c['name']}={c['value']}"
+                    for c in cookies
+                    if "autorace.jp" in c.get("domain", "")
+                ]
+                cookie_str = "; ".join(cookie_pairs)
+
+                # fetch_order_history の関数を import
+                sys.path.insert(0, str(ROOT / "scripts"))
+                from fetch_order_history import fetch_orders  # noqa
+
+                # vel_code は 3 桁 string ("002" 等)
+                vel_str = f"{place_code:03d}"
+
                 print(
-                    f"[execute_purchase] step 8.6: 投票履歴 navigate ({history_url})",
+                    f"[execute_purchase] step 8.6: GraphQL fetch_orders "
+                    f"vel={vel_str} race={race_no} day={race_date}",
                     file=sys.stderr,
                 )
-                await page.goto(history_url, wait_until="domcontentloaded",
-                                timeout=20000)
-                await asyncio.sleep(3)
-                full_history_text = await page.evaluate(
-                    "() => document.body.innerText"
+                orders = await asyncio.to_thread(
+                    fetch_orders, cookie_str, race_date, vel_str, race_no
+                )
+                print(
+                    f"[execute_purchase] orders 取得: {len(orders)} 件",
+                    file=sys.stderr,
                 )
 
-                # 最新 1 件の bet ブロックを抽出する複数候補:
-                # vote.autorace.jp の /mypage/order の DOM はまだ完全 inspect
-                # していないので heuristic で安全に。先頭の bet item-like
-                # 要素を取れたらそれを使う、取れなければ先頭の date heading
-                # 直後のセクションだけ使う。
-                latest_block_candidates = [
-                    # bet の繰返単位らしき selector
-                    'main div:has-text("複勝") >> nth=0',
-                    'li:has-text("複勝") >> nth=0',
-                    'article:has-text("複勝") >> nth=0',
-                    # 履歴日付 heading の最初のセクション
-                    'section:has-text("複勝") >> nth=0',
-                ]
-                for sel in latest_block_candidates:
+                # exact match を探す:
+                #   - 各 order の createdAt が click_started_at 以後
+                #   - packs に betType=FUKUSHOU かつ packDeme=str(car_no)
+                #     かつ voteAmount=amount のものがある
+                matches = []
+                for o in orders:
+                    created_str = o.get("createdAt", "")
                     try:
-                        loc = page.locator(sel)
-                        if await loc.count() > 0:
-                            inner = await loc.first.inner_text()
-                            if inner and "複勝" in inner:
-                                history_block_text = inner.strip()
-                                print(
-                                    f"[execute_purchase] history block "
-                                    f"selector hit: {sel!r}",
-                                    file=sys.stderr,
-                                )
-                                break
+                        # ISO8601 想定: "2026-05-09T11:39:41+09:00" or
+                        # "...Z" or naive
+                        s = created_str.replace("Z", "+00:00")
+                        created = _dt.datetime.fromisoformat(s)
+                        if created.tzinfo is None:
+                            created = created.replace(tzinfo=_jst)
                     except Exception:
+                        # createdAt parse 失敗は skip (false-positive 防止)
                         continue
+                    if created < click_started_at:
+                        continue
+                    for p in o.get("packs", []):
+                        bet_type = str(p.get("betType", "")).strip()
+                        deme = str(p.get("packDeme", "")).strip()
+                        vote_amt = int(p.get("voteAmount", 0))
+                        if (
+                            bet_type == "FUKUSHOU"
+                            and deme == str(car_no)
+                            and vote_amt == amount
+                        ):
+                            matches.append({
+                                "order_id": o.get("id"),
+                                "created_at": created.isoformat(),
+                                "betType": bet_type,
+                                "packDeme": deme,
+                                "voteAmount": vote_amt,
+                            })
+                            break
 
-                # selector 全敗時の fallback: 「複勝」最初の出現を中心に
-                # ±400 文字を抽出 (古い bet を含まないよう範囲限定)
-                if not history_block_text:
-                    idx = full_history_text.find("複勝")
-                    if idx >= 0:
-                        start = max(0, idx - 100)
-                        end = min(len(full_history_text), idx + 400)
-                        history_block_text = full_history_text[start:end]
-                        print(
-                            f"[execute_purchase] history block fallback: "
-                            f"first '複勝' 周辺 ±400 char",
-                            file=sys.stderr,
-                        )
-
-                if history_block_text:
-                    hist_checks = [
-                        (rf"{_re.escape(venue_jp)}\s*{race_no}\s*R",
-                         f"最新ブロックに {venue_jp} {race_no}R が無い"),
-                        (rf"複勝[\s\S]{{0,80}}\b{car_no}\b",
-                         f"最新ブロックに '複勝 {car_no}' が無い"),
-                        (rf"\b{amount}\b",
-                         f"最新ブロックに金額 {amount} が無い"),
-                    ]
-                    hist_failures = [
-                        msg for pat, msg in hist_checks
-                        if not _re.search(pat, history_block_text)
-                    ]
-                    if hist_failures:
-                        print(
-                            f"[execute_purchase] ⚠️ 投票履歴 (最新ブロック) "
-                            f"での確認失敗:\n  "
-                            + "\n  ".join(hist_failures),
-                            file=sys.stderr,
-                        )
-                    else:
-                        history_ok = True
-                        print(
-                            f"[execute_purchase] ✅ 最新 bet ブロックで "
-                            f"server-side 成立確認",
-                            file=sys.stderr,
-                        )
-
-                # 履歴 screenshot + txt は失敗 / 成功どちらも保存
-                try:
-                    hist_shot = (
-                        ROOT / "data"
-                        / f"execute_step_8_history_{int(time.time())}.png"
-                    )
-                    await page.screenshot(path=str(hist_shot),
-                                          full_page=True)
-                    hist_txt = (
-                        ROOT / "data"
-                        / f"execute_step_8_history_{int(time.time())}.txt"
-                    )
-                    # block + 全体 両方残す
-                    hist_txt.write_text(
-                        f"=== latest block ===\n{history_block_text}\n\n"
-                        f"=== full body ===\n{full_history_text}",
-                        encoding="utf-8",
+                if matches:
+                    history_ok = True
+                    history_match_info = (
+                        f"{len(matches)} 件 exact match: "
+                        f"{matches[0]}"
                     )
                     print(
-                        f"[execute_purchase] history screenshot: {hist_shot}",
+                        f"[execute_purchase] ✅ GraphQL exact match: "
+                        f"{history_match_info}",
                         file=sys.stderr,
                     )
-                except Exception:
-                    pass
+                else:
+                    print(
+                        f"[execute_purchase] ⚠️ GraphQL exact match なし "
+                        f"(orders={len(orders)} 件、click 以降 / 複勝 "
+                        f"{car_no}号 / ¥{amount} に該当せず)",
+                        file=sys.stderr,
+                    )
             except Exception as e:
                 print(
-                    f"[execute_purchase] 投票履歴 check 失敗(継続): {e}",
+                    f"[execute_purchase] GraphQL exact match 失敗(継続): {e}",
                     file=sys.stderr,
                 )
 
-            # 成功根拠の総合判定 (Codex 3 次 review):
-            # (a) history_ok: 最も強い (server-side 成立証拠)
-            # (b) success keyword: fallback
-            # (c) URL 遷移: 単独では成功扱い 不可 (補強情報のみ)
-            # → URL だけしか取れない場合は failure
+            # 成功根拠の総合判定 (Codex 4 次 review):
+            # (a) failure_hits: 即 fail (既に上で raise されている)
+            # (b) history_ok: GraphQL exact match (server-side 成立確定)
+            # (c) success keyword: fallback (受付番号付き完了画面)
+            # (d) URL 遷移: ログ用、成功根拠にしない
             if not history_ok and not success_hits:
                 raise RuntimeError(
                     f"投票完了の確認が取れない "
-                    f"(history NG / success keyword なし)。"
-                    f"\n  URL: {final_url} (URL 単独成立は不可)"
+                    f"(GraphQL exact match NG / success keyword なし)。"
+                    f"\n  URL: {final_url} (URL は補強情報のみ、単独成立不可)"
                     f"\n  body text 抜粋: {completion_text[:400]!r}"
                 )
 
@@ -665,6 +636,7 @@ async def execute_buy(
                 "url": final_url,
                 "success_evidence": {
                     "history_ok": history_ok,
+                    "history_match_info": history_match_info,
                     "keywords": success_hits,
                     "url_changed": url_changed_to_done,
                 },
@@ -708,15 +680,14 @@ def main() -> None:
         sys.exit(2)
 
     # === P1 hardening: race_date が「現在開催中の日付」 ===
-    # Codex 3 次 review: yesterday は深夜帯 (0:00-3:00 JST) のみ accept。
-    # それ以外は today only。
+    # Codex 4 次 review: yesterday 窓を 0:00-05:00 に拡大
     import datetime as _dt
     _jst = _dt.timezone(_dt.timedelta(hours=9))
     _now = _dt.datetime.now(_jst)
     _today = _now.date().isoformat()
     _yesterday = (_now.date() - _dt.timedelta(days=1)).isoformat()
     _allowed = {_today}
-    if _now.hour < 3:
+    if _now.hour < 5:  # 0-04:59 JST
         _allowed.add(_yesterday)
     if args.race_date not in _allowed:
         print(

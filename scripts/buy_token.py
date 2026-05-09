@@ -99,16 +99,16 @@ def is_today_jst(race_date: str) -> bool:
     return str(race_date) == today_jst
 
 
+YESTERDAY_ACCEPT_HOUR = 5  # JST 0:00-05:00 までは yesterday も accept
+
+
 def is_active_race_date(race_date: str) -> bool:
     """race_date が「現在開催中の日付」として妥当か。
 
-    Codex 3 次 review (2026-05-09) で「yesterday 無条件は広い」と指摘:
-    ミッドナイト R の深夜跨ぎ用途に限定すべき。
-    実装:
+    Codex 4 次 review (2026-05-09) を反映:
       - JST today は常に accept
-      - JST yesterday は **深夜帯 0:00-3:00** にのみ accept
-        (3:00 以降は yesterday を弾く = 寝過ごし or 次の日の朝に古い token を
-         踏むのを防ぐ)
+      - JST yesterday は 0:00-05:00 にのみ accept
+        (ミッドナイト R の締切後余裕を見て 3 時 → 5 時に拡大)
     """
     import datetime as _dt
     jst = _dt.timezone(_dt.timedelta(hours=9))
@@ -117,7 +117,7 @@ def is_active_race_date(race_date: str) -> bool:
     if str(race_date) == today:
         return True
     yesterday = (now_jst.date() - _dt.timedelta(days=1)).isoformat()
-    if str(race_date) == yesterday and now_jst.hour < 3:
+    if str(race_date) == yesterday and now_jst.hour < YESTERDAY_ACCEPT_HOUR:
         return True
     return False
 
