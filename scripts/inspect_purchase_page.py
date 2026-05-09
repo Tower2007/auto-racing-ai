@@ -92,25 +92,28 @@ async def inspect(place_code: int, race_no: int, car_no: int | None,
         page = await context.new_page()
 
         try:
-            # === Step 1: ログイン状態確認 ===
+            # === Step 1: ホーム到達 (ログイン判定はバグやすいので URL pattern 側で確認) ===
             await page.goto("https://vote.autorace.jp/", timeout=30000)
             await asyncio.sleep(2)
             current = page.url
             out(f"[1] HOME URL: {current}")
-
-            login_link = page.locator(
-                'a:has-text("ログイン"), button:has-text("ログイン")'
-            ).first
-            need_login = (
-                await login_link.count() > 0 and await login_link.is_visible()
-            )
-            if need_login:
-                out("[1] 未ログイン → 先に scripts/auto_login_autorace.py を実行してから再試行")
-                return
-            out("[1] ログイン済 ✅")
+            # 補助情報: ログアウトボタンが見えていれば logged-in
+            try:
+                logout_btn = page.locator(
+                    'a:has-text("ログアウト"), button:has-text("ログアウト")'
+                ).first
+                logged_in = (
+                    await logout_btn.count() > 0
+                    and await logout_btn.is_visible()
+                )
+                out(f"[1] ログアウトボタン検出 = {logged_in} "
+                    f"({'logged-in と推定' if logged_in else 'unknown'})")
+            except Exception:
+                out("[1] ログイン状態判定スキップ")
 
             # === Step 2: URL pattern 試行 ===
             successful_url = None
+            login_redirect_count = 0
             for pattern in URL_PATTERNS:
                 url = pattern.format(
                     vel_code=vel_code, date=date, race=race_no,
@@ -123,11 +126,10 @@ async def inspect(place_code: int, race_no: int, car_no: int | None,
                     final_url = page.url
                     status = response.status if response else None
                     out(f"    → {final_url} (status={status})")
-                    # 404 / リダイレクト元に戻る等を簡易検出
                     if status and status < 400 and "vote.autorace.jp" in final_url:
-                        # ログイン画面に蹴られていないかチェック
                         if "/login" in final_url:
                             out(f"    → ログイン画面に redirect されました (skip)")
+                            login_redirect_count += 1
                             continue
                         successful_url = final_url
                         break
@@ -136,15 +138,18 @@ async def inspect(place_code: int, race_no: int, car_no: int | None,
                     continue
 
             if not successful_url:
-                out("\n[!] 全 URL pattern が失敗。手動で vote.autorace.jp を開いて、")
-                out("    実際の購入画面 URL を URL_PATTERNS リストに追加してください。")
+                if login_redirect_count > 0:
+                    out("\n[!] 全 URL pattern がログイン画面に redirect されました。")
+                    out("    → scripts/auto_login_autorace.py を実行してから再試行してください。")
+                else:
+                    out("\n[!] 全 URL pattern が失敗。手動で vote.autorace.jp を開いて、")
+                    out("    実際の購入画面 URL を URL_PATTERNS リストに追加してください。")
                 # 最後にホームに戻して手動探索ヒント出す
                 await page.goto("https://vote.autorace.jp/", timeout=15000)
                 await asyncio.sleep(3)
-                # それでも HTML dump して保存
                 html = await page.content()
                 DUMP_HTML.write_text(html, encoding="utf-8")
-                out(f"\n[6] HTML 保存: {DUMP_HTML}")
+                out(f"\n[6] HTML 保存: {DUMP_HTML} (ホーム画面)")
                 DUMP_TXT.write_text("\n".join(lines), encoding="utf-8")
                 return
 
