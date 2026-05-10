@@ -21,6 +21,8 @@ data/*
 !data/production_calib.pkl
 !data/production_meta.json
 !data/expected_votes.csv
+!data/bet_history.csv
+!data/bet_history_detail.csv
 # click-to-buy のトークンログ・購入記録は data/ 配下だが機密扱いで commit しない
 data/buy_tokens.csv
 data/purchase_log.csv
