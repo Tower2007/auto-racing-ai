@@ -42,6 +42,12 @@ try:
 except Exception:
     _AUDIT_AVAILABLE = False
 
+try:
+    from ehi_monitor import calculate_ehi
+    _EHI_AVAILABLE = True
+except Exception:
+    _EHI_AVAILABLE = False
+
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 LOG_FILE = DATA / "daily_ingest.log"
@@ -406,8 +412,8 @@ def check_schtasks_health() -> dict:
     return out
 
 
-def _overall_health(bh: dict, st: dict) -> str:
-    """bet_history と schtasks の観測系異常を NG > WARN > OK で集約(R9)。
+def _overall_health(bh: dict, st: dict, ehi: dict | None = None) -> str:
+    """bet_history と schtasks、EHI の観測系異常を NG > WARN > OK で集約(R9)。
 
     R8 までは bh.status と st.ng_count しか見ておらず、st.warnings(例:
     schtasks 失敗 rc=1)を握りつぶして OK 表示する不具合があった。
@@ -417,20 +423,33 @@ def _overall_health(bh: dict, st: dict) -> str:
         return "NG"
     if any(lv == "NG" for lv, _ in bh.get("alerts", [])):
         return "NG"
+    if ehi and ehi.get("status") == "DANGER":
+        return "NG"
     if bh.get("status") == "WARN":
         return "WARN"
     if st.get("ng_count", 0) > 0:
         return "WARN"
     if st.get("warnings"):
         return "WARN"
+    if ehi and ehi.get("status") == "WARNING":
+        return "WARN"
     return "OK"
 
 
-def render_health_text(bh: dict, st: dict) -> str:
+def render_health_text(bh: dict, st: dict, ehi: dict | None = None) -> str:
     lines = []
     status_emoji = {"OK": "🟢", "WARN": "🟡", "NG": "🔴"}
-    overall = _overall_health(bh, st)
+    overall = _overall_health(bh, st, ehi)
     lines.append(f"【🩺 死活監視】 {status_emoji.get(overall, '')} {overall}")
+    
+    if ehi and ehi.get("ehi") is not None:
+        lines.append(
+            f"  Edge Health Index (7d): {ehi['ehi']} {ehi['emoji']} {ehi['status']} "
+            f"(n={ehi.get('n_races', 0)})"
+        )
+    elif ehi and ehi.get("status") == "NO_DATA":
+        lines.append(f"  Edge Health Index (7d): {ehi.get('message', 'No data')}")
+
     if bh.get("last_date"):
         lines.append(f"  bet_history 最終日: {bh['last_date']}  / 直近 7 日 R 数: {bh['recent_r_count']}")
     else:
@@ -465,14 +484,14 @@ def render_health_text(bh: dict, st: dict) -> str:
     return "\n".join(lines)
 
 
-def render_health_html(bh: dict, st: dict) -> str:
+def render_health_html(bh: dict, st: dict, ehi: dict | None = None) -> str:
     BORDER = '"border-collapse:collapse; border-color:#bbb; font-family:Arial,sans-serif; font-size:13px;"'
     TH = '"background:#e8e8e8; padding:6px 10px; border:1px solid #bbb; text-align:center;"'
     TD = '"padding:6px 10px; border:1px solid #ddd; text-align:left;"'
     TD_R = '"padding:6px 10px; border:1px solid #ddd; text-align:right;"'
 
     miss = bh.get("missing_picks", 0)
-    overall = _overall_health(bh, st)
+    overall = _overall_health(bh, st, ehi)
     status_color = {"OK": "#2e7d32", "WARN": "#e65100", "NG": "#c62828"}.get(overall, "#444")
     status_emoji = {"OK": "🟢", "WARN": "🟡", "NG": "🔴"}.get(overall, "")
     parts = [
@@ -488,8 +507,18 @@ def render_health_html(bh: dict, st: dict) -> str:
         parts.append("</ul>")
     parts.append(f'<table border="1" cellpadding="6" cellspacing="0" style={BORDER}>')
     parts.append(f'<tr><th style={TH}>項目</th><th style={TH}>値</th></tr>')
+    
+    if ehi and ehi.get("ehi") is not None:
+        ehi_val = ehi["ehi"]
+        ehi_color = {"HEALTHY": "#2e7d32", "WARNING": "#e65100", "DANGER": "#c62828"}.get(ehi["status"], "#444")
+        parts.append(
+            f'<tr><td style={TD}>Edge Health Index (7d)</td>'
+            f'<td style={TD_R}><b style="color:{ehi_color}">{ehi_val}</b> '
+            f'({ehi["emoji"]} {ehi["status"]})</td></tr>'
+        )
+
     parts.append(
-        f'<tr><td style={TD}>bet_history 最終日</td>'
+        f'<tr style="background:#fafafa;"><td style={TD}>bet_history 最終日</td>'
         f'<td style={TD_R}>{bh.get("last_date") or "(なし)"}</td></tr>'
     )
     parts.append(
@@ -709,11 +738,15 @@ def main() -> None:
     # 死活監視(Codex R6 提案: bet_history + schtasks)
     bh_health: dict = {}
     st_health: dict = {}
+    ehi_health: dict | None = None
     try:
+        if _EHI_AVAILABLE:
+            ehi_health = calculate_ehi(7)
+        
         bh_health = check_bet_history_health(args.days)
         st_health = check_schtasks_health()
-        text += "\n\n" + render_health_text(bh_health, st_health)
-        health_html = render_health_html(bh_health, st_health)
+        text += "\n\n" + render_health_text(bh_health, st_health, ehi_health)
+        health_html = render_health_html(bh_health, st_health, ehi_health)
         html = html.replace(
             '<hr style="border:none;',
             health_html + '\n<hr style="border:none;',
@@ -807,11 +840,11 @@ def main() -> None:
     else:
         ingest_status = "🟢OK"
 
-    # R9: subject に health overall(bet_history + schtasks)を反映
-    # 上で計算した bh_health / st_health を再利用(二重呼び出しを避ける)
+    # R9: subject に health overall(bet_history + schtasks + EHI)を反映
+    # 上で計算した bh_health / st_health / ehi_health を再利用
     try:
-        if bh_health or st_health:
-            health_overall = _overall_health(bh_health, st_health)
+        if bh_health or st_health or ehi_health:
+            health_overall = _overall_health(bh_health, st_health, ehi_health)
         else:
             health_overall = "?"
     except Exception:

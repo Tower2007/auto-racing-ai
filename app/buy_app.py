@@ -63,6 +63,12 @@ def _import_token_module():
 
 bt = _import_token_module()
 
+try:
+    from ehi_monitor import calculate_ehi
+    ehi = calculate_ehi(7)
+except Exception:
+    ehi = None
+
 params = st.query_params
 b64 = params.get("p", "")
 sig = params.get("s", "")
@@ -130,6 +136,13 @@ ev = float(payload.get("ev", 0))
 race_date = payload.get("race_date", "")
 
 st.title("💰 購入確認")
+
+if ehi and ehi.get("ehi") is not None:
+    st.caption(
+        f"🛡️ Edge Health Index (7d): **{ehi['ehi']}** {ehi['emoji']} {ehi['status']} "
+        f"(n={ehi.get('n_races', 0)})"
+    )
+
 st.markdown(f"### {venue_jp} R{race_no}  /  {car_no}号  /  複勝")
 
 col1, col2, col3 = st.columns(3)
