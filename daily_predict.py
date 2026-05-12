@@ -496,7 +496,8 @@ def render_text(picks: pd.DataFrame, today: str, time_label: str, thr: float) ->
     return "\n".join(lines)
 
 
-def render_html(picks: pd.DataFrame, today: str, time_label: str, thr: float) -> str:
+def render_html(picks: pd.DataFrame, today: str, time_label: str, thr: float,
+                ngrok_url: str | None = None) -> str:
     BORDER = '"border-collapse:collapse; border-color:#bbb; font-family:Arial,sans-serif; font-size:13px;"'
     TH = '"background:#e8e8e8; padding:6px 10px; border:1px solid #bbb; text-align:center;"'
     TD = '"padding:6px 10px; border:1px solid #ddd; text-align:right;"'
@@ -582,7 +583,7 @@ def render_html(picks: pd.DataFrame, today: str, time_label: str, thr: float) ->
                         "car_no": int(r["car_no"]),
                         "amount": 100,
                         "ev": float(r["ev_avg_calib"]),
-                    })
+                    }, host=ngrok_url)
                     parts.append(
                         f'<td style={TD}>'
                         f'<a href="{buy_url}" style={BTN_BUY}>💰 購入</a>'
@@ -828,8 +829,22 @@ def main():
         else:
             picks = pd.DataFrame()
 
+        # 候補ありの場合 ngrok トンネルを起動 (スマホからの 1-click 購入用)
+        ngrok_url = None
+        if not picks.empty:
+            try:
+                from ngrok_tunnel import start_tunnel
+                ngrok_url = start_tunnel(port=8502, ttl_sec=300)
+                if ngrok_url:
+                    logger.info("ngrok tunnel: %s (5min TTL)", ngrok_url)
+                else:
+                    logger.warning("ngrok tunnel start failed, falling back to LAN URL")
+            except Exception as e:
+                logger.warning("ngrok unavailable: %s", e)
+
         text = render_text(picks, target_date, time_label, args.thr)
-        html = render_html(picks, target_date, time_label, args.thr)
+        html = render_html(picks, target_date, time_label, args.thr,
+                           ngrok_url=ngrok_url)
         print()
         print(text)
 
