@@ -1,0 +1,133 @@
+"""ngrok トンネル管理 — 購入推奨メール送信時に一時起動。
+
+daily_predict.py から呼ばれ、buy_app.py (port 8502) への
+ngrok トンネルを起動して公開 URL を返す。
+指定秒後に自動停止する別スレッドを仕込む。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import subprocess
+import threading
+import time
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+_ngrok_process: subprocess.Popen | None = None
+_lock = threading.Lock()
+
+NGROK_CMD = "ngrok"
+DEFAULT_PORT = 8502
+DEFAULT_TTL_SEC = 300  # 5 分
+
+
+def start_tunnel(port: int = DEFAULT_PORT,
+                 ttl_sec: int = DEFAULT_TTL_SEC) -> str | None:
+    """ngrok トンネルを起動し、公開 URL を返す。
+
+    ttl_sec 秒後に自動停止するタイマーを仕込む。
+    既に起動中なら既存の URL を返す。
+    失敗時は None。
+    """
+    global _ngrok_process
+
+    with _lock:
+        if _ngrok_process and _ngrok_process.poll() is None:
+            url = _get_public_url()
+            if url:
+                return url
+
+        _kill_existing()
+
+        try:
+            proc = subprocess.Popen(
+                [NGROK_CMD, "http", str(port), "--log=stdout", "--log-format=json"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+            )
+            _ngrok_process = proc
+            logger.info("ngrok started (pid=%d, port=%d, ttl=%ds)", proc.pid, port, ttl_sec)
+        except FileNotFoundError:
+            logger.error("ngrok command not found")
+            return None
+        except Exception as e:
+            logger.error("ngrok start failed: %s", e)
+            return None
+
+    for _ in range(20):
+        time.sleep(0.5)
+        url = _get_public_url()
+        if url:
+            logger.info("ngrok tunnel URL: %s", url)
+            _schedule_stop(ttl_sec)
+            return url
+
+    logger.error("ngrok tunnel URL not available after 10s")
+    stop_tunnel()
+    return None
+
+
+def stop_tunnel() -> None:
+    """ngrok プロセスを停止。"""
+    global _ngrok_process
+    with _lock:
+        _kill_existing()
+        _ngrok_process = None
+
+
+def _kill_existing() -> None:
+    """既存の ngrok プロセスを終了。"""
+    global _ngrok_process
+    if _ngrok_process and _ngrok_process.poll() is None:
+        try:
+            _ngrok_process.terminate()
+            _ngrok_process.wait(timeout=5)
+        except Exception:
+            try:
+                _ngrok_process.kill()
+            except Exception:
+                pass
+        logger.info("ngrok stopped (pid=%d)", _ngrok_process.pid)
+    # orphan ngrok も止める
+    try:
+        subprocess.run(
+            ["taskkill", "/F", "/IM", "ngrok.exe"],
+            capture_output=True, timeout=5,
+        )
+    except Exception:
+        pass
+
+
+def _get_public_url() -> str | None:
+    """ngrok API から公開 URL を取得。"""
+    try:
+        import urllib.request
+        req = urllib.request.Request("http://127.0.0.1:4040/api/tunnels")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read())
+        for t in data.get("tunnels", []):
+            url = t.get("public_url", "")
+            if url.startswith("https://"):
+                return url
+        for t in data.get("tunnels", []):
+            url = t.get("public_url", "")
+            if url:
+                return url
+    except Exception:
+        pass
+    return None
+
+
+def _schedule_stop(ttl_sec: int) -> None:
+    """ttl_sec 秒後に ngrok を停止するタイマーを起動。"""
+    def _delayed_stop():
+        time.sleep(ttl_sec)
+        logger.info("ngrok TTL expired (%ds), stopping tunnel", ttl_sec)
+        stop_tunnel()
+
+    t = threading.Thread(target=_delayed_stop, daemon=True)
+    t.start()

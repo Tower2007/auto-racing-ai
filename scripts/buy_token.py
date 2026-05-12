@@ -413,7 +413,11 @@ def build_buy_url(payload: dict, host: str | None = None,
     b64, sig = sign(payload)
     if host is None:
         host = get_host_ip()
-    return f"http://{host}:{port}/?p={b64}&s={sig}"
+    if host.startswith("http://") or host.startswith("https://"):
+        base = host.rstrip("/")
+    else:
+        base = f"http://{host}:{port}"
+    return f"{base}/?p={b64}&s={sig}"
 
 
 if __name__ == "__main__":
