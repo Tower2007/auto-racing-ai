@@ -54,7 +54,12 @@ DATA = ROOT / "data"
 LOG_FILE = DATA / "daily_predict.log"
 PRODUCTION_LOG = DATA / "daily_predict_picks.csv"
 ODDS_SNAPSHOT_LOG = DATA / "odds_snapshots.csv"  # 発火時オッズスナップ (信号 persistence 解析用)
+SHADOW_LOG = DATA / "shadow_picks.csv"  # shadow 判定ログ (drift 補正 / 閾値変更の仮想評価)
 EXPECTED_VOTES_CSV = DATA / "expected_votes.csv"  # 場×R別 typical 票数 → 推奨ベット額算出
+
+# Shadow 判定用パラメータ (本番には影響しない、記録のみ)
+SHADOW_DRIFT_FACTORS = [0.70, 0.80]  # close_ev_est = fire_ev * factor
+SHADOW_THRESHOLDS = [1.80, 2.00]     # 代替閾値
 
 
 def _load_votes_lookup() -> dict[tuple[int, int], int]:
@@ -628,6 +633,57 @@ def append_picks_log(picks: pd.DataFrame, time_label: str):
     new.to_csv(PRODUCTION_LOG, mode="a", header=write_header, index=False)
 
 
+def append_shadow_log(top1: pd.DataFrame, time_label: str, thr: float):
+    """shadow 判定を記録。本番には影響しない。
+
+    各 top-1 候補に対して、複数の仮想条件での buy/skip を記録:
+      - drift 補正: close_ev_est = fire_ev * 0.70 / 0.80
+      - 代替閾値: thr=1.80 / 2.00
+    後日の結果照合で、どの条件が最適かを評価する。
+    """
+    if top1 is None or top1.empty:
+        return
+    try:
+        SHADOW_LOG.parent.mkdir(parents=True, exist_ok=True)
+        row = top1.iloc[0]
+        fire_ev = float(row.get("ev_avg_calib", float("nan")))
+        if pd.isna(fire_ev):
+            return
+        rec = {
+            "race_date": row.get("race_date", ""),
+            "place_code": int(row.get("place_code", 0)),
+            "race_no": int(row.get("race_no", 0)),
+            "car_no": int(row.get("car_no", 0)),
+            "pred_calib": float(row.get("pred_calib", 0)),
+            "fire_ev": fire_ev,
+            "place_odds_min": float(row.get("place_odds_min", 0)),
+            "place_odds_max": float(row.get("place_odds_max", 0)),
+            "batch": time_label,
+            "captured_at": dt.datetime.now().isoformat(timespec="seconds"),
+            # 本番判定
+            "live_buy": 1 if fire_ev >= thr else 0,
+            "live_thr": thr,
+        }
+        # drift 補正 shadow
+        for factor in SHADOW_DRIFT_FACTORS:
+            est = fire_ev * factor
+            rec[f"drift{int(factor*100)}_ev"] = round(est, 3)
+            rec[f"drift{int(factor*100)}_buy"] = 1 if est >= thr else 0
+        # 代替閾値 shadow
+        for alt_thr in SHADOW_THRESHOLDS:
+            rec[f"thr{int(alt_thr*100)}_buy"] = 1 if fire_ev >= alt_thr else 0
+            # drift + 代替閾値の組み合わせ
+            for factor in SHADOW_DRIFT_FACTORS:
+                est = fire_ev * factor
+                rec[f"drift{int(factor*100)}_thr{int(alt_thr*100)}_buy"] = 1 if est >= alt_thr else 0
+
+        new = pd.DataFrame([rec])
+        write_header = not SHADOW_LOG.exists() or SHADOW_LOG.stat().st_size == 0
+        new.to_csv(SHADOW_LOG, mode="a", header=write_header, index=False)
+    except Exception as e:
+        logging.warning("shadow_log 記録失敗: %s", e)
+
+
 def append_odds_snapshot(feat: pd.DataFrame, time_label: str):
     """発火時の全車オッズ + EV を odds_snapshots.csv に追記。
 
@@ -809,6 +865,8 @@ def main():
                     logger.warning("  R%d top1 EV=NaN (place_odds_min=%s, max=%s) — fns 未公開で silent skip",
                                    race_no, pmin, pmax)
                     continue
+                # shadow 記録: 閾値判定の前に全 top1 を記録 (drift 補正 / 代替閾値の仮想評価用)
+                append_shadow_log(top1, time_label, args.thr)
                 cands = top1[top1["ev_avg_calib"] >= args.thr].copy()
                 if cands.empty:
                     n_below_thr += 1

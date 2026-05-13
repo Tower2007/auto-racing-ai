@@ -215,23 +215,25 @@ def _load_current_meta() -> dict | None:
 
 
 def _should_adopt(new_metrics: dict, old_meta: dict | None,
-                  force: bool = False) -> tuple[bool, str]:
+                  force: bool = False) -> tuple[str, str]:
     """新モデルを採用すべきか判定。
 
-    判定基準:
-      1. 旧モデルなし → 採用
-      2. --force → 強制採用
-      3. valid_auc が旧モデルより低下 → 見送り
-      4. valid_logloss が旧モデルより 1% 以上悪化 → 見送り
-      5. best_iteration が旧モデルの 40% 未満 → 見送り (学習が浅すぎる)
+    判定基準 (NG = 見送り, WARN = 採用するが警告, OK = 採用):
+      1. 旧モデルなし → OK
+      2. --force → OK (強制)
+      3. valid_auc が旧モデルより低下 → NG
+      4. valid_logloss が旧モデルより 1% 以上悪化 → NG
+      5. best_iteration が旧モデルの 40% 未満 → NG (学習が浅すぎる)
+      6. best_iteration が旧モデルの 60% 未満 → WARN (浅い傾向)
+      7. それ以外 → OK
 
     Returns:
-        (adopt: bool, reason: str)
+        (verdict: "OK" | "WARN" | "NG", reason: str)
     """
     if old_meta is None:
-        return True, "旧モデルなし、初回採用"
+        return "OK", "旧モデルなし、初回採用"
     if force:
-        return True, "--force 指定、強制採用"
+        return "OK", "--force 指定、強制採用"
 
     old_tm = old_meta.get("train_metrics", {})
     old_auc = old_tm.get("valid_auc", 0)
@@ -242,28 +244,35 @@ def _should_adopt(new_metrics: dict, old_meta: dict | None,
     new_logloss = new_metrics.get("valid_logloss", 999)
     new_best_iter = new_metrics.get("best_iteration", 0)
 
-    # AUC 低下
+    # AUC 低下 → NG
     if new_auc < old_auc:
-        return False, (
+        return "NG", (
             f"valid_auc 低下: {old_auc:.4f} -> {new_auc:.4f} "
             f"(diff={new_auc - old_auc:+.4f})"
         )
 
-    # logloss 1% 以上悪化
+    # logloss 1% 以上悪化 → NG
     if old_logloss > 0 and new_logloss > old_logloss * 1.01:
-        return False, (
+        return "NG", (
             f"valid_logloss 悪化: {old_logloss:.5f} -> {new_logloss:.5f} "
             f"(+{(new_logloss / old_logloss - 1) * 100:.1f}%)"
         )
 
-    # best_iteration が旧の 40% 未満 (学習が浅すぎ)
+    # best_iteration が旧の 40% 未満 → NG (学習が浅すぎ)
     if old_best_iter > 0 and new_best_iter < old_best_iter * 0.4:
-        return False, (
+        return "NG", (
             f"best_iteration 激減: {old_best_iter} -> {new_best_iter} "
             f"({new_best_iter / old_best_iter * 100:.0f}%、閾値 40%)"
         )
 
-    return True, (
+    # best_iteration が旧の 60% 未満 → WARN (浅い傾向)
+    if old_best_iter > 0 and new_best_iter < old_best_iter * 0.6:
+        return "WARN", (
+            f"best_iteration 減少: {old_best_iter} -> {new_best_iter} "
+            f"({new_best_iter / old_best_iter * 100:.0f}%、60% 未満で WARN)"
+        )
+
+    return "OK", (
         f"OK: valid_auc {old_auc:.4f} -> {new_auc:.4f}, "
         f"logloss {old_logloss:.5f} -> {new_logloss:.5f}, "
         f"best_iter {old_best_iter} -> {new_best_iter}"
@@ -287,17 +296,17 @@ def main():
 
     # 品質ゲート: 旧モデルと比較
     old_meta = _load_current_meta()
-    adopt, reason = _should_adopt(train_metrics, old_meta, force=args.force)
+    verdict, reason = _should_adopt(train_metrics, old_meta, force=args.force)
 
-    if not adopt:
+    if verdict == "NG":
         logger.warning("=" * 60)
-        logger.warning("新モデル採用見送り: %s", reason)
+        logger.warning("新モデル採用見送り (NG): %s", reason)
         logger.warning("旧モデルを維持します。--force で強制採用可。")
         logger.warning("=" * 60)
-        # 見送り記録を prev に残す (デバッグ用)
         rejected_path = DATA / "production_meta.rejected.json"
         rejected = {
             "trained_at": datetime.now().isoformat(timespec="seconds"),
+            "verdict": verdict,
             "rejected_reason": reason,
             "train_metrics": train_metrics,
         }
@@ -306,7 +315,10 @@ def main():
         logger.info("見送りメタ保存: %s", rejected_path.name)
         return
 
-    logger.info("品質ゲート通過: %s", reason)
+    if verdict == "WARN":
+        logger.warning("品質ゲート WARN (採用するが要注意): %s", reason)
+    else:
+        logger.info("品質ゲート通過 (OK): %s", reason)
 
     # 旧モデルの meta をバックアップ
     model_path = DATA / "production_model.lgb"
@@ -334,6 +346,7 @@ def main():
         },
         "train_metrics": train_metrics,
         "calib_metrics": calib_metrics,
+        "quality_gate_verdict": verdict,
         "adoption_reason": reason,
     }
     with open(meta_path, "w", encoding="utf-8") as f:
