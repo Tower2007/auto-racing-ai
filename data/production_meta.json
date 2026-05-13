@@ -1,5 +1,5 @@
 {
-  "trained_at": "2026-05-10T03:00:14",
+  "trained_at": "2026-04-29T15:17:09",
   "target": "target_top3",
   "n_features": 55,
   "feature_columns": [
@@ -75,40 +75,21 @@
   ],
   "data_date_range": {
     "min": "2021-04-26",
-    "max": "2026-05-01"
+    "max": "2026-04-26"
   },
   "train_metrics": {
-    "n_train": 238370,
-    "n_val": 26615,
-    "best_iteration": 143,
-    "train_auc": 0.8186111045285491,
-    "valid_auc": 0.8242064269921652,
-    "valid_logloss": 0.5015846599639384
+    "n_train": 236123,
+    "n_val": 26353,
+    "best_iteration": 271,
+    "train_auc": 0.8325414559699078,
+    "valid_auc": 0.8265856836523581,
+    "valid_logloss": 0.49901496055721983
   },
   "calib_metrics": {
-    "fit_data_diagnostic": {
-      "n_calib": 217578,
-      "raw_auc": 0.8091561036076702,
-      "calib_auc": 0.8094006318833646,
-      "raw_logloss": 0.5200227423742884,
-      "calib_logloss": 0.519386724259095,
-      "note": "in-sample (fit data 上の診断値)。honest 評価値として引用しないこと。校正性能の評価指標は honest_split を見ること。"
-    },
-    "honest_split": {
-      "cutoff": "2024-04",
-      "n_calib": 103360,
-      "n_eval": 114218,
-      "raw_auc": 0.815743918678354,
-      "calib_auc": 0.8156190252553263,
-      "raw_logloss": 0.5123704353793914,
-      "calib_logloss": 0.5163192568215033,
-      "note": "honest: fit on test_month < 2024-04, eval on test_month >= 2024-04"
-    },
     "n_calib": 217578,
     "raw_auc": 0.8091561036076702,
     "calib_auc": 0.8094006318833646,
     "raw_logloss": 0.5200227423742884,
-    "calib_logloss": 0.519386724259095,
-    "_legacy_keys_note": "n_calib/raw_auc/calib_auc/raw_logloss/calib_logloss は in-sample 値で 後方互換のため残置。新しいコードは fit_data_diagnostic か honest_split を参照。"
+    "calib_logloss": 0.519386724259095
   }
 }

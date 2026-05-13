@@ -202,9 +202,79 @@ def fit_calibration() -> tuple[IsotonicRegression, dict]:
     return iso, metrics
 
 
+def _load_current_meta() -> dict | None:
+    """現行モデルの meta を読み込む。なければ None。"""
+    meta_path = DATA / "production_meta.json"
+    if not meta_path.exists():
+        return None
+    try:
+        with open(meta_path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _should_adopt(new_metrics: dict, old_meta: dict | None,
+                  force: bool = False) -> tuple[bool, str]:
+    """新モデルを採用すべきか判定。
+
+    判定基準:
+      1. 旧モデルなし → 採用
+      2. --force → 強制採用
+      3. valid_auc が旧モデルより低下 → 見送り
+      4. valid_logloss が旧モデルより 1% 以上悪化 → 見送り
+      5. best_iteration が旧モデルの 40% 未満 → 見送り (学習が浅すぎる)
+
+    Returns:
+        (adopt: bool, reason: str)
+    """
+    if old_meta is None:
+        return True, "旧モデルなし、初回採用"
+    if force:
+        return True, "--force 指定、強制採用"
+
+    old_tm = old_meta.get("train_metrics", {})
+    old_auc = old_tm.get("valid_auc", 0)
+    old_logloss = old_tm.get("valid_logloss", 999)
+    old_best_iter = old_tm.get("best_iteration", 0)
+
+    new_auc = new_metrics.get("valid_auc", 0)
+    new_logloss = new_metrics.get("valid_logloss", 999)
+    new_best_iter = new_metrics.get("best_iteration", 0)
+
+    # AUC 低下
+    if new_auc < old_auc:
+        return False, (
+            f"valid_auc 低下: {old_auc:.4f} -> {new_auc:.4f} "
+            f"(diff={new_auc - old_auc:+.4f})"
+        )
+
+    # logloss 1% 以上悪化
+    if old_logloss > 0 and new_logloss > old_logloss * 1.01:
+        return False, (
+            f"valid_logloss 悪化: {old_logloss:.5f} -> {new_logloss:.5f} "
+            f"(+{(new_logloss / old_logloss - 1) * 100:.1f}%)"
+        )
+
+    # best_iteration が旧の 40% 未満 (学習が浅すぎ)
+    if old_best_iter > 0 and new_best_iter < old_best_iter * 0.4:
+        return False, (
+            f"best_iteration 激減: {old_best_iter} -> {new_best_iter} "
+            f"({new_best_iter / old_best_iter * 100:.0f}%、閾値 40%)"
+        )
+
+    return True, (
+        f"OK: valid_auc {old_auc:.4f} -> {new_auc:.4f}, "
+        f"logloss {old_logloss:.5f} -> {new_logloss:.5f}, "
+        f"best_iter {old_best_iter} -> {new_best_iter}"
+    )
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--target", default="target_top3", choices=["target_top3", "target_win"])
+    p.add_argument("--force", action="store_true",
+                   help="品質ゲートを無視して強制的に新モデルを採用")
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -215,10 +285,38 @@ def main():
     model, train_metrics = train_full(X, y, df_kept["race_date"])
     iso, calib_metrics = fit_calibration()
 
-    # 保存
+    # 品質ゲート: 旧モデルと比較
+    old_meta = _load_current_meta()
+    adopt, reason = _should_adopt(train_metrics, old_meta, force=args.force)
+
+    if not adopt:
+        logger.warning("=" * 60)
+        logger.warning("新モデル採用見送り: %s", reason)
+        logger.warning("旧モデルを維持します。--force で強制採用可。")
+        logger.warning("=" * 60)
+        # 見送り記録を prev に残す (デバッグ用)
+        rejected_path = DATA / "production_meta.rejected.json"
+        rejected = {
+            "trained_at": datetime.now().isoformat(timespec="seconds"),
+            "rejected_reason": reason,
+            "train_metrics": train_metrics,
+        }
+        with open(rejected_path, "w", encoding="utf-8") as f:
+            json.dump(rejected, f, ensure_ascii=False, indent=2)
+        logger.info("見送りメタ保存: %s", rejected_path.name)
+        return
+
+    logger.info("品質ゲート通過: %s", reason)
+
+    # 旧モデルの meta をバックアップ
     model_path = DATA / "production_model.lgb"
     calib_path = DATA / "production_calib.pkl"
     meta_path = DATA / "production_meta.json"
+    prev_meta_path = DATA / "production_meta.prev.json"
+
+    if meta_path.exists():
+        import shutil
+        shutil.copy2(meta_path, prev_meta_path)
 
     model.save_model(str(model_path))
     with open(calib_path, "wb") as f:
@@ -236,6 +334,7 @@ def main():
         },
         "train_metrics": train_metrics,
         "calib_metrics": calib_metrics,
+        "adoption_reason": reason,
     }
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
