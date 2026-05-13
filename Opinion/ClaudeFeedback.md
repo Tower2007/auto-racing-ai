@@ -4,6 +4,31 @@
 
 ---
 
+## 2026-05-14: finished フラグ revert + target_definition_version 導入
+
+### 決定: DQ/落車を学習から除外 (旧条件に revert)
+
+Codex 同意のもと、`ml/features.py` の `_build_target()` を旧条件に戻した。
+
+- `finished = 1` → `finished = order.notna()` に revert
+- parquet 再生成済: <=04-26 で 262,476 行 (4/29 meta と完全一致)
+- 理由: Phase A は固定仮説の live 検証が目的。訓練母集団を変えて品質ゲートの
+  基準を揺らすのは今は避けるべき (Codex 判断に同意)
+
+### target_definition_version の導入
+
+Codex 提案を採用。`ml/train_production.py` に以下を追加:
+
+- `TARGET_DEFINITION_VERSION = 1` 定数 (v1=旧定義、v2=DQ含有)
+- `production_meta.json` に `target_definition_version` フィールド
+- 品質ゲート `_should_adopt()` で version 不一致時は WARN を出す
+  (AUC/best_iter の差が「モデル品質」か「教師データ定義差」かを見分けるため)
+
+将来 DQ/落車を再度含める場合は version を上げることで、品質ゲートが
+「定義変更による差」と認識して誤 NG を出さなくなる。
+
+---
+
 ## 2026-05-14: Parquet +1,828 行の根本原因特定
 
 ### Codex 指摘 (同日)

@@ -60,6 +60,12 @@ CATEGORICAL = [
     "year", "month", "dow",
 ]
 
+# 教師データ定義バージョン。フィルタ条件や target の定義を変えたら上げる。
+# AUC/best_iter の差が「モデル品質」か「教師データ定義差」かを見分けるため。
+# v1: finished = order.notna() (DQ/落車を除外)
+# v2: finished = 1 (DQ/落車を含む) — 2026-05-02 導入、05-14 revert で v1 に戻す
+TARGET_DEFINITION_VERSION = 1
+
 
 def load_features() -> pd.DataFrame:
     df = pd.read_parquet(DATA / "ml_features.parquet")
@@ -235,6 +241,14 @@ def _should_adopt(new_metrics: dict, old_meta: dict | None,
     if force:
         return "OK", "--force 指定、強制採用"
 
+    # 教師データ定義バージョンの不一致チェック
+    old_tdv = old_meta.get("target_definition_version")
+    if old_tdv is not None and old_tdv != TARGET_DEFINITION_VERSION:
+        return "WARN", (
+            f"target_definition_version 変更: {old_tdv} -> {TARGET_DEFINITION_VERSION}. "
+            "AUC/best_iter の差は教師データ定義差の可能性あり"
+        )
+
     old_tm = old_meta.get("train_metrics", {})
     old_auc = old_tm.get("valid_auc", 0)
     old_logloss = old_tm.get("valid_logloss", 999)
@@ -337,6 +351,7 @@ def main():
     meta = {
         "trained_at": datetime.now().isoformat(timespec="seconds"),
         "target": args.target,
+        "target_definition_version": TARGET_DEFINITION_VERSION,
         "n_features": int(X.shape[1]),
         "feature_columns": feature_cols,
         "categorical": [c for c in CATEGORICAL if c in feature_cols],

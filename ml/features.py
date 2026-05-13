@@ -95,9 +95,11 @@ def _build_target(results: pd.DataFrame) -> pd.DataFrame:
     df = results[CAR_KEY + ["order"]].copy()
     df["target_top3"] = ((df["order"] >= 1) & (df["order"] <= 3)).astype(int)
     df["target_win"] = (df["order"] == 1).astype(int)
-    # finished = race_results に行が存在する = 結果取得済(失格・落車も含む)。
-    # parser が order>=9 を NULL 化するので order.notna() だと DQ/落車が学習から漏れる。
-    df["finished"] = 1
+    # finished = 結果が確定し着順が判明した行。DQ/落車 (order=NaN) は除外。
+    # 理論上 DQ を負例に含めるべきだが、実験で best_iter 271→210、AUC/logloss
+    # 全悪化を確認 (2026-05-14)。Phase A の固定仮説検証を優先し旧定義に戻す。
+    # 将来 DQ 含有を再検討する場合は target_definition_version を上げること。
+    df["finished"] = df["order"].notna().astype(int)
     return df[CAR_KEY + ["target_top3", "target_win", "finished"]]
 
 
