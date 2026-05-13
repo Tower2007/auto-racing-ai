@@ -367,8 +367,8 @@ def align_features(df: pd.DataFrame, meta: dict) -> pd.DataFrame:
     return out
 
 
-PREDICT_RETRY_MAX = 2          # top1 EV NaN 時の odds 再取得試行回数 (1min × 2 = 最大 2 分待機)
-PREDICT_RETRY_SLEEP_SEC = 60   # 再取得までの待機秒
+PREDICT_RETRY_MAX = 1          # top1 EV NaN 時の odds 再取得試行回数 (30s × 1 = 最大 30 秒待機)
+PREDICT_RETRY_SLEEP_SEC = 30   # 再取得までの待機秒 (LEAD_MIN=2 対応で 60→30 に短縮)
 
 
 def predict_race(
@@ -770,7 +770,7 @@ def main():
             venue = VENUE_CODES.get(pc, str(pc))
             logger.info("--- %s (pc=%d) races=%s ---", venue, pc, race_nos)
             NEAR_MISS_BAND = 0.30  # EV ≥ thr-0.30 なら drift up を期待して retry
-            NEAR_MISS_RETRIES = 2  # 60s × 2 で最大 -3min まで監視
+            NEAR_MISS_RETRIES = 1  # 30s × 1 (LEAD_MIN=2 対応で短縮)
             for race_no in race_nos:
                 df = predict_race(client, model, iso, meta, pc, target_date, race_no)
                 if df.empty:
