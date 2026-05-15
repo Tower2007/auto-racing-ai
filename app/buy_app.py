@@ -96,7 +96,7 @@ except ValueError as e:
 
 # ===== P3 hardening: payload validation (strict_amount=True / Phase A) =====
 try:
-    bt.validate_payload(payload, strict_amount=True)
+    bt.validate_payload(payload, strict_amount=False)
 except ValueError as e:
     st.title("🚫 payload validation 失敗")
     st.error(f"{e}")

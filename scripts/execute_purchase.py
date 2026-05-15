@@ -682,12 +682,17 @@ def main() -> None:
     except Exception:
         pass
 
-    # === P3 hardening: amount strict == 100 (Codex 3 次 review) ===
-    # Phase A の本番入口は amount == 100 固定。
-    # 将来の金額拡張は別フェーズで MAX_AMOUNT_YEN を明示的に変更してから解除。
-    if args.amount != 100:
+    # === P3 hardening: amount <= MAX_AMOUNT_YEN (Codex 3 次 review 由来) ===
+    # recommended_bet_yen() が場×R 別に最適額を返すので、上限チェックのみ。
+    if args.amount > MAX_AMOUNT_YEN:
         print(
-            f"[execute_purchase] ❌ amount {args.amount} 不可 (Phase A は 100 固定)",
+            f"[execute_purchase] ❌ amount {args.amount} > {MAX_AMOUNT_YEN} (safety limit)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if args.amount % 100 != 0 or args.amount < 100:
+        print(
+            f"[execute_purchase] ❌ amount {args.amount} は 100 円単位で 100 円以上",
             file=sys.stderr,
         )
         sys.exit(2)

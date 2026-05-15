@@ -586,7 +586,7 @@ def render_html(picks: pd.DataFrame, today: str, time_label: str, thr: float,
                         "venue_jp": VENUE_JP_MAP_.get(pc, "?"),
                         "race_no": int(r["race_no"]),
                         "car_no": int(r["car_no"]),
-                        "amount": 100,
+                        "amount": rec_yen,
                         "ev": float(r["ev_avg_calib"]),
                     }, host=ngrok_url)
                     parts.append(
