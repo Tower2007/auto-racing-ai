@@ -131,7 +131,7 @@ def get_autorace_client():
     return AutoraceClient()
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=60)
 def fetch_today_open_venues() -> list[tuple[int, bool]]:
     """Hold/Today API で本日開催 + 中止でない場の (place_code, is_finished) リストを返す。
 
