@@ -88,8 +88,8 @@ reports/               # 各種分析レポート(commit 対象)
 | タスク | 時刻 | 内容 |
 |---|---|---|
 | `AutoraceDailyIngest` | 毎日 06:30 | データ収集 (catchup 2 日) |
-| `AutoraceDynamicScheduler` | 毎日 07:00 | `python dynamic_scheduler.py`: Program/Print ページから各場 R 毎の発走時刻を取得し、各レース発走 `LEAD_MIN` 分前 (現在 2 分前) の `AutoraceDyn_{venue}_R{n}` one-shot を 12 R × 場数ぶん登録(冪等、毎日再生成) |
-| `AutoraceDyn_{venue}_R{n}` | 各レース発走 LEAD_MIN 分前(現在 2 分前、動的) | `python daily_predict.py --venues {pc} --races {n} --suppress-noresult-email`: 1 R 単位で予測、候補ありのみメール送信。`daily_predict` 側 NaN/near-miss retry (30s × 1) で実質 -1.5 分まで救済 |
+| `AutoraceDynamicScheduler` | 毎日 07:00 | `python dynamic_scheduler.py`: Program/Print ページから各場 R 毎の発走時刻を取得し、各レース発走 `LEAD_MIN` 分前 (現在 4 分前) の `AutoraceDyn_{venue}_R{n}` one-shot を 12 R × 場数ぶん登録(冪等、毎日再生成) |
+| `AutoraceDyn_{venue}_R{n}` | 各レース発走 LEAD_MIN 分前(現在 4 分前、動的) | `python daily_predict.py --venues {pc} --races {n} --suppress-noresult-email`: 1 R 単位で予測、候補ありのみメール送信。near-miss retry 廃止、処理 ~10 秒で締切 ~2 分前に到着 |
 | `AutoraceWeeklyRetrain` | 毎日曜 03:00 | 本番モデル再学習 |
 | `AutoraceWeeklyStatus` | 毎月曜 07:30 | 週次ステータス報告 |
 | `AutoraceFetchOrderHistory` | 毎日 02:30 | `python scripts/daily_fetch_order_history.py`: vote.autorace.jp の購入履歴を `--since 2d --detail --cookie-source playwright` で取得し `data/bet_history.csv` / `bet_history_detail.csv` にマージ。失敗時のみ Gmail 通知。**2026-05-08 から Playwright auto-login** に切替(SBI IPO project と同じパターン)。資格情報は `accounts.json`(.gitignore)。実装: `scripts/auto_login_autorace.py`。旧 Firefox cookie 方式は `--cookie-source firefox` で fallback 可。経緯: memory `ml_baseline_findings.md` 2026-05-08 |
@@ -98,8 +98,8 @@ reports/               # 各種分析レポート(commit 対象)
 - 発走時刻取得: `/race_info/Program/Print/{venueKey}/{YYYY-MM-DD}` から R 毎の発走予定時刻を HTML スクレイプ。12 R 全て掲載されるので推定ではなく実時刻ベースで登録。
   - 取得失敗時のみ fallback: Hold/Today の `(nowRaceNo, raceStartTime)` を anchor、`liveEndTime − 5 min` を R12 とした線形補間。`liveStartTime`(放送開始、R1 より約 30 分早い)は更なる fallback。
   - 深夜跨ぎ(R 番号順に時刻が前 R より早くなる)は +1 日として処理。
-- 各レース発走 `LEAD_MIN` 分前 (現在 2 分前、`dynamic_scheduler.py:LEAD_MIN`) で one-shot 発火 → そのレースの 1 R 分だけ predict
-  - LEAD_MIN は 30→15→10→5→2 と段階的に短縮。5 分前でも確定時オッズとの drift (平均 -20%, 57% が確定時 EV<1.50) が主要損失要因として残ったため、2 分前へ短縮 (2026-05-14)。click-to-buy 完成後は 2 分前でも投票可能。daily_predict 側 30s × 1 retry で最悪 -1.5 分まで救済。
+- 各レース発走 `LEAD_MIN` 分前 (現在 4 分前、`dynamic_scheduler.py:LEAD_MIN`) で one-shot 発火 → そのレースの 1 R 分だけ predict
+  - LEAD_MIN は 30→15→10→5→2→4 と変遷。2 分前 (2026-05-14〜05-17) では処理+送信で締切ギリギリに到着する問題が発生。4 分前に戻し near-miss retry を廃止することで通知が締切 ~2 分前に安定到着。drift は 5 分前時 (-20%) より軽微と判断。
 - `--suppress-noresult-email`: 候補なしの R はメールスキップ(候補ありの R のみ通知)
 - 当日中止・全 fallback 失敗の場は登録スキップ
 - 冪等: 既存 `AutoraceDyn_*` を全削除してから再登録、同日中の手動再走 OK
