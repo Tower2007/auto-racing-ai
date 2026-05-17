@@ -372,8 +372,8 @@ def align_features(df: pd.DataFrame, meta: dict) -> pd.DataFrame:
     return out
 
 
-PREDICT_RETRY_MAX = 1          # top1 EV NaN 時の odds 再取得試行回数 (30s × 1 = 最大 30 秒待機)
-PREDICT_RETRY_SLEEP_SEC = 30   # 再取得までの待機秒 (LEAD_MIN=2 対応で 60→30 に短縮)
+PREDICT_RETRY_MAX = 0          # near-miss retry 廃止 (LEAD_MIN=4 で締切 2 分前到着を優先)
+PREDICT_RETRY_SLEEP_SEC = 30   # 未使用 (PREDICT_RETRY_MAX=0)
 
 
 def predict_race(
@@ -825,8 +825,8 @@ def main():
         for pc in args.venues:
             venue = VENUE_CODES.get(pc, str(pc))
             logger.info("--- %s (pc=%d) races=%s ---", venue, pc, race_nos)
-            NEAR_MISS_BAND = 0.30  # EV ≥ thr-0.30 なら drift up を期待して retry
-            NEAR_MISS_RETRIES = 1  # 30s × 1 (LEAD_MIN=2 対応で短縮)
+            NEAR_MISS_BAND = 0.30  # (参考値、retry 廃止により未使用)
+            NEAR_MISS_RETRIES = 0  # near-miss retry 廃止 (締切 2 分前到着を優先)
             for race_no in race_nos:
                 df = predict_race(client, model, iso, meta, pc, target_date, race_no)
                 if df.empty:
@@ -891,6 +891,10 @@ def main():
         ngrok_url = None
         if not picks.empty:
             try:
+                import sys as _sys
+                _scripts = str(Path(__file__).resolve().parent / "scripts")
+                if _scripts not in _sys.path:
+                    _sys.path.insert(0, _scripts)
                 from ngrok_tunnel import start_tunnel
                 ngrok_url = start_tunnel(port=8502, ttl_sec=300)
                 if ngrok_url:

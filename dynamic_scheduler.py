@@ -33,13 +33,11 @@ LOG_FILE = DATA / "dynamic_scheduler.log"
 TASK_PREFIX = "AutoraceDyn_"
 DEFAULT_RACE_INTERVAL_MIN = 30  # liveEndTime 取得失敗時のフォールバック
 # 発走 LEAD_MIN 分前に発火。
-# 30→15→10→5→2 分前へ段階的に短縮。
-# 5 分前でも確定時オッズとの drift (平均 -20%, 57% が確定時 EV<1.50) が
-# 主要な損失要因として残った (2026-05-14 分析)。Codex 見解: 観測時点を
-# close に寄せるのが Phase A thr=1.50 固定と最も整合する改善。
-# click-to-buy 完成後は 2 分前でも投票可能。
-# daily_predict 側 retry を 30s × 1 に短縮し、最悪 -1min で完了。
-LEAD_MIN = 2
+# 30→15→10→5→2→4 分前へ変遷。
+# 2 分前 (2026-05-14〜05-17): 処理+メール送信で締切ギリギリに到着する問題。
+# 4 分前に戻し near-miss retry を廃止することで、通知が締切 ~2 分前に安定到着。
+# drift は 5 分前 (-20%) より軽微と判断。
+LEAD_MIN = 4
 RACES_PER_DAY = 12
 # 最終R終了時刻 = R12 発走 + おおよそレース3分 + 払戻数分。
 # liveEndTime からこの分を差し引いて R12 発走時刻と扱う。
