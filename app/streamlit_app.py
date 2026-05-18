@@ -204,7 +204,7 @@ def race_status(start_time_str: str | None, now: dt.datetime,
     return ("🔮 前売予想", f"前売オッズ・発走まで {int(minutes_to_start)} 分")
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=90)
 def fetch_live_day(date_str: str, pc: int) -> dict:
     """1 場 12 R 分の状態+予測+結果を取得。
     戻り値: {race_no: {has_odds, has_result, source, top_cars, df, refund_info}}
