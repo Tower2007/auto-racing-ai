@@ -33,6 +33,7 @@ import datetime as dt
 import json
 import logging
 import pickle
+import subprocess
 import sys
 import time
 import traceback
@@ -887,9 +888,28 @@ def main():
         else:
             picks = pd.DataFrame()
 
-        # 候補ありの場合 ngrok トンネルを起動 (スマホからの 1-click 購入用)
+        # 候補ありの場合 buy_app + ngrok トンネルを起動 (スマホからの 1-click 購入用)
         ngrok_url = None
         if not picks.empty:
+            # buy_app が未起動ならバックグラウンドで起動
+            try:
+                import urllib.request as _ur
+                _ur.urlopen("http://127.0.0.1:8502/_stcore/health", timeout=2)
+                logger.info("buy_app already running on :8502")
+            except Exception:
+                try:
+                    buy_app_path = str(Path(__file__).resolve().parent / "app" / "buy_app.py")
+                    subprocess.Popen(
+                        [sys.executable, "-m", "streamlit", "run", buy_app_path,
+                         "--server.port", "8502", "--server.headless", "true"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+                    )
+                    logger.info("buy_app started on :8502")
+                    time.sleep(3)
+                except Exception as e:
+                    logger.warning("buy_app start failed: %s", e)
+            # ngrok トンネル起動
             try:
                 import sys as _sys
                 _scripts = str(Path(__file__).resolve().parent / "scripts")
