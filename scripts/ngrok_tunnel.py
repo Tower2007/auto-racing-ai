@@ -29,18 +29,21 @@ def start_tunnel(port: int = DEFAULT_PORT,
     """ngrok トンネルを起動し、公開 URL を返す。
 
     ttl_sec 秒後に自動停止するタイマーを仕込む。
-    既に起動中なら既存の URL を返す。
+    既に起動中（手動含む）なら既存の URL を返す。
     失敗時は None。
     """
     global _ngrok_process
 
-    with _lock:
-        if _ngrok_process and _ngrok_process.poll() is None:
-            url = _get_public_url()
-            if url:
-                return url
+    # まず既存の ngrok（手動起動含む）の URL を試す — 殺さずに再利用
+    url = _get_public_url()
+    if url:
+        logger.info("reusing existing ngrok tunnel: %s", url)
+        _schedule_stop(ttl_sec)
+        return url
 
+    with _lock:
         _kill_existing()
+        time.sleep(1)  # ポート解放待ち
 
         try:
             proc = subprocess.Popen(
@@ -58,15 +61,15 @@ def start_tunnel(port: int = DEFAULT_PORT,
             logger.error("ngrok start failed: %s", e)
             return None
 
-    for _ in range(20):
+    for i in range(60):
         time.sleep(0.5)
         url = _get_public_url()
         if url:
-            logger.info("ngrok tunnel URL: %s", url)
+            logger.info("ngrok tunnel URL: %s (%.1fs)", url, (i + 1) * 0.5)
             _schedule_stop(ttl_sec)
             return url
 
-    logger.error("ngrok tunnel URL not available after 10s")
+    logger.error("ngrok tunnel URL not available after 30s")
     stop_tunnel()
     return None
 
