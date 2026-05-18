@@ -889,7 +889,10 @@ def main():
             picks = pd.DataFrame()
 
         # 候補ありの場合 buy_app + ngrok トンネルを起動 (スマホからの 1-click 購入用)
+        # 4 分後に両方自動停止する cleanup プロセスも spawn
+        BUY_TTL_SEC = 240  # 4 分
         ngrok_url = None
+        buy_app_pid = None
         if not picks.empty:
             # buy_app が未起動ならバックグラウンドで起動
             try:
@@ -899,13 +902,14 @@ def main():
             except Exception:
                 try:
                     buy_app_path = str(Path(__file__).resolve().parent / "app" / "buy_app.py")
-                    subprocess.Popen(
+                    proc = subprocess.Popen(
                         [sys.executable, "-m", "streamlit", "run", buy_app_path,
                          "--server.port", "8502", "--server.headless", "true"],
                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                         creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
                     )
-                    logger.info("buy_app started on :8502")
+                    buy_app_pid = proc.pid
+                    logger.info("buy_app started on :8502 (pid=%d)", buy_app_pid)
                     time.sleep(3)
                 except Exception as e:
                     logger.warning("buy_app start failed: %s", e)
@@ -916,13 +920,31 @@ def main():
                 if _scripts not in _sys.path:
                     _sys.path.insert(0, _scripts)
                 from ngrok_tunnel import start_tunnel
-                ngrok_url = start_tunnel(port=8502, ttl_sec=300)
+                ngrok_url = start_tunnel(port=8502, ttl_sec=BUY_TTL_SEC)
                 if ngrok_url:
-                    logger.info("ngrok tunnel: %s (5min TTL)", ngrok_url)
+                    logger.info("ngrok tunnel: %s (%ds TTL)", ngrok_url, BUY_TTL_SEC)
                 else:
                     logger.warning("ngrok tunnel start failed, falling back to LAN URL")
             except Exception as e:
                 logger.warning("ngrok unavailable: %s", e)
+            # cleanup: BUY_TTL_SEC 後に ngrok + buy_app を停止する独立プロセス
+            cleanup_script = (
+                f"import time, subprocess, os, signal; "
+                f"time.sleep({BUY_TTL_SEC}); "
+                f"subprocess.run(['taskkill','/F','/IM','ngrok.exe'],"
+                f"capture_output=True,timeout=5); "
+                + (f"os.kill({buy_app_pid}, signal.SIGTERM); " if buy_app_pid else "")
+            )
+            try:
+                subprocess.Popen(
+                    [sys.executable, "-c", cleanup_script],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+                )
+                logger.info("cleanup scheduled in %ds (ngrok%s)",
+                            BUY_TTL_SEC, f" + buy_app pid={buy_app_pid}" if buy_app_pid else "")
+            except Exception as e:
+                logger.warning("cleanup scheduler failed: %s", e)
 
         text = render_text(picks, target_date, time_label, args.thr)
         html = render_html(picks, target_date, time_label, args.thr,
