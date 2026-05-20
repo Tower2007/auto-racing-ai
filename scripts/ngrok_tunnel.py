@@ -19,9 +19,10 @@ logger = logging.getLogger(__name__)
 _ngrok_process: subprocess.Popen | None = None
 _lock = threading.Lock()
 
-NGROK_CMD = "ngrok"
+NGROK_CMD = r"C:\Users\no28a\AppData\Local\Microsoft\WinGet\Packages\Ngrok.Ngrok_Microsoft.Winget.Source_8wekyb3d8bbwe\ngrok.exe"
 DEFAULT_PORT = 8502
 DEFAULT_TTL_SEC = 300  # 5 分
+_NGROK_LOG = str(Path(__file__).resolve().parent.parent / "data" / "ngrok_process.log")
 
 
 def start_tunnel(port: int = DEFAULT_PORT,
@@ -43,11 +44,12 @@ def start_tunnel(port: int = DEFAULT_PORT,
 
     with _lock:
         _kill_existing()
-        time.sleep(1)  # ポート解放待ち
+        time.sleep(3)  # ポート解放待ち (4040 bind 競合回避)
 
         try:
             proc = subprocess.Popen(
-                [NGROK_CMD, "http", str(port), "--log=stdout", "--log-format=json"],
+                [NGROK_CMD, "http", str(port),
+                 "--log", _NGROK_LOG, "--log-format", "json"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
