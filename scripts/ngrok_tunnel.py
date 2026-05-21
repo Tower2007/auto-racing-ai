@@ -20,6 +20,7 @@ _ngrok_process: subprocess.Popen | None = None
 _lock = threading.Lock()
 
 NGROK_CMD = r"C:\Users\no28a\AppData\Local\Microsoft\WinGet\Packages\Ngrok.Ngrok_Microsoft.Winget.Source_8wekyb3d8bbwe\ngrok.exe"
+NGROK_CONFIG = r"C:\Users\no28a\AppData\Local\ngrok\ngrok.yml"
 DEFAULT_PORT = 8502
 DEFAULT_TTL_SEC = 300  # 5 分
 _NGROK_LOG = str(Path(__file__).resolve().parent.parent / "data" / "ngrok_process.log")
@@ -47,15 +48,19 @@ def start_tunnel(port: int = DEFAULT_PORT,
         time.sleep(3)  # ポート解放待ち (4040 bind 競合回避)
 
         try:
+            cmd = [NGROK_CMD, "http", str(port),
+                   "--log", _NGROK_LOG, "--log-format", "json"]
+            if Path(NGROK_CONFIG).exists():
+                cmd += ["--config", NGROK_CONFIG]
             proc = subprocess.Popen(
-                [NGROK_CMD, "http", str(port),
-                 "--log", _NGROK_LOG, "--log-format", "json"],
+                cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
             )
             _ngrok_process = proc
-            logger.info("ngrok started (pid=%d, port=%d, ttl=%ds)", proc.pid, port, ttl_sec)
+            logger.info("ngrok started (pid=%d, port=%d, ttl=%ds, config=%s)",
+                        proc.pid, port, ttl_sec, NGROK_CONFIG)
         except FileNotFoundError:
             logger.error("ngrok command not found")
             return None
@@ -63,11 +68,16 @@ def start_tunnel(port: int = DEFAULT_PORT,
             logger.error("ngrok start failed: %s", e)
             return None
 
-    for i in range(60):
-        time.sleep(0.5)
+    for i in range(30):
+        time.sleep(1)
+        # プロセスが死んでいたら即打ち切り
+        if _ngrok_process and _ngrok_process.poll() is not None:
+            logger.error("ngrok process exited with code %d (see %s)",
+                         _ngrok_process.returncode, _NGROK_LOG)
+            break
         url = _get_public_url()
         if url:
-            logger.info("ngrok tunnel URL: %s (%.1fs)", url, (i + 1) * 0.5)
+            logger.info("ngrok tunnel URL: %s (%.1fs)", url, i + 1)
             _schedule_stop(ttl_sec)
             return url
 
@@ -112,7 +122,7 @@ def _get_public_url() -> str | None:
     try:
         import urllib.request
         req = urllib.request.Request("http://127.0.0.1:4040/api/tunnels")
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        with urllib.request.urlopen(req, timeout=1) as resp:
             data = json.loads(resp.read())
         for t in data.get("tunnels", []):
             url = t.get("public_url", "")
