@@ -49,9 +49,8 @@ def start_tunnel(port: int = DEFAULT_PORT,
 
         try:
             cmd = [NGROK_CMD, "http", str(port),
+                   "--config", NGROK_CONFIG,
                    "--log", _NGROK_LOG, "--log-format", "json"]
-            if Path(NGROK_CONFIG).exists():
-                cmd += ["--config", NGROK_CONFIG]
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
