@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -20,10 +21,30 @@ _ngrok_process: subprocess.Popen | None = None
 _lock = threading.Lock()
 
 NGROK_CMD = r"C:\Users\no28a\AppData\Local\Microsoft\WinGet\Packages\Ngrok.Ngrok_Microsoft.Winget.Source_8wekyb3d8bbwe\ngrok.exe"
-NGROK_CONFIG = r"C:\Users\no28a\AppData\Local\ngrok\ngrok.yml"
 DEFAULT_PORT = 8502
 DEFAULT_TTL_SEC = 300  # 5 分
 _NGROK_LOG = str(Path(__file__).resolve().parent.parent / "data" / "ngrok_process.log")
+
+# authtoken: .env → 環境変数 の順で解決。config ファイルに依存しない
+# (schtasks 環境では %LOCALAPPDATA%\ngrok\ngrok.yml が見えないため)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_DOTENV = _PROJECT_ROOT / ".env"
+
+
+def _load_authtoken() -> str | None:
+    """NGROK_AUTHTOKEN を .env → 環境変数の順で取得。"""
+    # .env から直接読む (dotenv ライブラリ不要)
+    if _DOTENV.exists():
+        try:
+            for line in _DOTENV.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if line.startswith("NGROK_AUTHTOKEN="):
+                    val = line.split("=", 1)[1].strip()
+                    if val:
+                        return val
+        except Exception:
+            pass
+    return os.environ.get("NGROK_AUTHTOKEN")
 
 
 def start_tunnel(port: int = DEFAULT_PORT,
@@ -43,13 +64,18 @@ def start_tunnel(port: int = DEFAULT_PORT,
         _schedule_stop(ttl_sec)
         return url
 
+    authtoken = _load_authtoken()
+    if not authtoken:
+        logger.error("NGROK_AUTHTOKEN not found in .env or env vars")
+        return None
+
     with _lock:
         _kill_existing()
         time.sleep(3)  # ポート解放待ち (4040 bind 競合回避)
 
         try:
             cmd = [NGROK_CMD, "http", str(port),
-                   "--config", NGROK_CONFIG,
+                   "--authtoken", authtoken,
                    "--log", _NGROK_LOG, "--log-format", "json"]
             proc = subprocess.Popen(
                 cmd,
@@ -58,10 +84,10 @@ def start_tunnel(port: int = DEFAULT_PORT,
                 creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
             )
             _ngrok_process = proc
-            logger.info("ngrok started (pid=%d, port=%d, ttl=%ds, config=%s)",
-                        proc.pid, port, ttl_sec, NGROK_CONFIG)
+            logger.info("ngrok started (pid=%d, port=%d, ttl=%ds, authtoken=***)",
+                        proc.pid, port, ttl_sec)
         except FileNotFoundError:
-            logger.error("ngrok command not found")
+            logger.error("ngrok command not found: %s", NGROK_CMD)
             return None
         except Exception as e:
             logger.error("ngrok start failed: %s", e)
@@ -76,7 +102,7 @@ def start_tunnel(port: int = DEFAULT_PORT,
             break
         url = _get_public_url()
         if url:
-            logger.info("ngrok tunnel URL: %s (%.1fs)", url, i + 1)
+            logger.info("ngrok tunnel URL: %s (%ds)", url, i + 1)
             _schedule_stop(ttl_sec)
             return url
 
