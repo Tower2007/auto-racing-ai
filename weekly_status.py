@@ -513,19 +513,21 @@ def check_ngrok_health(days: int = 7) -> dict:
     return out
 
 
-def check_model_freshness() -> dict:
-    """本番モデルの塩漬けリスク監視 (Antigravity 2026-05-23 提案 #2)。
+def check_model_freshness(st_health: dict | None = None) -> dict:
+    """本番モデルの塩漬けリスク監視 (Antigravity 2026-05-23 提案 #2、
+    2026-05-23 修正で「再学習未実行」と「連続却下」を区別)。
 
-    production_meta.json + retrain_history.csv を見て:
-      - model_age_days: 現行モデル trained_at からの経過日数
-      - consecutive_rejections: 直近の連続却下回数 (NG/WARN を採用見送りとカウント)
-      - last_attempt: 直近の再学習試行時刻と verdict
+    schtasks の AutoraceWeeklyRetrain.last_run と trained_at を比較し、
+    retrain_status を 3 状態に分類:
+      - "rejected"     : 再学習は走ってるが採用見送り (本当の塩漬け)
+      - "cron_inactive": 再学習 cron が走ってない / 失敗
+      - "fresh"        : 直近で trained_at 更新 (採用済)
 
     判定:
-      - model_age <= 14 日                            → OK
-      - 14 日超 + 連続却下なし (再学習も走ってない可能性) → INFO
-      - 21 日超 OR 連続却下 ≥ 2                       → WARN
-      - 35 日超 OR 連続却下 ≥ 4                       → NG (5 週連続却下 = 概念ドリフトの可能性)
+      - 14 日以内: OK
+      - 21 日超 (cron_inactive)  → WARN: cron 障害の可能性
+      - 21 日超 (rejected) 連続却下>=2 → WARN: 塩漬け監視継続
+      - 35 日超 OR 連続却下>=4 → NG: 概念ドリフト/cron 障害深刻
     """
     out: dict = {
         "model_trained_at": None,
@@ -535,6 +537,8 @@ def check_model_freshness() -> dict:
         "last_attempt_at": None,
         "last_attempt_verdict": None,
         "history_available": False,
+        "weekly_retrain_last_run": None,
+        "retrain_status": "unknown",
         "alerts": [],
     }
     meta_p = DATA / "production_meta.json"
@@ -583,24 +587,75 @@ def check_model_freshness() -> dict:
         except Exception as e:
             out["alerts"].append(("WARN", f"retrain_history.csv 読み込み失敗: {e}"))
 
+    # schtasks の AutoraceWeeklyRetrain last_run と比較して状態判別
+    weekly_retrain_last: pd.Timestamp | None = None
+    if st_health and st_health.get("tasks"):
+        for task in st_health["tasks"]:
+            if task.get("name", "").startswith("AutoraceWeeklyRetrain"):
+                lr = task.get("last_run", "")
+                if lr:
+                    try:
+                        weekly_retrain_last = pd.to_datetime(lr)
+                    except Exception:
+                        pass
+                break
+    if weekly_retrain_last is not None:
+        out["weekly_retrain_last_run"] = weekly_retrain_last.isoformat()
+
+    trained_ts = (pd.to_datetime(out["model_trained_at"])
+                  if out["model_trained_at"] else None)
+    if trained_ts is None:
+        out["retrain_status"] = "unknown"
+    elif weekly_retrain_last is None:
+        out["retrain_status"] = "schtasks_unavailable"  # 判定保留
+    elif weekly_retrain_last > trained_ts:
+        # 再学習が走ってる (last_run > trained_at) のに採用更新されてない
+        # = 採用見送り (本当の塩漬け)
+        out["retrain_status"] = "rejected"
+    else:
+        # 再学習 cron 自体が走ってない or last_run が trained_at 以前
+        # (= 採用後 retrain 未実施 = 翌週まで待ち)
+        out["retrain_status"] = "fresh" if (out.get("model_age_days") or 0) < 8 else "cron_inactive"
+
     # 判定
     age = out.get("model_age_days")
     rej = out.get("consecutive_rejections", 0)
+    status = out["retrain_status"]
     if age is not None:
-        if age >= 35 or rej >= 4:
+        if status == "cron_inactive" and age >= 35:
             out["alerts"].append((
                 "NG",
-                f"モデル塩漬け {age} 日 / 連続却下 {rej} 回 — 概念ドリフトの可能性、要再検討"
+                f"再学習 cron 異常 {age} 日: WeeklyRetrain.last_run="
+                f"{out['weekly_retrain_last_run']} ≤ trained_at — schtasks 要確認"
             ))
-        elif age >= 21 or rej >= 2:
+        elif status == "rejected" and (age >= 35 or rej >= 4):
+            out["alerts"].append((
+                "NG",
+                f"モデル塩漬け {age} 日 / 連続却下 {rej} 回 — "
+                f"再学習は走ってるが品質ゲート連続 NG = 概念ドリフトの可能性、要再検討"
+            ))
+        elif status == "cron_inactive" and age >= 21:
             out["alerts"].append((
                 "WARN",
-                f"モデル塩漬け {age} 日 / 連続却下 {rej} 回 — 監視継続"
+                f"再学習 cron 不調 {age} 日: WeeklyRetrain.last_run="
+                f"{out['weekly_retrain_last_run']} ≤ trained_at — cron 障害の可能性"
+            ))
+        elif status == "rejected" and (age >= 21 or rej >= 2):
+            out["alerts"].append((
+                "WARN",
+                f"モデル塩漬け {age} 日 / 連続却下 {rej} 回 — "
+                f"再学習は走ってるが採用見送り継続中"
+            ))
+        elif status == "schtasks_unavailable" and age >= 21:
+            out["alerts"].append((
+                "WARN",
+                f"モデル {age} 日経過、schtasks 情報なしで cron 状態不明 (要 schtasks 確認)"
             ))
         elif age >= 14 and not out["history_available"]:
             out["alerts"].append((
                 "INFO",
-                f"モデル経過 {age} 日 / retrain_history 未蓄積 (今後 1 週で初データ蓄積)"
+                f"モデル経過 {age} 日 / retrain_history 未蓄積 "
+                f"(retrain_status={status})"
             ))
     return out
 
@@ -709,15 +764,26 @@ def render_health_text(bh: dict, st: dict, ehi: dict | None = None,
         lines.append("")
         age = mf.get("model_age_days")
         rej = mf.get("consecutive_rejections", 0)
+        status_label = {
+            "rejected": "📛 連続却下 (再学習は走ってるが採用見送り)",
+            "cron_inactive": "⚠️ 再学習 cron 未実行 (schtasks 障害の可能性)",
+            "fresh": "✅ 直近採用済",
+            "schtasks_unavailable": "❓ schtasks 情報なし",
+            "unknown": "❓ trained_at 不明",
+        }.get(mf.get("retrain_status", "unknown"), "?")
         lines.append(
             f"  本番モデル塩漬け監視: "
             f"trained_at={mf.get('model_trained_at', '不明')}"
             f"{' (' + str(age) + ' 日経過)' if age is not None else ''}"
-            f" / 連続却下 {rej} 回"
         )
+        lines.append(f"    状態: {status_label} / 連続却下 {rej} 回")
+        if mf.get("weekly_retrain_last_run"):
+            lines.append(
+                f"    AutoraceWeeklyRetrain 直近実行: {mf['weekly_retrain_last_run']}"
+            )
         if mf.get("last_attempt_at"):
             lines.append(
-                f"    直近の再学習試行: {mf['last_attempt_at']} "
+                f"    直近の再学習 attempt (history): {mf['last_attempt_at']} "
                 f"(verdict={mf.get('last_attempt_verdict', '?')})"
             )
         if not mf.get("history_available"):
@@ -864,6 +930,13 @@ def render_health_html(bh: dict, st: dict, ehi: dict | None = None,
     if mf is not None:
         age = mf.get("model_age_days")
         rej = mf.get("consecutive_rejections", 0)
+        status_label = {
+            "rejected": "📛 連続却下 (再学習は走ってるが採用見送り)",
+            "cron_inactive": "⚠️ 再学習 cron 未実行",
+            "fresh": "✅ 直近採用済",
+            "schtasks_unavailable": "❓ schtasks 情報なし",
+            "unknown": "❓ trained_at 不明",
+        }.get(mf.get("retrain_status", "unknown"), "?")
         parts.append(
             f'<h4 style="margin:14px 0 4px 0; font-size:13px;">'
             f'🧠 本番モデル塩漬け監視</h4>'
@@ -872,13 +945,24 @@ def render_health_html(bh: dict, st: dict, ehi: dict | None = None,
             f'<p style="margin:2px 0; font-size:12px;">'
             f'trained_at: <b>{mf.get("model_trained_at", "不明")}</b>'
             + (f' (<b>{age}</b> 日経過)' if age is not None else '')
-            + f' / 連続却下 <b style="color:{"#c62828" if rej >= 2 else "#444"}">{rej}</b> 回'
+            + f'</p>'
+        )
+        parts.append(
+            f'<p style="margin:2px 0; font-size:12px;">'
+            f'状態: {status_label} / 連続却下 '
+            f'<b style="color:{"#c62828" if rej >= 2 else "#444"}">{rej}</b> 回'
             f'</p>'
         )
+        if mf.get("weekly_retrain_last_run"):
+            parts.append(
+                f'<p style="margin:2px 0; font-size:11px; color:#666;">'
+                f'AutoraceWeeklyRetrain 直近実行: {mf["weekly_retrain_last_run"]}'
+                f'</p>'
+            )
         if mf.get("last_attempt_at"):
             parts.append(
                 f'<p style="margin:2px 0; font-size:11px; color:#666;">'
-                f'直近試行: {mf["last_attempt_at"]} '
+                f'直近 attempt (history): {mf["last_attempt_at"]} '
                 f'(verdict={mf.get("last_attempt_verdict", "?")})'
                 f'</p>'
             )
@@ -1069,7 +1153,8 @@ def main() -> None:
         bh_health = check_bet_history_health(args.days)
         st_health = check_schtasks_health()
         ng_health = check_ngrok_health(args.days)
-        mf_health = check_model_freshness()
+        # st_health を渡すことで「再学習未実行」と「連続却下」を区別
+        mf_health = check_model_freshness(st_health)
         text += "\n\n" + render_health_text(
             bh_health, st_health, ehi_health, ng_health, mf_health
         )
