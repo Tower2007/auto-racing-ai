@@ -169,13 +169,13 @@ except Exception:
 
 st.write("")
 
-# dry-run チェックボックス (default: True で安全側)
+# dry-run チェックボックス (default: OFF — 購入リンク経由の実運用を優先)
 dry_run = st.checkbox(
     "🛡️ dry-run (実際には購入しない、navigate + form fill のみ)",
-    value=True,
+    value=False,
     help=(
-        "初期は dry-run で動作確認推奨。チェック外すと実際に投票実行。"
-        "外す前に execute_purchase.py の selector が正しいか確認すること。"
+        "ON にすると投票実行せず画面遷移のみ。"
+        "通常は OFF で実投票。PIN 認証が最終防衛。"
     ),
 )
 
