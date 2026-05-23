@@ -220,6 +220,37 @@ def _load_current_meta() -> dict | None:
         return None
 
 
+def _append_retrain_history(verdict: str, reason: str, metrics: dict) -> None:
+    """再学習結果を data/retrain_history.csv に追記。
+
+    weekly_status の塩漬けリスク監視 (Antigravity 2026-05-23 提案) で
+    連続却下回数を集計するために OK/WARN/NG 全件を蓄積する。
+    """
+    import csv
+    history_path = DATA / "retrain_history.csv"
+    header = ["timestamp", "verdict", "reason",
+              "valid_auc", "valid_logloss", "best_iteration",
+              "target_definition_version"]
+    row = [
+        datetime.now().isoformat(timespec="seconds"),
+        verdict,
+        reason,
+        metrics.get("valid_auc", ""),
+        metrics.get("valid_logloss", ""),
+        metrics.get("best_iteration", ""),
+        TARGET_DEFINITION_VERSION,
+    ]
+    try:
+        new_file = not history_path.exists()
+        with open(history_path, "a", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            if new_file:
+                writer.writerow(header)
+            writer.writerow(row)
+    except Exception as e:
+        logger.warning("retrain_history.csv 追記失敗: %s", e)
+
+
 def _should_adopt(new_metrics: dict, old_meta: dict | None,
                   force: bool = False) -> tuple[str, str]:
     """新モデルを採用すべきか判定。
@@ -311,6 +342,9 @@ def main():
     # 品質ゲート: 旧モデルと比較
     old_meta = _load_current_meta()
     verdict, reason = _should_adopt(train_metrics, old_meta, force=args.force)
+
+    # 学習履歴を append (OK/WARN/NG 全件、塩漬け監視用)
+    _append_retrain_history(verdict, reason, train_metrics)
 
     if verdict == "NG":
         logger.warning("=" * 60)

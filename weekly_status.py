@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import re
 import subprocess
 import sys
@@ -512,12 +513,104 @@ def check_ngrok_health(days: int = 7) -> dict:
     return out
 
 
-def _overall_health(bh: dict, st: dict, ehi: dict | None = None,
-                    ng: dict | None = None) -> str:
-    """bet_history / schtasks / EHI / ngrok の観測系異常を NG > WARN > OK で集約。
+def check_model_freshness() -> dict:
+    """本番モデルの塩漬けリスク監視 (Antigravity 2026-05-23 提案 #2)。
 
-    R9 で warnings 握り潰しバグ修正、2026-05-23 で ngrok health 追加
-    (Antigravity 提案: サイレント死リスク対策)。
+    production_meta.json + retrain_history.csv を見て:
+      - model_age_days: 現行モデル trained_at からの経過日数
+      - consecutive_rejections: 直近の連続却下回数 (NG/WARN を採用見送りとカウント)
+      - last_attempt: 直近の再学習試行時刻と verdict
+
+    判定:
+      - model_age <= 14 日                            → OK
+      - 14 日超 + 連続却下なし (再学習も走ってない可能性) → INFO
+      - 21 日超 OR 連続却下 ≥ 2                       → WARN
+      - 35 日超 OR 連続却下 ≥ 4                       → NG (5 週連続却下 = 概念ドリフトの可能性)
+    """
+    out: dict = {
+        "model_trained_at": None,
+        "model_age_days": None,
+        "current_verdict": None,
+        "consecutive_rejections": 0,
+        "last_attempt_at": None,
+        "last_attempt_verdict": None,
+        "history_available": False,
+        "alerts": [],
+    }
+    meta_p = DATA / "production_meta.json"
+    if not meta_p.exists():
+        out["alerts"].append(("WARN", "production_meta.json が無い"))
+        return out
+    try:
+        with open(meta_p, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        trained = pd.to_datetime(meta.get("trained_at"))
+        out["model_trained_at"] = trained.isoformat() if pd.notna(trained) else None
+        if pd.notna(trained):
+            age = (pd.Timestamp.now() - trained).days
+            out["model_age_days"] = age
+        out["current_verdict"] = meta.get("quality_gate_verdict")  # 旧モデルだと None
+    except Exception as e:
+        out["alerts"].append(("WARN", f"production_meta.json 読み込み失敗: {e}"))
+
+    # retrain_history.csv から連続却下数をカウント (採用日以降の試行のみ対象)
+    hist_p = DATA / "retrain_history.csv"
+    if hist_p.exists():
+        out["history_available"] = True
+        try:
+            hist = pd.read_csv(hist_p)
+            if not hist.empty and "timestamp" in hist.columns:
+                hist["timestamp"] = pd.to_datetime(hist["timestamp"], errors="coerce")
+                hist = hist.dropna(subset=["timestamp"]).sort_values("timestamp")
+                # 採用日 (model_trained_at) 以降の試行
+                if out["model_trained_at"]:
+                    trained_ts = pd.to_datetime(out["model_trained_at"])
+                    after = hist[hist["timestamp"] > trained_ts]
+                else:
+                    after = hist
+                if not after.empty:
+                    last_row = after.iloc[-1]
+                    out["last_attempt_at"] = last_row["timestamp"].isoformat()
+                    out["last_attempt_verdict"] = str(last_row.get("verdict", ""))
+                    # 連続却下: 直近から OK が出るまで遡る (NG/WARN を却下扱い)
+                    count = 0
+                    for _, row in after[::-1].iterrows():
+                        if str(row.get("verdict", "")) in ("NG", "WARN"):
+                            count += 1
+                        else:
+                            break
+                    out["consecutive_rejections"] = count
+        except Exception as e:
+            out["alerts"].append(("WARN", f"retrain_history.csv 読み込み失敗: {e}"))
+
+    # 判定
+    age = out.get("model_age_days")
+    rej = out.get("consecutive_rejections", 0)
+    if age is not None:
+        if age >= 35 or rej >= 4:
+            out["alerts"].append((
+                "NG",
+                f"モデル塩漬け {age} 日 / 連続却下 {rej} 回 — 概念ドリフトの可能性、要再検討"
+            ))
+        elif age >= 21 or rej >= 2:
+            out["alerts"].append((
+                "WARN",
+                f"モデル塩漬け {age} 日 / 連続却下 {rej} 回 — 監視継続"
+            ))
+        elif age >= 14 and not out["history_available"]:
+            out["alerts"].append((
+                "INFO",
+                f"モデル経過 {age} 日 / retrain_history 未蓄積 (今後 1 週で初データ蓄積)"
+            ))
+    return out
+
+
+def _overall_health(bh: dict, st: dict, ehi: dict | None = None,
+                    ng: dict | None = None, mf: dict | None = None) -> str:
+    """bet_history / schtasks / EHI / ngrok / model_freshness の異常を集約。
+
+    R9 で warnings 握り潰しバグ修正、2026-05-23 で ngrok + model_freshness
+    追加 (Antigravity 提案)。
     """
     if bh.get("status") == "NG":
         return "NG"
@@ -526,6 +619,8 @@ def _overall_health(bh: dict, st: dict, ehi: dict | None = None,
     if ehi and ehi.get("status") == "DANGER":
         return "NG"
     if ng and any(lv == "NG" for lv, _ in ng.get("alerts", [])):
+        return "NG"
+    if mf and any(lv == "NG" for lv, _ in mf.get("alerts", [])):
         return "NG"
     if bh.get("status") == "WARN":
         return "WARN"
@@ -537,14 +632,16 @@ def _overall_health(bh: dict, st: dict, ehi: dict | None = None,
         return "WARN"
     if ng and any(lv == "WARN" for lv, _ in ng.get("alerts", [])):
         return "WARN"
+    if mf and any(lv == "WARN" for lv, _ in mf.get("alerts", [])):
+        return "WARN"
     return "OK"
 
 
 def render_health_text(bh: dict, st: dict, ehi: dict | None = None,
-                       ng: dict | None = None) -> str:
+                       ng: dict | None = None, mf: dict | None = None) -> str:
     lines = []
     status_emoji = {"OK": "🟢", "WARN": "🟡", "NG": "🔴"}
-    overall = _overall_health(bh, st, ehi, ng)
+    overall = _overall_health(bh, st, ehi, ng, mf)
     lines.append(f"【🩺 死活監視】 {status_emoji.get(overall, '')} {overall}")
     
     if ehi and ehi.get("ehi") is not None:
@@ -607,18 +704,42 @@ def render_health_text(bh: dict, st: dict, ehi: dict | None = None,
             for ts, reason in ng["failure_reasons"]:
                 lines.append(f"      - {ts}  {reason}")
 
+    # モデル塩漬けリスク (Antigravity 2026-05-23 提案 #2)
+    if mf is not None:
+        lines.append("")
+        age = mf.get("model_age_days")
+        rej = mf.get("consecutive_rejections", 0)
+        lines.append(
+            f"  本番モデル塩漬け監視: "
+            f"trained_at={mf.get('model_trained_at', '不明')}"
+            f"{' (' + str(age) + ' 日経過)' if age is not None else ''}"
+            f" / 連続却下 {rej} 回"
+        )
+        if mf.get("last_attempt_at"):
+            lines.append(
+                f"    直近の再学習試行: {mf['last_attempt_at']} "
+                f"(verdict={mf.get('last_attempt_verdict', '?')})"
+            )
+        if not mf.get("history_available"):
+            lines.append(
+                f"    (retrain_history.csv 未蓄積 — 次回 train_production 実行から記録開始)"
+            )
+        for level, msg in mf.get("alerts", []):
+            prefix = {"NG": "🔴 NG", "WARN": "🟡 WARN", "INFO": "ℹ️  INFO"}.get(level, level)
+            lines.append(f"    {prefix}: {msg}")
+
     return "\n".join(lines)
 
 
 def render_health_html(bh: dict, st: dict, ehi: dict | None = None,
-                       ng: dict | None = None) -> str:
+                       ng: dict | None = None, mf: dict | None = None) -> str:
     BORDER = '"border-collapse:collapse; border-color:#bbb; font-family:Arial,sans-serif; font-size:13px;"'
     TH = '"background:#e8e8e8; padding:6px 10px; border:1px solid #bbb; text-align:center;"'
     TD = '"padding:6px 10px; border:1px solid #ddd; text-align:left;"'
     TD_R = '"padding:6px 10px; border:1px solid #ddd; text-align:right;"'
 
     miss = bh.get("missing_picks", 0)
-    overall = _overall_health(bh, st, ehi, ng)
+    overall = _overall_health(bh, st, ehi, ng, mf)
     status_color = {"OK": "#2e7d32", "WARN": "#e65100", "NG": "#c62828"}.get(overall, "#444")
     status_emoji = {"OK": "🟢", "WARN": "🟡", "NG": "🔴"}.get(overall, "")
     parts = [
@@ -737,6 +858,41 @@ def render_health_html(bh: dict, st: dict, ehi: dict | None = None,
             parts.append('<ul style="margin:0 0 0 18px; font-size:11px; color:#666;">')
             for ts, reason in ng["failure_reasons"]:
                 parts.append(f'<li>{ts}  {reason}</li>')
+            parts.append("</ul>")
+
+    # モデル塩漬けリスク (Antigravity 2026-05-23 提案 #2)
+    if mf is not None:
+        age = mf.get("model_age_days")
+        rej = mf.get("consecutive_rejections", 0)
+        parts.append(
+            f'<h4 style="margin:14px 0 4px 0; font-size:13px;">'
+            f'🧠 本番モデル塩漬け監視</h4>'
+        )
+        parts.append(
+            f'<p style="margin:2px 0; font-size:12px;">'
+            f'trained_at: <b>{mf.get("model_trained_at", "不明")}</b>'
+            + (f' (<b>{age}</b> 日経過)' if age is not None else '')
+            + f' / 連続却下 <b style="color:{"#c62828" if rej >= 2 else "#444"}">{rej}</b> 回'
+            f'</p>'
+        )
+        if mf.get("last_attempt_at"):
+            parts.append(
+                f'<p style="margin:2px 0; font-size:11px; color:#666;">'
+                f'直近試行: {mf["last_attempt_at"]} '
+                f'(verdict={mf.get("last_attempt_verdict", "?")})'
+                f'</p>'
+            )
+        if not mf.get("history_available"):
+            parts.append(
+                f'<p style="margin:2px 0; font-size:11px; color:#888;">'
+                f'(retrain_history.csv 未蓄積 — 次回 train_production 実行から記録開始)'
+                f'</p>'
+            )
+        if mf.get("alerts"):
+            parts.append('<ul style="margin:4px 0 0 18px; font-size:12px;">')
+            for level, msg in mf["alerts"]:
+                color = {"NG": "#c62828", "WARN": "#e65100", "INFO": "#666"}.get(level, "#444")
+                parts.append(f'<li style="color:{color}"><b>{level}</b>: {msg}</li>')
             parts.append("</ul>")
 
     return "\n".join(parts)
@@ -900,11 +1056,12 @@ def main() -> None:
     html = render_html(summary, days, errors)
 
     # 死活監視(Codex R6 提案: bet_history + schtasks + EHI、
-    # Antigravity 2026-05-23 提案: ngrok)
+    # Antigravity 2026-05-23 提案: ngrok + model_freshness)
     bh_health: dict = {}
     st_health: dict = {}
     ehi_health: dict | None = None
     ng_health: dict | None = None
+    mf_health: dict | None = None
     try:
         if _EHI_AVAILABLE:
             ehi_health = calculate_ehi(7)
@@ -912,8 +1069,13 @@ def main() -> None:
         bh_health = check_bet_history_health(args.days)
         st_health = check_schtasks_health()
         ng_health = check_ngrok_health(args.days)
-        text += "\n\n" + render_health_text(bh_health, st_health, ehi_health, ng_health)
-        health_html = render_health_html(bh_health, st_health, ehi_health, ng_health)
+        mf_health = check_model_freshness()
+        text += "\n\n" + render_health_text(
+            bh_health, st_health, ehi_health, ng_health, mf_health
+        )
+        health_html = render_health_html(
+            bh_health, st_health, ehi_health, ng_health, mf_health
+        )
         html = html.replace(
             '<hr style="border:none;',
             health_html + '\n<hr style="border:none;',
