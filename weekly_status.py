@@ -412,18 +412,120 @@ def check_schtasks_health() -> dict:
     return out
 
 
-def _overall_health(bh: dict, st: dict, ehi: dict | None = None) -> str:
-    """bet_history と schtasks、EHI の観測系異常を NG > WARN > OK で集約(R9)。
+def check_ngrok_health(days: int = 7) -> dict:
+    """ngrok トンネル起動の死活監視 (Antigravity 2026-05-23 提案)。
 
-    R8 までは bh.status と st.ng_count しか見ておらず、st.warnings(例:
-    schtasks 失敗 rc=1)を握りつぶして OK 表示する不具合があった。
-    R9 で warnings も WARN 以上に昇格する。
+    daily_predict.log から直近 N 日の ngrok 起動結果を集計:
+      - 成功: "ngrok tunnel: https://" / "ngrok tunnel URL:" / "reusing existing ngrok"
+      - 失敗: "ngrok tunnel start failed" / "ngrok unavailable" /
+              "NGROK_AUTHTOKEN not found" / "ngrok command not found" /
+              "ngrok process exited" / "tunnel URL not available"
+
+    判定:
+      - 試行 0      → INFO (購入推奨が出てない期間)
+      - 全試行失敗  → NG (ngrok 設定要確認 → サイレント死リスク顕在化)
+      - 一部失敗    → WARN (失敗率付き)
+      - 全成功      → OK
+    """
+    out: dict = {
+        "attempts": 0,
+        "successes": 0,
+        "failures": 0,
+        "failure_reasons": [],  # [(timestamp, reason), ...] 直近 5 件
+        "last_success_at": None,
+        "last_failure_at": None,
+        "alerts": [],
+    }
+    log_p = DATA / "daily_predict.log"
+    if not log_p.exists():
+        out["alerts"].append(("INFO", "daily_predict.log が存在しない"))
+        return out
+
+    cutoff = pd.Timestamp.now() - pd.Timedelta(days=days)
+    success_patterns = [
+        r"ngrok tunnel:\s*https?://",
+        r"ngrok tunnel URL:\s*https?://",
+        r"reusing existing ngrok tunnel",
+    ]
+    failure_patterns = [
+        (r"ngrok tunnel start failed", "tunnel start 失敗 (LAN fallback)"),
+        (r"ngrok unavailable", "ngrok 例外で利用不可"),
+        (r"NGROK_AUTHTOKEN not found", "authtoken 未設定"),
+        (r"ngrok command not found", "ngrok コマンド未発見"),
+        (r"ngrok process exited", "ngrok プロセス異常終了"),
+        (r"tunnel URL not available", "URL 取得タイムアウト (30s)"),
+    ]
+
+    try:
+        with open(log_p, "r", encoding="utf-8", errors="replace") as f:
+            tail = f.readlines()[-20000:]  # 直近 20k 行 (1 ヶ月分余裕)
+    except Exception as e:
+        out["alerts"].append(("WARN", f"daily_predict.log 読み込み失敗: {e}"))
+        return out
+
+    for line in tail:
+        m = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+        if not m:
+            continue
+        try:
+            ts = pd.to_datetime(m.group(1))
+        except Exception:
+            continue
+        if ts < cutoff:
+            continue
+        # 成功判定先 (失敗 fallback ログより優先)
+        matched_success = False
+        for sp in success_patterns:
+            if re.search(sp, line):
+                out["successes"] += 1
+                if out["last_success_at"] is None or ts > pd.to_datetime(out["last_success_at"]):
+                    out["last_success_at"] = ts.isoformat()
+                matched_success = True
+                break
+        if matched_success:
+            continue
+        for fp, reason in failure_patterns:
+            if re.search(fp, line):
+                out["failures"] += 1
+                out["failure_reasons"].append((ts.isoformat(), reason))
+                if out["last_failure_at"] is None or ts > pd.to_datetime(out["last_failure_at"]):
+                    out["last_failure_at"] = ts.isoformat()
+                break
+
+    # 失敗理由は直近 5 件のみ保持 (メールを膨らませないため)
+    out["failure_reasons"] = out["failure_reasons"][-5:]
+    out["attempts"] = out["successes"] + out["failures"]
+
+    if out["attempts"] == 0:
+        out["alerts"].append(("INFO", "ngrok 起動試行なし (購入推奨が出てない期間)"))
+    elif out["successes"] == 0:
+        out["alerts"].append((
+            "NG",
+            f"ngrok 全試行失敗 ({out['failures']} 件 / 直近 {days} 日)"
+        ))
+    elif out["failures"] > 0:
+        rate = out["failures"] / out["attempts"] * 100
+        out["alerts"].append((
+            "WARN",
+            f"ngrok 失敗率 {rate:.0f}% ({out['failures']}/{out['attempts']} 件 / 直近 {days} 日)"
+        ))
+    return out
+
+
+def _overall_health(bh: dict, st: dict, ehi: dict | None = None,
+                    ng: dict | None = None) -> str:
+    """bet_history / schtasks / EHI / ngrok の観測系異常を NG > WARN > OK で集約。
+
+    R9 で warnings 握り潰しバグ修正、2026-05-23 で ngrok health 追加
+    (Antigravity 提案: サイレント死リスク対策)。
     """
     if bh.get("status") == "NG":
         return "NG"
     if any(lv == "NG" for lv, _ in bh.get("alerts", [])):
         return "NG"
     if ehi and ehi.get("status") == "DANGER":
+        return "NG"
+    if ng and any(lv == "NG" for lv, _ in ng.get("alerts", [])):
         return "NG"
     if bh.get("status") == "WARN":
         return "WARN"
@@ -433,13 +535,16 @@ def _overall_health(bh: dict, st: dict, ehi: dict | None = None) -> str:
         return "WARN"
     if ehi and ehi.get("status") == "WARNING":
         return "WARN"
+    if ng and any(lv == "WARN" for lv, _ in ng.get("alerts", [])):
+        return "WARN"
     return "OK"
 
 
-def render_health_text(bh: dict, st: dict, ehi: dict | None = None) -> str:
+def render_health_text(bh: dict, st: dict, ehi: dict | None = None,
+                       ng: dict | None = None) -> str:
     lines = []
     status_emoji = {"OK": "🟢", "WARN": "🟡", "NG": "🔴"}
-    overall = _overall_health(bh, st, ehi)
+    overall = _overall_health(bh, st, ehi, ng)
     lines.append(f"【🩺 死活監視】 {status_emoji.get(overall, '')} {overall}")
     
     if ehi and ehi.get("ehi") is not None:
@@ -481,17 +586,39 @@ def render_health_text(bh: dict, st: dict, ehi: dict | None = None) -> str:
             lines.append(f"  (raw snapshot: {st['snapshot_path']})")
     for w in st.get("warnings", []):
         lines.append(f"  ⚠️ schtasks: {w}")
+
+    # ngrok 死活監視セクション (Antigravity 2026-05-23 提案)
+    if ng is not None:
+        lines.append("")
+        lines.append(
+            f"  ngrok トンネル (購入推奨時のみ起動): "
+            f"成功 {ng.get('successes', 0)} / 失敗 {ng.get('failures', 0)} "
+            f"/ 試行 {ng.get('attempts', 0)}"
+        )
+        if ng.get("last_success_at"):
+            lines.append(f"    最終成功: {ng['last_success_at']}")
+        if ng.get("last_failure_at"):
+            lines.append(f"    最終失敗: {ng['last_failure_at']}")
+        for level, msg in ng.get("alerts", []):
+            prefix = {"NG": "🔴 NG", "WARN": "🟡 WARN", "INFO": "ℹ️  INFO"}.get(level, level)
+            lines.append(f"    {prefix}: {msg}")
+        # 失敗理由詳細 (直近 5 件) は WARN/NG 時のみ
+        if ng.get("failures", 0) > 0 and ng.get("failure_reasons"):
+            for ts, reason in ng["failure_reasons"]:
+                lines.append(f"      - {ts}  {reason}")
+
     return "\n".join(lines)
 
 
-def render_health_html(bh: dict, st: dict, ehi: dict | None = None) -> str:
+def render_health_html(bh: dict, st: dict, ehi: dict | None = None,
+                       ng: dict | None = None) -> str:
     BORDER = '"border-collapse:collapse; border-color:#bbb; font-family:Arial,sans-serif; font-size:13px;"'
     TH = '"background:#e8e8e8; padding:6px 10px; border:1px solid #bbb; text-align:center;"'
     TD = '"padding:6px 10px; border:1px solid #ddd; text-align:left;"'
     TD_R = '"padding:6px 10px; border:1px solid #ddd; text-align:right;"'
 
     miss = bh.get("missing_picks", 0)
-    overall = _overall_health(bh, st, ehi)
+    overall = _overall_health(bh, st, ehi, ng)
     status_color = {"OK": "#2e7d32", "WARN": "#e65100", "NG": "#c62828"}.get(overall, "#444")
     status_emoji = {"OK": "🟢", "WARN": "🟡", "NG": "🔴"}.get(overall, "")
     parts = [
@@ -575,6 +702,43 @@ def render_health_html(bh: dict, st: dict, ehi: dict | None = None) -> str:
             f'<p style="color:#888; font-size:11px; margin:4px 0;">'
             f'raw snapshot: {st["snapshot_path"]}</p>'
         )
+
+    # ngrok 死活監視 (Antigravity 2026-05-23 提案)
+    if ng is not None:
+        parts.append(
+            f'<h4 style="margin:14px 0 4px 0; font-size:13px;">'
+            f'🌐 ngrok トンネル (購入推奨時のみ起動)</h4>'
+        )
+        parts.append(
+            f'<p style="margin:2px 0; font-size:12px;">'
+            f'成功 <b>{ng.get("successes", 0)}</b> / '
+            f'失敗 <b style="color:#c62828">{ng.get("failures", 0)}</b> / '
+            f'試行 {ng.get("attempts", 0)}'
+            f'</p>'
+        )
+        if ng.get("last_success_at") or ng.get("last_failure_at"):
+            parts.append('<ul style="margin:2px 0 0 18px; font-size:11px; color:#666;">')
+            if ng.get("last_success_at"):
+                parts.append(f'<li>最終成功: {ng["last_success_at"]}</li>')
+            if ng.get("last_failure_at"):
+                parts.append(f'<li>最終失敗: {ng["last_failure_at"]}</li>')
+            parts.append("</ul>")
+        if ng.get("alerts"):
+            parts.append('<ul style="margin:4px 0 0 18px; font-size:12px;">')
+            for level, msg in ng["alerts"]:
+                color = {"NG": "#c62828", "WARN": "#e65100", "INFO": "#666"}.get(level, "#444")
+                parts.append(f'<li style="color:{color}"><b>{level}</b>: {msg}</li>')
+            parts.append("</ul>")
+        if ng.get("failures", 0) > 0 and ng.get("failure_reasons"):
+            parts.append(
+                '<p style="margin:4px 0 2px 0; font-size:11px; color:#888;">'
+                '失敗理由 (直近 5 件):</p>'
+            )
+            parts.append('<ul style="margin:0 0 0 18px; font-size:11px; color:#666;">')
+            for ts, reason in ng["failure_reasons"]:
+                parts.append(f'<li>{ts}  {reason}</li>')
+            parts.append("</ul>")
+
     return "\n".join(parts)
 
 
@@ -735,18 +899,21 @@ def main() -> None:
     text = render_text(summary, days, errors)
     html = render_html(summary, days, errors)
 
-    # 死活監視(Codex R6 提案: bet_history + schtasks)
+    # 死活監視(Codex R6 提案: bet_history + schtasks + EHI、
+    # Antigravity 2026-05-23 提案: ngrok)
     bh_health: dict = {}
     st_health: dict = {}
     ehi_health: dict | None = None
+    ng_health: dict | None = None
     try:
         if _EHI_AVAILABLE:
             ehi_health = calculate_ehi(7)
-        
+
         bh_health = check_bet_history_health(args.days)
         st_health = check_schtasks_health()
-        text += "\n\n" + render_health_text(bh_health, st_health, ehi_health)
-        health_html = render_health_html(bh_health, st_health, ehi_health)
+        ng_health = check_ngrok_health(args.days)
+        text += "\n\n" + render_health_text(bh_health, st_health, ehi_health, ng_health)
+        health_html = render_health_html(bh_health, st_health, ehi_health, ng_health)
         html = html.replace(
             '<hr style="border:none;',
             health_html + '\n<hr style="border:none;',
