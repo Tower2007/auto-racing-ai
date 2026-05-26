@@ -91,7 +91,7 @@ reports/               # 各種分析レポート(commit 対象)
 | `AutoraceDynamicScheduler` | 毎日 07:00 | `python dynamic_scheduler.py`: Program/Print ページから各場 R 毎の発走時刻を取得し、各レース発走 `LEAD_MIN` 分前 (現在 4 分前) の `AutoraceDyn_{venue}_R{n}` one-shot を 12 R × 場数ぶん登録(冪等、毎日再生成) |
 | `AutoraceDyn_{venue}_R{n}` | 各レース発走 LEAD_MIN 分前(現在 4 分前、動的) | `python daily_predict.py --venues {pc} --races {n} --suppress-noresult-email`: 1 R 単位で予測、候補ありのみメール送信。near-miss retry 廃止、処理 ~10 秒で締切 ~2 分前に到着 |
 | `AutoraceWeeklyRetrain` | 毎日曜 03:00 | 本番モデル再学習 |
-| `AutoraceWeeklyStatus` | 毎月曜 07:30 | 週次ステータス報告 |
+| `AutoraceWeeklyStatus` | 毎月曜 07:20 | 週次ステータス報告 |
 | `AutoraceFetchOrderHistory` | 毎日 02:30 | `python scripts/daily_fetch_order_history.py`: vote.autorace.jp の購入履歴を `--since 2d --detail --cookie-source playwright` で取得し `data/bet_history.csv` / `bet_history_detail.csv` にマージ。失敗時のみ Gmail 通知。**2026-05-08 から Playwright auto-login** に切替(SBI IPO project と同じパターン)。資格情報は `accounts.json`(.gitignore)。実装: `scripts/auto_login_autorace.py`。旧 Firefox cookie 方式は `--cookie-source firefox` で fallback 可。経緯: memory `ml_baseline_findings.md` 2026-05-08 |
 
 #### 設計
