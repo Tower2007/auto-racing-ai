@@ -77,6 +77,28 @@ FAILURE_KEYWORDS = (
 )
 
 
+def _run_auto_login() -> str:
+    """auto_login_autorace.py を subprocess で実行し、結果を返す。
+
+    セッション切れ時の自動復旧用 (2026-05-26 導入)。
+    execute_buy() 内から asyncio.to_thread() 経由で呼ばれる。
+    """
+    import subprocess as _sp
+    result = _sp.run(
+        [sys.executable, str(ROOT / "scripts" / "auto_login_autorace.py")],
+        cwd=str(ROOT),
+        capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+        timeout=90,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"auto_login exit={result.returncode}: "
+            f"{result.stderr[-300:]}"
+        )
+    return result.stdout[-200:].strip()
+
+
 async def execute_buy(
     race_date: str,
     place_code: int,
@@ -131,26 +153,52 @@ async def execute_buy(
         page = await context.new_page()
 
         try:
-            # === Step 1: login 状態確認 (永続プロファイル流用) ===
-            await page.goto("https://vote.autorace.jp/",
+            # === Step 1: login 状態確認 (保護ページでリダイレクト検査) ===
+            # 旧方式: ホームページの「ログアウト」ボタン存在チェック
+            #   → cookie キャッシュで偽陽性が起き、step 1.5 で落ちていた
+            # 新方式: 実際の投票ページに navigate して /login リダイレクトを検査
+            #   → セッション有効性を確実に判定 (2026-05-26 修正)
+            check_url = (
+                f"https://vote.autorace.jp/vote"
+                f"?vel_code={vel_code}&race_num={race_no}"
+            )
+            await page.goto(check_url,
                             wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(2)
-            try:
-                logout_btn = page.locator(
-                    'a:has-text("ログアウト"), button:has-text("ログアウト")'
-                ).first
-                logged_in = (
-                    await logout_btn.count() > 0
-                    and await logout_btn.is_visible()
+            if "/login" in page.url:
+                # セッション切れ → auto_login で再ログイン試行
+                print(
+                    f"[execute_purchase] session 切れ検出 ({page.url}), "
+                    f"auto_login で再ログイン試行",
+                    file=sys.stderr,
                 )
-            except Exception:
-                logged_in = False
-            if not logged_in:
-                raise RuntimeError(
-                    "ログイン状態が切れています。先に "
-                    "scripts/auto_login_autorace.py を実行してから再試行してください。"
-                )
-            print(f"[execute_purchase] logged-in 確認", file=sys.stderr)
+                try:
+                    login_result = await asyncio.to_thread(
+                        _run_auto_login
+                    )
+                    print(
+                        f"[execute_purchase] auto_login 結果: {login_result}",
+                        file=sys.stderr,
+                    )
+                    # 再ログイン後、投票ページに再度アクセス
+                    await page.goto(check_url,
+                                    wait_until="domcontentloaded",
+                                    timeout=30000)
+                    await asyncio.sleep(2)
+                    if "/login" in page.url:
+                        raise RuntimeError(
+                            "auto_login 実行後もセッション切れ。"
+                            "手動で scripts/auto_login_autorace.py を確認してください。"
+                        )
+                except RuntimeError:
+                    raise
+                except Exception as e:
+                    raise RuntimeError(
+                        f"auto_login 自動再ログイン失敗: {e}。"
+                        "手動で scripts/auto_login_autorace.py を実行してください。"
+                    )
+            print(f"[execute_purchase] logged-in 確認 (投票ページ直接検査)",
+                  file=sys.stderr)
 
             # === Step 1.5: カートクリア (前回 dry-run 残骸対策) ===
             print(f"[execute_purchase] step 1.5: 既存カートクリア",
