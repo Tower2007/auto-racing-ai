@@ -99,6 +99,29 @@ def _run_auto_login() -> str:
     return result.stdout[-200:].strip()
 
 
+async def _launch_context(pw):
+    """Playwright の persistent context を起動して (context, page) を返す。"""
+    context = await pw.chromium.launch_persistent_context(
+        user_data_dir=str(PROFILE_DIR),
+        headless=False,
+        channel="chrome",
+        viewport={"width": 1280, "height": 900},
+        locale="ja-JP",
+        timezone_id="Asia/Tokyo",
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+        ],
+        ignore_default_args=["--enable-automation"],
+    )
+    await context.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', "
+        "{get: () => undefined})"
+    )
+    page = await context.new_page()
+    return context, page
+
+
 async def execute_buy(
     race_date: str,
     place_code: int,
@@ -133,31 +156,12 @@ async def execute_buy(
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
     async with async_playwright() as pw:
-        context = await pw.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
-            headless=False,  # 初期は false (動作確認のため)
-            channel="chrome",
-            viewport={"width": 1280, "height": 900},
-            locale="ja-JP",
-            timezone_id="Asia/Tokyo",
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-            ],
-            ignore_default_args=["--enable-automation"],
-        )
-        await context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', "
-            "{get: () => undefined})"
-        )
-        page = await context.new_page()
+        context, page = await _launch_context(pw)
 
         try:
             # === Step 1: login 状態確認 (保護ページでリダイレクト検査) ===
-            # 旧方式: ホームページの「ログアウト」ボタン存在チェック
-            #   → cookie キャッシュで偽陽性が起き、step 1.5 で落ちていた
-            # 新方式: 実際の投票ページに navigate して /login リダイレクトを検査
-            #   → セッション有効性を確実に判定 (2026-05-26 修正)
+            # 実際の投票ページに navigate して /login リダイレクトを検査
+            # → セッション有効性を確実に判定 (2026-05-26 導入)
             check_url = (
                 f"https://vote.autorace.jp/vote"
                 f"?vel_code={vel_code}&race_num={race_no}"
@@ -166,12 +170,18 @@ async def execute_buy(
                             wait_until="domcontentloaded", timeout=30000)
             await asyncio.sleep(2)
             if "/login" in page.url:
-                # セッション切れ → auto_login で再ログイン試行
+                # セッション切れ → context を閉じてから auto_login 実行
+                # (同じ profile dir を使うため、ロック競合を回避)
                 print(
                     f"[execute_purchase] session 切れ検出 ({page.url}), "
-                    f"auto_login で再ログイン試行",
+                    f"context 閉じて auto_login で再ログイン試行",
                     file=sys.stderr,
                 )
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+
                 try:
                     login_result = await asyncio.to_thread(
                         _run_auto_login
@@ -180,22 +190,22 @@ async def execute_buy(
                         f"[execute_purchase] auto_login 結果: {login_result}",
                         file=sys.stderr,
                     )
-                    # 再ログイン後、投票ページに再度アクセス
-                    await page.goto(check_url,
-                                    wait_until="domcontentloaded",
-                                    timeout=30000)
-                    await asyncio.sleep(2)
-                    if "/login" in page.url:
-                        raise RuntimeError(
-                            "auto_login 実行後もセッション切れ。"
-                            "手動で scripts/auto_login_autorace.py を確認してください。"
-                        )
-                except RuntimeError:
-                    raise
                 except Exception as e:
                     raise RuntimeError(
                         f"auto_login 自動再ログイン失敗: {e}。"
                         "手動で scripts/auto_login_autorace.py を実行してください。"
+                    )
+
+                # 再ログイン後、context を再起動して投票ページに再アクセス
+                context, page = await _launch_context(pw)
+                await page.goto(check_url,
+                                wait_until="domcontentloaded",
+                                timeout=30000)
+                await asyncio.sleep(2)
+                if "/login" in page.url:
+                    raise RuntimeError(
+                        "auto_login 実行後もセッション切れ。"
+                        "手動で scripts/auto_login_autorace.py を確認してください。"
                     )
             print(f"[execute_purchase] logged-in 確認 (投票ページ直接検査)",
                   file=sys.stderr)
