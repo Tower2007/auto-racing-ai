@@ -47,12 +47,17 @@ def _load_authtoken() -> str | None:
     return os.environ.get("NGROK_AUTHTOKEN")
 
 
+MAX_RETRIES = 2  # CRL タイムアウト等の一時障害対策 (2026-05-27 導入)
+POLL_TIMEOUT_SEC = 30  # 各試行での URL 待ち秒数
+
+
 def start_tunnel(port: int = DEFAULT_PORT,
                  ttl_sec: int = DEFAULT_TTL_SEC) -> str | None:
     """ngrok トンネルを起動し、公開 URL を返す。
 
     ttl_sec 秒後に自動停止するタイマーを仕込む。
     既に起動中（手動含む）なら既存の URL を返す。
+    一時的なネットワーク障害 (CRL timeout 等) に備え最大 MAX_RETRIES 回リトライ。
     失敗時は None。
     """
     global _ngrok_process
@@ -69,45 +74,52 @@ def start_tunnel(port: int = DEFAULT_PORT,
         logger.error("NGROK_AUTHTOKEN not found in .env or env vars")
         return None
 
-    with _lock:
-        _kill_existing()
-        time.sleep(3)  # ポート解放待ち (4040 bind 競合回避)
+    for attempt in range(MAX_RETRIES):
+        if attempt > 0:
+            logger.info("ngrok retry %d/%d", attempt + 1, MAX_RETRIES)
 
-        try:
-            cmd = [NGROK_CMD, "http", str(port),
-                   "--authtoken", authtoken,
-                   "--log", _NGROK_LOG, "--log-format", "json"]
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
-            )
-            _ngrok_process = proc
-            logger.info("ngrok started (pid=%d, port=%d, ttl=%ds, authtoken=***)",
-                        proc.pid, port, ttl_sec)
-        except FileNotFoundError:
-            logger.error("ngrok command not found: %s", NGROK_CMD)
-            return None
-        except Exception as e:
-            logger.error("ngrok start failed: %s", e)
-            return None
+        with _lock:
+            _kill_existing()
+            time.sleep(3)  # ポート解放待ち (4040 bind 競合回避)
 
-    for i in range(30):
-        time.sleep(1)
-        # プロセスが死んでいたら即打ち切り
-        if _ngrok_process and _ngrok_process.poll() is not None:
-            logger.error("ngrok process exited with code %d (see %s)",
-                         _ngrok_process.returncode, _NGROK_LOG)
-            break
-        url = _get_public_url()
-        if url:
-            logger.info("ngrok tunnel URL: %s (%ds)", url, i + 1)
-            _schedule_stop(ttl_sec)
-            return url
+            try:
+                cmd = [NGROK_CMD, "http", str(port),
+                       "--authtoken", authtoken,
+                       "--log", _NGROK_LOG, "--log-format", "json"]
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+                )
+                _ngrok_process = proc
+                logger.info("ngrok started (pid=%d, port=%d, ttl=%ds, authtoken=***)",
+                            proc.pid, port, ttl_sec)
+            except FileNotFoundError:
+                logger.error("ngrok command not found: %s", NGROK_CMD)
+                return None
+            except Exception as e:
+                logger.error("ngrok start failed: %s", e)
+                return None
 
-    logger.error("ngrok tunnel URL not available after 30s")
-    stop_tunnel()
+        for i in range(POLL_TIMEOUT_SEC):
+            time.sleep(1)
+            # プロセスが死んでいたら即打ち切り
+            if _ngrok_process and _ngrok_process.poll() is not None:
+                logger.error("ngrok process exited with code %d (see %s)",
+                             _ngrok_process.returncode, _NGROK_LOG)
+                break
+            url = _get_public_url()
+            if url:
+                logger.info("ngrok tunnel URL: %s (%ds)", url, i + 1)
+                _schedule_stop(ttl_sec)
+                return url
+
+        logger.warning("ngrok tunnel URL not available after %ds (attempt %d/%d)",
+                       POLL_TIMEOUT_SEC, attempt + 1, MAX_RETRIES)
+        stop_tunnel()
+
+    logger.error("ngrok tunnel failed after %d attempts", MAX_RETRIES)
     return None
 
 
