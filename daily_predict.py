@@ -56,6 +56,8 @@ LOG_FILE = DATA / "daily_predict.log"
 PRODUCTION_LOG = DATA / "daily_predict_picks.csv"
 ODDS_SNAPSHOT_LOG = DATA / "odds_snapshots.csv"  # 発火時オッズスナップ (信号 persistence 解析用)
 SHADOW_LOG = DATA / "shadow_picks.csv"  # shadow 判定ログ (drift 補正 / 閾値変更の仮想評価)
+SANYO_RF3_PAPER_LOG = DATA / "sanyo_rf3_paper.csv"  # 山陽 三連複 paper trading (観測のみ、投票せず)
+SANYO_PLACE_CODE = 6  # 山陽 (過去検証で rf3 のみ構造的 edge: 月勝率40% median84%)
 EXPECTED_VOTES_CSV = DATA / "expected_votes.csv"  # 場×R別 typical 票数 → 推奨ベット額算出
 
 # Shadow 判定用パラメータ (本番には影響しない、記録のみ)
@@ -464,7 +466,28 @@ def predict_race(
 
 # ─── 通知 ─────────────────────────────────────────────────────
 
-def render_text(picks: pd.DataFrame, today: str, time_label: str, thr: float) -> str:
+def _render_sanyo_rf3_text(refs: list[dict]) -> list[str]:
+    """山陽 三連複 参考セクション (text)。投票非推奨・観測用。"""
+    if not refs:
+        return []
+    lines = [
+        "",
+        "─" * 40,
+        "📊 山陽 三連複 参考 (投票非推奨・観測用)",
+        "  山陽は過去 rf3 に構造的 edge (月勝率40% / median84%)。",
+        "  下記はモデル pred top-3 を三連複 1 点で買った場合の参考。",
+        "  ※ 実際の投票は上記の複勝のみ推奨。",
+    ]
+    for ref in refs:
+        odds = ref.get("rf3_odds")
+        odds_str = f"{odds:.1f}倍" if odds else "(オッズ取得不可)"
+        lines.append(f"  山陽 R{ref['race_no']}: 三連複 {ref['deme']}  {odds_str}")
+    lines.append("─" * 40)
+    return lines
+
+
+def render_text(picks: pd.DataFrame, today: str, time_label: str, thr: float,
+                sanyo_rf3_refs: list[dict] | None = None) -> str:
     if picks.empty:
         return f"[autorace] {today} {time_label} 候補なし(EV>={thr})"
     lines = [
@@ -494,6 +517,8 @@ def render_text(picks: pd.DataFrame, today: str, time_label: str, thr: float) ->
             f"https://autorace.jp/race_info/Odds/{r['venue']}/{today}/{int(r['race_no'])}"
         )
     lines.append(f"  🎯 投票 (公式): https://vote.autorace.jp/")
+    # 山陽 三連複 参考 (投票非推奨・観測用)
+    lines.extend(_render_sanyo_rf3_text(sanyo_rf3_refs or []))
     # 累積成績フッタ
     perf = cumulative_performance()
     if perf and perf["n_total"] > 0:
@@ -502,8 +527,35 @@ def render_text(picks: pd.DataFrame, today: str, time_label: str, thr: float) ->
     return "\n".join(lines)
 
 
+def _render_sanyo_rf3_html(refs: list[dict]) -> str:
+    """山陽 三連複 参考セクション (HTML)。投票非推奨・観測用。"""
+    if not refs:
+        return ""
+    rows = []
+    for ref in refs:
+        odds = ref.get("rf3_odds")
+        odds_str = f"{odds:.1f}倍" if odds else "(取得不可)"
+        rows.append(
+            f'<li>山陽 R{ref["race_no"]}: <b>三連複 {ref["deme"]}</b> '
+            f'<span style="color:#1565c0;">{odds_str}</span></li>'
+        )
+    return (
+        '<div style="margin-top:16px; padding:10px 14px; '
+        'background:#fff8e1; border:1px solid #ffd54f; border-radius:6px; '
+        'font-size:13px; color:#444;">'
+        '<b>📊 山陽 三連複 参考 (投票非推奨・観測用)</b>'
+        '<p style="margin:4px 0; font-size:12px; color:#666;">'
+        '山陽は過去 rf3 に構造的 edge (月勝率40% / median84%)。'
+        'モデル pred top-3 を三連複 1 点で買った場合の参考です。'
+        '<b>実際の投票は上記の複勝のみ推奨。</b></p>'
+        '<ul style="margin:4px 0 0 18px;">' + "".join(rows) + '</ul>'
+        '</div>'
+    )
+
+
 def render_html(picks: pd.DataFrame, today: str, time_label: str, thr: float,
-                ngrok_url: str | None = None) -> str:
+                ngrok_url: str | None = None,
+                sanyo_rf3_refs: list[dict] | None = None) -> str:
     BORDER = '"border-collapse:collapse; border-color:#bbb; font-family:Arial,sans-serif; font-size:13px;"'
     TH = '"background:#e8e8e8; padding:6px 10px; border:1px solid #bbb; text-align:center;"'
     TD = '"padding:6px 10px; border:1px solid #ddd; text-align:right;"'
@@ -605,6 +657,10 @@ def render_html(picks: pd.DataFrame, today: str, time_label: str, thr: float,
             f' &nbsp;<span style="color:#888; font-size:11px;">'
             f'(オッズ低下≦10% 目安、過去180日中央値票数ベース)</span></p>'
         )
+    # 山陽 三連複 参考 (投票非推奨・観測用)
+    rf3_html = _render_sanyo_rf3_html(sanyo_rf3_refs or [])
+    if rf3_html:
+        parts.append(rf3_html)
     # 累積成績フッタ (青ボックス)
     perf = cumulative_performance()
     if perf and perf["n_total"] > 0:
@@ -705,6 +761,81 @@ def append_odds_snapshot(feat: pd.DataFrame, time_label: str):
     snap["captured_at"] = dt.datetime.now().isoformat(timespec="seconds")
     write_header = not ODDS_SNAPSHOT_LOG.exists() or ODDS_SNAPSHOT_LOG.stat().st_size == 0
     snap.to_csv(ODDS_SNAPSHOT_LOG, mode="a", header=write_header, index=False)
+
+
+def _rf3_odds_lookup(rf3_list: dict, cars: list[int]) -> float | None:
+    """rf3OddsList (ネスト dict rf3[i][j][k], i<j<k) から三連複オッズを引く。"""
+    if not isinstance(rf3_list, dict) or len(cars) != 3:
+        return None
+    i, j, k = sorted(int(c) for c in cars)
+    try:
+        return float(rf3_list[str(i)][str(j)][str(k)])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def build_sanyo_rf3_reference(
+    client: AutoraceClient, feat: pd.DataFrame,
+    race_date: str, race_no: int,
+) -> dict | None:
+    """山陽の三連複 (rf3) 参考情報を生成 (投票せず観測のみ)。
+
+    過去検証 (docs/ev_strategy_findings.md) で山陽 rf3 のみ構造的 edge
+    (月勝率 40% / median 84% / min 22%、他場は min 0%) が観測された。
+    Phase A 規律 (複勝 top-1 のみ投票) は崩さず、山陽で複勝推奨が出た R に
+    限り「モデル pred top-3 を三連複 1 点で買ったら」の参考情報を案内する。
+
+    返り値 dict (メール表示 + paper CSV 記録用)、取得失敗時は None。
+    """
+    if feat is None or feat.empty:
+        return None
+    # モデル pred 上位 3 車 (三連複は順不同なので昇順ソート)
+    top3 = feat.sort_values("pred_calib", ascending=False).head(3)
+    if len(top3) < 3:
+        return None
+    cars = sorted(int(c) for c in top3["car_no"].tolist())
+    # rf3 オッズ取得 (発火時点の最新)
+    rf3_odds = None
+    try:
+        odds_resp = client.get_odds(SANYO_PLACE_CODE, race_date, race_no)
+        odds_body = odds_resp.get("body", {})
+        if isinstance(odds_body, dict):
+            rf3_odds = _rf3_odds_lookup(odds_body.get("rf3OddsList", {}), cars)
+    except Exception as e:
+        logging.warning("山陽 rf3 オッズ取得失敗 R%d: %s", race_no, e)
+
+    ref = {
+        "race_date": race_date,
+        "place_code": SANYO_PLACE_CODE,
+        "race_no": race_no,
+        "cars": cars,                       # 例: [3, 5, 7]
+        "deme": "-".join(str(c) for c in cars),
+        "rf3_odds": rf3_odds,
+        "captured_at": dt.datetime.now().isoformat(timespec="seconds"),
+    }
+    return ref
+
+
+def append_sanyo_rf3_paper(ref: dict) -> None:
+    """山陽 rf3 参考を paper trading CSV に記録 (後で payouts と join し検証)。"""
+    if not ref:
+        return
+    import csv
+    SANYO_RF3_PAPER_LOG.parent.mkdir(parents=True, exist_ok=True)
+    header = ["race_date", "place_code", "race_no", "deme",
+              "rf3_odds", "captured_at"]
+    row = [ref["race_date"], ref["place_code"], ref["race_no"],
+           ref["deme"], ref.get("rf3_odds", ""), ref["captured_at"]]
+    try:
+        new_file = (not SANYO_RF3_PAPER_LOG.exists()
+                    or SANYO_RF3_PAPER_LOG.stat().st_size == 0)
+        with open(SANYO_RF3_PAPER_LOG, "a", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            if new_file:
+                w.writerow(header)
+            w.writerow(row)
+    except Exception as e:
+        logging.warning("sanyo_rf3_paper.csv 追記失敗: %s", e)
 
 
 # ─── メイン ───────────────────────────────────────────────────
@@ -816,6 +947,7 @@ def main():
                 return
 
         all_picks = []
+        sanyo_rf3_refs = []  # 山陽 三連複 参考 (投票せず観測のみ)
         race_nos = args.races if args.races else list(range(1, 13))
         # サマリ用カウンタ: 発走 30→15 分前へ短縮しても複勝オッズが薄ければ
         # NaN で silent skip する。可視化のため eval/NaN/below/hit を集計。
@@ -882,6 +1014,18 @@ def main():
                                 r["pred_calib"], r["ev_avg_calib"],
                                 r["place_odds_min"], r["place_odds_max"])
 
+                # 山陽のみ: 三連複 参考情報を生成 (投票せず観測のみ、paper 記録)
+                if pc == SANYO_PLACE_CODE:
+                    try:
+                        ref = build_sanyo_rf3_reference(client, df, target_date, race_no)
+                        if ref:
+                            sanyo_rf3_refs.append(ref)
+                            append_sanyo_rf3_paper(ref)
+                            logger.info("  [山陽 rf3 参考] 三連複 %s オッズ=%s (観測のみ、投票せず)",
+                                        ref["deme"], ref.get("rf3_odds"))
+                    except Exception as e:
+                        logger.warning("  山陽 rf3 参考生成失敗 R%d: %s", race_no, e)
+
         if all_picks:
             picks = pd.concat(all_picks, ignore_index=True)
             picks = picks.sort_values(["place_code", "race_no"]).reset_index(drop=True)
@@ -946,9 +1090,10 @@ def main():
             except Exception as e:
                 logger.warning("cleanup scheduler failed: %s", e)
 
-        text = render_text(picks, target_date, time_label, args.thr)
+        text = render_text(picks, target_date, time_label, args.thr,
+                           sanyo_rf3_refs=sanyo_rf3_refs)
         html = render_html(picks, target_date, time_label, args.thr,
-                           ngrok_url=ngrok_url)
+                           ngrok_url=ngrok_url, sanyo_rf3_refs=sanyo_rf3_refs)
         print()
         print(text)
 
