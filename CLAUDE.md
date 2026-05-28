@@ -110,6 +110,10 @@ reports/               # 各種分析レポート(commit 対象)
 - 動的方式に置換。`AutoraceMorningPredict` / `NoonPredict` / `EveningPredict` は 動的稼働確認後に disable / 削除予定
 
 戦略仕様: `docs/ev_strategy_findings.md` 参照(thr=1.50、中間モデル、複勝 top-1)。
+三連系 (rt3 + rf3) 推奨: 浜松(4) + 山陽(6) 限定、ev_avg_calib >= 1.80 で pred top-3 の
+三連単 1 点 + 三連複 1 点を追加推奨 (2026-05-29 導入、paper 記録 `data/rt3_paper.csv`)。
+過去検証 `scripts/ev_3point_by_place.py` thr=1.80:
+rt3 浜松 ROI 530% / 山陽 ROI 141%、rf3 浜松 ROI 330% / 山陽 ROI 185%。
 場ごとに開催形態(通常/ナイター/ミッドナイト)が変わっても `liveStartTime` / `liveEndTime`
 で自動追従するため取り逃がしなし。賭け運用は手動投票(自動投票は ToS グレーで非実施)。
 
