@@ -67,6 +67,11 @@ EXPECTED_VOTES_CSV = DATA / "expected_votes.csv"  # 場×R別 typical 票数 →
 RT3_ELIGIBLE_PLACES = {4, 6}  # 浜松, 山陽
 RT3_THR = 1.80
 RT3_PAPER_LOG = DATA / "rt3_paper.csv"
+# 三連系まとめ買い (複勝+三連単+三連複 を 1 ボタンで購入) の click-to-buy 有効化フラグ。
+# execute_purchase.py の --bets-json 実装 + dry-run 検証が完了するまで False。
+# False の間は浜松・山陽でも従来通り「複勝のみ」の購入ボタンを出す
+# (三連系はメールの推奨表示のみ = paper trading)。
+RT3_BUY_ENABLED = False
 
 # Shadow 判定用パラメータ (本番には影響しない、記録のみ)
 SHADOW_DRIFT_FACTORS = [0.70, 0.80]  # close_ev_est = fire_ev * factor
@@ -667,6 +672,13 @@ def render_html(picks: pd.DataFrame, today: str, time_label: str, thr: float,
         except Exception:
             _buy_enabled = False  # buy_secret_key 未設定 等で安全に skip
 
+        # 三連系まとめ買い: (place_code, race_no) → rt3_ref の lookup
+        # 浜松・山陽 EV>=1.80 のレースは複勝 + 三連単 + 三連複を 1 ボタンで購入
+        rt3_lookup = {
+            (int(ref["place_code"]), int(ref["race_no"])): ref
+            for ref in (rt3_refs or [])
+        }
+
         parts.append(f'<table border="1" cellpadding="6" cellspacing="0" style={BORDER}>')
         parts.append(
             f'<tr><th style={TH}>場</th><th style={TH}>R</th><th style={TH}>車</th>'
@@ -717,22 +729,40 @@ def render_html(picks: pd.DataFrame, today: str, time_label: str, thr: float,
                 f'<td style={TD}><a href="{vote_url}" style={BTN_VOTE}>🎯 投票</a></td>'
             )
             if _buy_enabled:
-                # Phase A 制約: 金額 ¥100 固定、複勝 top1 のみ
                 try:
                     pc = int(r["place_code"])
-                    buy_url = _build_buy_url({
+                    rno = int(r["race_no"])
+                    rt3_ref = rt3_lookup.get((pc, rno)) if RT3_BUY_ENABLED else None
+                    base_payload = {
                         "race_date": today,
                         "place_code": pc,
                         "venue": r["venue"],
                         "venue_jp": VENUE_JP_MAP_.get(pc, "?"),
-                        "race_no": int(r["race_no"]),
+                        "race_no": rno,
                         "car_no": int(r["car_no"]),
-                        "amount": rec_yen,
                         "ev": float(r["ev_avg_calib"]),
-                    }, host=ngrok_url)
+                    }
+                    if rt3_ref:
+                        # 浜松・山陽 EV>=1.80: 3 券種まとめ買い
+                        # 複勝=推奨額、三連単=¥100、三連複=¥100
+                        cars_ord = [int(c) for c in rt3_ref["cars_ordered"]]
+                        cars_srt = [int(c) for c in rt3_ref["cars_sorted"]]
+                        base_payload["amount"] = rec_yen  # buy_app 表示・互換用
+                        base_payload["bets"] = [
+                            {"type": "fns", "cars": [int(r["car_no"])],
+                             "amount": rec_yen},
+                            {"type": "rt3", "cars": cars_ord, "amount": 100},
+                            {"type": "rf3", "cars": cars_srt, "amount": 100},
+                        ]
+                        btn_label = "💰 3点購入"
+                    else:
+                        # 従来: 複勝 top1 のみ
+                        base_payload["amount"] = rec_yen
+                        btn_label = "💰 購入"
+                    buy_url = _build_buy_url(base_payload, host=ngrok_url)
                     parts.append(
                         f'<td style={TD}>'
-                        f'<a href="{buy_url}" style={BTN_BUY}>💰 購入</a>'
+                        f'<a href="{buy_url}" style={BTN_BUY}>{btn_label}</a>'
                         f'</td>'
                     )
                 except Exception:

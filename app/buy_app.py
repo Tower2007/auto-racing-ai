@@ -134,6 +134,18 @@ car_no = int(payload.get("car_no", 0))
 amount = int(payload.get("amount", 0))
 ev = float(payload.get("ev", 0))
 race_date = payload.get("race_date", "")
+bets = payload.get("bets") or []  # 三連系まとめ買いモード (浜松・山陽 EV>=1.80)
+
+# 券種コード → 日本語ラベル + 出目フォーマット
+_BET_LABEL = {"fns": "複勝", "rt3": "三連単", "rf3": "三連複"}
+_BET_SEP = {"fns": "", "rt3": "→", "rf3": "-"}
+
+
+def _deme_str(bet_type: str, cars: list) -> str:
+    """券種別の出目表記。fns='6' / rt3='6→5→4' / rf3='4-5-6'。"""
+    sep = _BET_SEP.get(bet_type, "-")
+    return sep.join(str(int(c)) for c in cars)
+
 
 st.title("💰 購入確認")
 
@@ -143,12 +155,28 @@ if ehi and ehi.get("ehi") is not None:
         f"(n={ehi.get('n_races', 0)})"
     )
 
-st.markdown(f"### {venue_jp} R{race_no}  /  {car_no}号  /  複勝")
-
-col1, col2, col3 = st.columns(3)
-col1.metric("金額", f"¥{amount:,}")
-col2.metric("EV", f"{ev:.2f}")
-col3.metric("レース日", race_date)
+if bets:
+    # === 三連系まとめ買いモード ===
+    total_amount = sum(int(b.get("amount", 0)) for b in bets)
+    st.markdown(f"### {venue_jp} R{race_no}  /  3 券種まとめ買い")
+    for b in bets:
+        bt_code = str(b.get("type", ""))
+        label = _BET_LABEL.get(bt_code, bt_code)
+        deme = _deme_str(bt_code, b.get("cars", []))
+        amt = int(b.get("amount", 0))
+        st.markdown(f"- **{label}** {deme}　¥{amt:,}")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("合計金額", f"¥{total_amount:,}")
+    col2.metric("EV(複勝)", f"{ev:.2f}")
+    col3.metric("レース日", race_date)
+    amount = total_amount  # 以降の表示・互換用
+else:
+    # === 単一複勝モード (従来) ===
+    st.markdown(f"### {venue_jp} R{race_no}  /  {car_no}号  /  複勝")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("金額", f"¥{amount:,}")
+    col2.metric("EV", f"{ev:.2f}")
+    col3.metric("レース日", race_date)
 
 st.write("---")
 
@@ -223,9 +251,13 @@ if st.button("✅ 購入する", type="primary", use_container_width=True):
             "--race-date", str(race_date),
             "--place", str(place_code),
             "--race", str(race_no),
-            "--car", str(car_no),
-            "--amount", str(amount),
         ]
+        if bets:
+            # 三連系まとめ買い: bets を JSON で渡す
+            cmd += ["--bets-json", json.dumps(bets, ensure_ascii=False)]
+        else:
+            # 単一複勝 (従来)
+            cmd += ["--car", str(car_no), "--amount", str(amount)]
         if dry_run:
             cmd.append("--dry-run")
 
@@ -263,5 +295,5 @@ st.write("---")
 _pin_label = "PIN 認証 ON" if expected_pin else "PIN 認証 OFF (accounts.json で 'pin' 設定で有効化)"
 st.caption(
     "© autorace-ai click-to-buy &nbsp;|&nbsp; "
-    f"🛡️ token 1 回限り / Phase A 推奨のみ / 金額 ¥100 固定 / {_pin_label}"
+    f"🛡️ token 1 回限り / Phase A 推奨のみ / 複勝=推奨額・三連=各¥100 / {_pin_label}"
 )

@@ -36,21 +36,70 @@ ALLOWED_AMOUNT_MIN = 100
 ALLOWED_AMOUNT_MAX = 1000
 ALLOWED_AMOUNT_UNIT = 100  # 100 円単位
 
+# 三連系まとめ買い (2026-05-30 導入): 複勝(最大¥1000) + rt3¥100 + rf3¥100 = ¥1200
+# 余裕を見て合計上限 ¥1500。execute_purchase 側 MAX_TOTAL_YEN と整合させること。
+MAX_TOTAL_YEN = 1500
+ALLOWED_BET_TYPES = {"fns", "rt3", "rf3"}
+# 券種別の cars 長さ (fns=複勝 1 車、rt3=三連単 3 車、rf3=三連複 3 車)
+BET_CARS_LEN = {"fns": 1, "rt3": 3, "rf3": 3}
+
+
+def _validate_bets(bets: list) -> None:
+    """bets list (3 券種まとめ買い) を validate。
+
+    各 bet: {"type": "fns"|"rt3"|"rf3", "cars": [..], "amount": int}
+    Raises:
+        ValueError: 不正値
+    """
+    if not isinstance(bets, list) or not bets:
+        raise ValueError("bets は非空 list である必要があります")
+    total = 0
+    for i, b in enumerate(bets):
+        if not isinstance(b, dict):
+            raise ValueError(f"bets[{i}] が dict でない: {b!r}")
+        bt = str(b.get("type", ""))
+        if bt not in ALLOWED_BET_TYPES:
+            raise ValueError(f"bets[{i}].type 不正 ({ALLOWED_BET_TYPES} 期待): {bt!r}")
+        cars = b.get("cars", [])
+        if not isinstance(cars, list) or len(cars) != BET_CARS_LEN[bt]:
+            raise ValueError(
+                f"bets[{i}].cars は長さ {BET_CARS_LEN[bt]} の list 必須 ({bt}): {cars!r}"
+            )
+        for c in cars:
+            ci = int(c)
+            if not (1 <= ci <= 8):
+                raise ValueError(f"bets[{i}].cars に不正な車番 (1-8 期待): {ci}")
+        # 三連系は重複車不可
+        if bt in ("rt3", "rf3") and len(set(int(c) for c in cars)) != 3:
+            raise ValueError(f"bets[{i}].cars に重複車番 ({bt}): {cars!r}")
+        amount = int(b.get("amount", 0))
+        if amount < ALLOWED_AMOUNT_MIN or amount > ALLOWED_AMOUNT_MAX:
+            raise ValueError(
+                f"bets[{i}].amount 範囲外 ({ALLOWED_AMOUNT_MIN}-{ALLOWED_AMOUNT_MAX}): {amount}"
+            )
+        if amount % ALLOWED_AMOUNT_UNIT != 0:
+            raise ValueError(f"bets[{i}].amount は {ALLOWED_AMOUNT_UNIT}円単位: {amount}")
+        total += amount
+    if total > MAX_TOTAL_YEN:
+        raise ValueError(f"bets 合計 {total} > 上限 {MAX_TOTAL_YEN}")
+
 
 def validate_payload(payload: dict, *, strict_amount: bool = True) -> None:
     """payload の必須項目と値域を validate (P3 hardening)。
 
     Args:
-        payload: race_date / place_code / race_no / car_no / amount を含む
+        payload: race_date / place_code / race_no を含む。
+                 単一複勝モード: car_no / amount を持つ。
+                 まとめ買いモード: bets (list) を持つ (car_no/amount は不要)。
         strict_amount: **default True** (Codex 3 次 review):
-                       Phase A の本番入口は amount == 100 固定。
-                       将来の金額拡張は別フェーズで明示的に False にする。
+                       Phase A の単一複勝本番入口は amount == 100 固定。
+                       金額拡張・まとめ買いは明示的に False。
 
     Raises:
         ValueError: 不正値
     """
-    required = ["race_date", "place_code", "race_no", "car_no", "amount"]
-    for k in required:
+    # 共通フィールド (race_date / place_code / race_no)
+    for k in ("race_date", "place_code", "race_no"):
         if k not in payload:
             raise ValueError(f"payload に '{k}' が無い")
 
@@ -69,6 +118,16 @@ def validate_payload(payload: dict, *, strict_amount: bool = True) -> None:
     race = int(payload["race_no"])
     if not (1 <= race <= 12):
         raise ValueError(f"race_no 不正 (1-12 期待): {race}")
+
+    # まとめ買いモード: bets があればそれを検証して return
+    if "bets" in payload and payload["bets"]:
+        _validate_bets(payload["bets"])
+        return
+
+    # 単一複勝モード (従来)
+    for k in ("car_no", "amount"):
+        if k not in payload:
+            raise ValueError(f"payload に '{k}' が無い")
 
     car = int(payload["car_no"])
     if not (1 <= car <= 8):

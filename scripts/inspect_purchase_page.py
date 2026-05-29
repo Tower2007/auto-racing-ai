@@ -52,7 +52,7 @@ URL_PATTERNS = [
 
 
 async def inspect(place_code: int, race_no: int, car_no: int | None,
-                  date: str) -> None:
+                  date: str, mode: str = "fukushou") -> None:
     from playwright.async_api import async_playwright
 
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
@@ -298,6 +298,97 @@ async def inspect(place_code: int, race_no: int, car_no: int | None,
                 html_path.write_text(html_x, encoding="utf-8")
                 out(f"    html: {html_path}")
 
+            async def _dump_tables(tag: str) -> None:
+                """画面上の全 table の header + 先頭数行のセル構造を JS で抽出。
+
+                三連単/三連複の車番選択 table の列構成 (1着/2着/3着 列か、
+                順不同チェックボックスか) を確定するため。
+                """
+                out(f"\n    --- [{tag}] table 構造 dump ---")
+                try:
+                    tables = await page.evaluate(
+                        """() => {
+                            const out = [];
+                            for (const t of document.querySelectorAll('table')) {
+                                if (t.offsetParent === null) continue;  // 非表示 skip
+                                const headers = Array.from(
+                                    t.querySelectorAll('thead th, thead td')
+                                ).map(e => e.innerText.trim());
+                                const rows = [];
+                                const bodyRows = t.querySelectorAll('tbody tr');
+                                for (let i = 0; i < Math.min(3, bodyRows.length); i++) {
+                                    const cells = Array.from(bodyRows[i].children).map(td => {
+                                        const inp = td.querySelector(
+                                            'input[type=checkbox], input[type=radio]'
+                                        );
+                                        return {
+                                            text: td.innerText.trim().slice(0, 12),
+                                            hasInput: !!inp,
+                                            inputType: inp ? inp.type : null,
+                                            inputName: inp ? inp.name : null,
+                                            inputValue: inp ? inp.value : null,
+                                        };
+                                    });
+                                    rows.push(cells);
+                                }
+                                out.push({
+                                    id: t.id, cls: t.className.slice(0, 40),
+                                    headers, sampleRows: rows,
+                                });
+                            }
+                            return out;
+                        }"""
+                    )
+                    import json as _json
+                    for ti, t in enumerate(tables):
+                        out(f"    [table {ti}] id={t.get('id')!r} cls={t.get('cls')!r}")
+                        out(f"      headers: {t.get('headers')}")
+                        for ri, row in enumerate(t.get("sampleRows", [])):
+                            out(f"      row{ri}: {_json.dumps(row, ensure_ascii=False)}")
+                except Exception as e:
+                    out(f"    table dump 失敗: {e}")
+
+            async def _select_bettype(label_text: str) -> bool:
+                """#select-bettype 内の券種 label を click (全角/半角両対応)。"""
+                for txt in (label_text, label_text.translate(
+                        str.maketrans("０１２３連単複", "0123連単複"))):
+                    loc = page.locator(
+                        f'#select-bettype label:has-text("{txt}")'
+                    ).first
+                    try:
+                        if await loc.count() > 0:
+                            await loc.click(timeout=5000)
+                            await asyncio.sleep(1.5)
+                            out(f"    券種 click OK: {txt!r}")
+                            return True
+                    except Exception as e:
+                        out(f"    券種 click 失敗 ({txt!r}): {e}")
+                out(f"    券種 label 見つからず: {label_text!r}")
+                return False
+
+            # === mode == "3point": 三連単/三連複の DOM 調査 ===
+            if mode == "3point":
+                out("\n[3point] 三連単・三連複の選択 UI を調査")
+                # (1) 初期状態 (default ３連単 active) を dump
+                await _dump_tables("initial")
+                await _dump_all("3point_initial", 20)
+                # (2) ３連単 を明示 active にして dump
+                out("\n[3point-rt3] ３連単 タブ")
+                await _select_bettype("３連単")
+                await _dump_tables("rt3")
+                await _dump_all("3point_rt3", 21)
+                # (3) ３連複 を active にして dump
+                out("\n[3point-rf3] ３連複 タブ")
+                await _select_bettype("３連複")
+                await _dump_tables("rf3")
+                await _dump_all("3point_rf3", 22)
+                out("\n[3point] 調査完了。data/inspect_step_2[0-2]_*.png/html と")
+                out("         data/purchase_form_dump.txt を確認してください。")
+                out("\n[done] 5 秒後にウインドウを閉じます ...")
+                await asyncio.sleep(5)
+                DUMP_TXT.write_text("\n".join(lines), encoding="utf-8")
+                return
+
             # --- Step 10: 投票パネルで 複勝 ON / 3連単 OFF にする ---
             # 投票パネル (#select-bettype) は「複数の券種を同時 active」設計。
             # 初期は ３連単 が RED、他は gray。
@@ -462,6 +553,9 @@ def main() -> None:
     p.add_argument("car_no", type=int, nargs="?", default=None,
                    help="車番 (省略可、navigate 確認のみなら不要)")
     p.add_argument("--date", default=None, help="YYYY-MM-DD (default: 今日)")
+    p.add_argument("--mode", default="fukushou",
+                   choices=["fukushou", "3point"],
+                   help="fukushou=複勝フロー調査 (従来) / 3point=三連単・三連複 DOM 調査")
     args = p.parse_args()
 
     try:
@@ -470,7 +564,8 @@ def main() -> None:
         pass
 
     date = args.date or dt.date.today().isoformat()
-    asyncio.run(inspect(args.place_code, args.race_no, args.car_no, date))
+    asyncio.run(inspect(args.place_code, args.race_no, args.car_no, date,
+                        mode=args.mode))
 
 
 if __name__ == "__main__":
