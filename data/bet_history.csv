@@ -50,3 +50,6 @@ date,place_code,place_name,race_no,bet_amount,refund_amount,profit
 2026-05-24,5,iizuka,5,100,210,110
 2026-05-25,5,iizuka,5,100,140,40
 2026-05-26,2,kawaguchi,11,300,300,0
+2026-05-30,4,hamamatsu,6,300,200,-100
+2026-05-30,4,hamamatsu,7,500,0,-500
+2026-05-30,4,hamamatsu,9,300,0,-300
