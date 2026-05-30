@@ -5,9 +5,17 @@
 解釈次第ではアウト。autorace.jp が後から違反判定する可能性あり、自己責任。
 
 スコープ制限 (server-side enforce):
-  - 複勝のみ (rt/rf/wide 等は受け付けない)
-  - 金額 ≤ ¥1,000 (誤発火による損失上限)
+  - 券種は 複勝(fns) / 三連単(rt3) / 三連複(rf3) のみ
+    (rt3/rf3 は浜松・山陽の EV>=1.80 まとめ買い専用、2026-05-30 追加)
+  - 1 券種 ≤ ¥1,000、1 R 合計 ≤ ¥1,500 (誤発火による損失上限)
   - 1 token 1 回限り (buy_token.py 側で重複防止)
+
+まとめ買い (2026-05-30):
+  --bets-json '[{"type":"fns","cars":[6],"amount":300},
+                {"type":"rt3","cars":[6,5,4],"amount":100},
+                {"type":"rf3","cars":[4,5,6],"amount":100}]'
+  各券種を順に投票シートへ追加 → 1 回で確認・投票。
+  三連単=1着/2着/3着列、三連複=BOX列に 3 車。
 
 実行フロー (2026-05-09 inspect_purchase_page.py で構造確認済):
   1. login 状態確認 (永続プロファイル経由)
@@ -48,7 +56,36 @@ VEL_CODE_MAP = {2: "002", 3: "003", 4: "004", 5: "005", 6: "006"}
 VENUE_JP_MAP = {2: "川口", 3: "伊勢崎", 4: "浜松", 5: "飯塚", 6: "山陽"}
 
 # 安全制限 (server-side enforce)
-MAX_AMOUNT_YEN = 1000  # 1 R の最大投資額
+MAX_AMOUNT_YEN = 1000   # 1 券種あたりの最大投資額
+MAX_TOTAL_YEN = 1500    # 1 R の全券種合計上限 (複勝¥1000 + rt3¥100 + rf3¥100 余裕)
+
+# 券種メタ (2026-05-30 三連系まとめ買い対応、inspect_purchase_page 調査で確定)
+#   tab_label: #select-bettype 内の券種ラベル (全角)
+#   n_cars   : 必要な車番数
+#   columns  : iv__table 内で click する td:nth-child 番号のリスト
+#              三連単 = 1着(1)/2着(2)/3着(3) を着順で、三連複 = BOX(4) に 3 車、
+#              複勝 = 1着(1) に 1 車
+#   deme_sep : GraphQL packDeme の区切り (検証用)。fns="6" rt3="6-5-4" rf3="4=5=6"
+#   gql_type : GraphQL betType enum (検証用)
+BET_META = {
+    "fns": {"tab_label": "複勝",   "n_cars": 1, "columns": [1],
+            "deme_sep": "",  "gql_type": "FUKUSHOU"},
+    "rt3": {"tab_label": "３連単", "n_cars": 3, "columns": [1, 2, 3],
+            "deme_sep": "-", "gql_type": "SANRENTAN"},
+    "rf3": {"tab_label": "３連複", "n_cars": 3, "columns": [4, 4, 4],
+            "deme_sep": "=", "gql_type": "SANRENFUKU"},
+}
+# #select-bettype の全券種ラベル (active 正規化で「対象以外を OFF」にするため)
+ALL_BET_TAB_LABELS = ["３連単", "３連複", "２連単", "２連複", "ワイド", "単勝", "複勝"]
+
+
+def _deme_str(bet_type: str, cars: list) -> str:
+    """券種別の packDeme 表記。fns='6' / rt3='6-5-4' / rf3='4=5=6'(昇順)。"""
+    sep = BET_META[bet_type]["deme_sep"]
+    if bet_type == "rf3":
+        cars = sorted(int(c) for c in cars)  # 三連複は順不同 → 昇順正規化
+    return sep.join(str(int(c)) for c in cars)
+
 
 # 投票完了 / 失敗判定キーワード (Step 8.5 で使用)
 # 2026-05-09 本番テストで「締切13:02」の「締切」が failure 誤検知された。
@@ -122,23 +159,162 @@ async def _launch_context(pw):
     return context, page
 
 
+# ─── 三連系まとめ買い用 helper (2026-05-30) ──────────────────────
+
+async def _bettype_active_map(page) -> dict:
+    """#select-bettype 内の各券種ラベルが active(赤) か判定。
+
+    active タブは背景が赤系 (r>150, g<110, b<110)。computed style で判定。
+    戻り値: {"複勝": True, "３連単": False, ...}
+    """
+    return await page.evaluate(
+        """() => {
+            const res = {};
+            const root = document.querySelector('#select-bettype');
+            if (!root) return res;
+            for (const lab of root.querySelectorAll('label')) {
+                const t = lab.innerText.trim();
+                if (!t || t.length > 4) continue;
+                const bg = getComputedStyle(lab).backgroundColor || '';
+                const m = bg.match(/(\\d+)\\s*,\\s*(\\d+)\\s*,\\s*(\\d+)/);
+                let active = false;
+                if (m) {
+                    const r = +m[1], g = +m[2], b = +m[3];
+                    active = (r > 150 && g < 110 && b < 110);
+                }
+                res[t] = active;
+            }
+            return res;
+        }"""
+    )
+
+
+async def _normalize_bettype(page, target_label: str) -> bool:
+    """#select-bettype を「target のみ active」に正規化。
+
+    複数同時 active 設計のため、対象以外の active を OFF にし、対象を ON にする。
+    最大 3 回試行。成功で True。
+    """
+    for _ in range(3):
+        amap = await _bettype_active_map(page)
+        # 対象以外の active を OFF
+        for lab, active in list(amap.items()):
+            if lab in ALL_BET_TAB_LABELS and active and lab != target_label:
+                try:
+                    await page.locator(
+                        f'#select-bettype label:has-text("{lab}")'
+                    ).first.click(timeout=4000)
+                    await asyncio.sleep(0.7)
+                except Exception:
+                    pass
+        # 対象を ON
+        amap = await _bettype_active_map(page)
+        if not amap.get(target_label, False):
+            try:
+                await page.locator(
+                    f'#select-bettype label:has-text("{target_label}")'
+                ).first.click(timeout=4000)
+                await asyncio.sleep(0.7)
+            except Exception:
+                pass
+        # 検証: target のみ active か
+        amap = await _bettype_active_map(page)
+        active_now = [l for l, a in amap.items()
+                      if a and l in ALL_BET_TAB_LABELS]
+        if active_now == [target_label]:
+            return True
+    return False
+
+
+async def _select_cars(page, bet_type: str, cars: list) -> None:
+    """iv__table (1着/2着/3着/BOX) で券種別に車番チェックボックスを click。
+
+    fns: 1着列に 1 車。rt3: 1着=cars[0]/2着=cars[1]/3着=cars[2]。
+    rf3: BOX列(td4) に 3 車。
+    """
+    columns = BET_META[bet_type]["columns"]
+    for car, col in zip(cars, columns):
+        sel = (
+            f'table:has(th:has-text("BOX")) tbody '
+            f'tr:nth-child({int(car)}) td:nth-child({col}) label'
+        )
+        loc = page.locator(sel).first
+        if await loc.count() == 0:
+            raise RuntimeError(
+                f"車番 {car} col{col} の checkbox が見つからない ({bet_type})"
+            )
+        await loc.click(timeout=5000)
+        await asyncio.sleep(0.6)
+
+
+async def _set_amount_units(page, amount: int) -> bool:
+    """口数入力 (可視 text input) を amount//100 に set。"""
+    unit_value = str(amount // 100)
+    for sel in ['input[type="text"]:visible', 'input[type="number"]:visible']:
+        try:
+            inp = page.locator(sel).first
+            if await inp.count() > 0:
+                await inp.fill(unit_value, timeout=3000)
+                await asyncio.sleep(0.4)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _add_to_sheet(page) -> None:
+    """「投票シートに追加」 click (disabled なら error)。"""
+    btn = page.locator('button:has-text("投票シートに追加")').first
+    if await btn.count() == 0:
+        raise RuntimeError("「投票シートに追加」 button が見つからない")
+    if await btn.is_disabled():
+        raise RuntimeError(
+            "「投票シートに追加」が disabled (車番未選択 / 締切 / 不正)"
+        )
+    await btn.click(timeout=5000)
+    await asyncio.sleep(2)
+
+
 async def execute_buy(
     race_date: str,
     place_code: int,
     race_no: int,
-    car_no: int,
-    amount: int,
+    car_no: int | None = None,
+    amount: int | None = None,
     dry_run: bool = True,
+    bets: list | None = None,
 ) -> dict:
     """Playwright で投票実行。
+
+    Args:
+        bets: [{"type":"fns"|"rt3"|"rf3", "cars":[..], "amount":int}, ...]
+              None なら car_no/amount から単一複勝 bet を構築 (後方互換)。
 
     Returns:
         dict with keys: success (bool), dry_run (bool), message (str), url (str)
     """
-    if amount > MAX_AMOUNT_YEN:
-        raise ValueError(
-            f"amount {amount} > {MAX_AMOUNT_YEN} (safety limit)"
-        )
+    # bets 構築 (後方互換: 単一複勝)
+    if bets is None:
+        if car_no is None or amount is None:
+            raise ValueError("bets も car_no/amount も無い")
+        bets = [{"type": "fns", "cars": [int(car_no)], "amount": int(amount)}]
+
+    # 値域・合計チェック
+    total = 0
+    for b in bets:
+        if b["type"] not in BET_META:
+            raise ValueError(f"未知の券種: {b['type']}")
+        if int(b["amount"]) > MAX_AMOUNT_YEN:
+            raise ValueError(
+                f"{b['type']} amount {b['amount']} > {MAX_AMOUNT_YEN} (safety)"
+            )
+        if len(b["cars"]) != BET_META[b["type"]]["n_cars"]:
+            raise ValueError(
+                f"{b['type']} cars 数不正: {b['cars']}"
+            )
+        total += int(b["amount"])
+    if total > MAX_TOTAL_YEN:
+        raise ValueError(f"合計 {total} > {MAX_TOTAL_YEN} (safety limit)")
     if place_code not in VEL_CODE_MAP:
         raise ValueError(f"unknown place_code {place_code}")
 
@@ -275,94 +451,43 @@ async def execute_buy(
                     "session 切れ"
                 )
 
-            # === Step 3: 複勝タブを ON ===
-            print(f"[execute_purchase] step 3: 複勝 ON",
-                  file=sys.stderr)
-            try:
-                fukushou = page.locator(
-                    '#select-bettype label:has-text("複勝")'
-                ).first
-                await fukushou.click(timeout=5000)
-                await asyncio.sleep(1.5)
-            except Exception as e:
-                raise RuntimeError(f"複勝 click 失敗: {e}")
-
-            # === Step 4: ３連単タブを OFF (default active を解除) ===
-            print(f"[execute_purchase] step 4: ３連単 OFF (deselect)",
-                  file=sys.stderr)
-            try:
-                sanrentan = page.locator(
-                    '#select-bettype label:has-text("３連単")'
-                ).first
-                if await sanrentan.count() > 0:
-                    await sanrentan.click(timeout=5000)
-                    await asyncio.sleep(1.5)
-            except Exception as e:
-                # deselect 失敗は致命的ではない (元から OFF だった可能性)
-                print(f"[execute_purchase] ３連単 deselect 失敗(継続): {e}",
-                      file=sys.stderr)
-
-            # === Step 5: 車番 N の １着列 (= 複勝対象) を click ===
-            print(f"[execute_purchase] step 5: 車番 {car_no} click",
-                  file=sys.stderr)
-            try:
-                car_label = page.locator(
-                    f'table:has(th:has-text("１着")) tbody '
-                    f'tr:nth-child({car_no}) td:nth-child(1) label'
-                ).first
-                await car_label.click(timeout=5000)
-                await asyncio.sleep(1)
-            except Exception as e:
-                raise RuntimeError(f"車番 {car_no} click 失敗: {e}")
-
-            # === Step 5.5: 金額入力を amount/100 に明示 set ===
-            # 「各 [N] 00円」の N を amount//100 に。
-            # default は 1 (=¥100) だが前回テストで 2 等になってる可能性
-            unit_value = str(amount // 100)
-            print(
-                f"[execute_purchase] step 5.5: 金額 input を '{unit_value}' "
-                f"(={amount}円) に reset",
-                file=sys.stderr,
-            )
-            amount_set_ok = False
-            for sel in [
-                'input[type="text"]:visible',
-                'input[type="number"]:visible',
-            ]:
-                try:
-                    amount_input = page.locator(sel).first
-                    if await amount_input.count() > 0:
-                        await amount_input.fill(unit_value, timeout=3000)
-                        await asyncio.sleep(0.5)
-                        amount_set_ok = True
-                        break
-                except Exception as e:
-                    print(
-                        f"[execute_purchase] 金額 set ({sel}) 失敗: {e}",
-                        file=sys.stderr,
-                    )
-            if not amount_set_ok:
+            # === Step 3-6: 各券種を順にシートへ追加 ===
+            # 券種ごとに: 券種正規化(target のみ active) → 車番 click →
+            #             口数 set → 投票シートに追加
+            for bi, b in enumerate(bets):
+                bt = b["type"]
+                cars = [int(c) for c in b["cars"]]
+                amt = int(b["amount"])
+                tab = BET_META[bt]["tab_label"]
                 print(
-                    f"[execute_purchase] 警告: 金額 input が見つからず "
-                    f"default 値で進む",
+                    f"[execute_purchase] step 3-6[{bi}]: {tab} "
+                    f"cars={cars} ¥{amt}",
                     file=sys.stderr,
                 )
-
-            # === Step 6: 「投票シートに追加」 click ===
-            print(f"[execute_purchase] step 6: 投票シートに追加",
-                  file=sys.stderr)
-            try:
-                add_btn = page.locator(
-                    'button:has-text("投票シートに追加")'
-                ).first
-                if await add_btn.is_disabled():
+                # 3: 券種を target のみ active に正規化
+                if not await _normalize_bettype(page, tab):
                     raise RuntimeError(
-                        "投票シートに追加が disabled (車番未選択 / 締切超過 / 不正)"
+                        f"券種正規化失敗 ({tab} のみ active にできない)"
                     )
-                await add_btn.click(timeout=5000)
-                await asyncio.sleep(2)
-            except Exception as e:
-                raise RuntimeError(f"投票シートに追加 click 失敗: {e}")
+                # 4: 車番 click (列は券種別: fns=1着 / rt3=1着2着3着 / rf3=BOX)
+                try:
+                    await _select_cars(page, bt, cars)
+                except Exception as e:
+                    raise RuntimeError(f"{tab} 車番選択失敗: {e}")
+                # 5: 口数 set (amount//100)
+                if not await _set_amount_units(page, amt):
+                    print(
+                        f"[execute_purchase] 警告: {tab} 金額 input 見つからず "
+                        f"default で進む",
+                        file=sys.stderr,
+                    )
+                # 6: 投票シートに追加
+                try:
+                    await _add_to_sheet(page)
+                    print(f"[execute_purchase]   → {tab} シート追加 OK",
+                          file=sys.stderr)
+                except Exception as e:
+                    raise RuntimeError(f"{tab} 投票シートに追加 失敗: {e}")
 
             # === Step 7: 「投票確認へ」 click → /vote/confirm に遷移 ===
             print(f"[execute_purchase] step 7: 投票確認へ",
@@ -427,43 +552,43 @@ async def execute_buy(
                 print(f"[execute_purchase] body.innerText 保存失敗: {e}",
                       file=sys.stderr)
 
-            # P1 hardening: 構造的検証 (券種 / 場 / R / 車番 / 件数 / 金額 / 日付)
+            # P1 hardening: 構造的検証 (券種 / 場 / R / 件数 / 合計金額)
             import re as _re
             venue_jp = VENUE_JP_MAP.get(place_code, "?")
+            n_bets = len(bets)
+            total_yen = sum(int(b["amount"]) for b in bets)
 
-            # 確認画面の date 照合は外す (Codex 4 次 review):
-            # 既存 PNG では確認画面に日付が可視テキストに出ていない可能性大。
-            # body.innerText に hidden 的に入っているかは次回 dry-run の
-            # data/execute_step_7_confirm_<ts>.txt で確認するまで保留。
-            # 主防御は: TTL 30 分 + yesterday 5 時まで + 場/R/券種/車番/金額。
+            # 確認画面の date 照合は外す (Codex 4 次 review、主防御は
+            # TTL 30 分 + yesterday 5 時まで + 場/R/券種/件数/金額)。
 
             checks = [
-                (
-                    r"複勝",
-                    "券種が複勝でない (確認画面に '複勝' が無い)",
-                ),
                 (
                     rf"{_re.escape(venue_jp)}\s*{race_no}\s*R",
                     f"場/R 不一致 (期待: {venue_jp} {race_no}R)",
                 ),
-                # 「複勝 1組」直後に車番が表示される
                 (
-                    rf"複勝[\s\S]{{0,30}}\b{car_no}\b",
-                    f"車番 {car_no} の表示確認失敗",
+                    rf"投票数\s*\n?\s*{n_bets}\s*組",
+                    f"投票数が {n_bets}組 でない",
                 ),
                 (
-                    r"投票数\s*\n?\s*1組",
-                    "投票数が 1組 でない",
-                ),
-                (
-                    r"1票",
-                    "1票 表記なし (件数異常)",
-                ),
-                (
-                    rf"合計購入額\s*\n?\s*{amount}\s*円",
-                    f"合計購入額が {amount}円 でない",
+                    rf"合計購入額\s*\n?\s*{total_yen}\s*円",
+                    f"合計購入額が {total_yen}円 でない",
                 ),
             ]
+            # 各券種の券種ラベルが確認画面に出ているか
+            _CONFIRM_LABEL = {"fns": "複勝", "rt3": "３連単", "rf3": "３連複"}
+            for b in bets:
+                lbl = _CONFIRM_LABEL[b["type"]]
+                checks.append((
+                    _re.escape(lbl),
+                    f"券種 {lbl} が確認画面に無い",
+                ))
+                # 出目の各車番が確認画面テキストに含まれるか (緩め: 桁の存在のみ)
+                for c in b["cars"]:
+                    checks.append((
+                        rf"\b{int(c)}\b",
+                        f"{lbl} の車番 {int(c)} 表示確認失敗",
+                    ))
 
             failures: list[str] = []
             for pattern, errmsg in checks:
@@ -474,13 +599,17 @@ async def execute_buy(
                 raise RuntimeError(
                     "確認画面検証失敗:\n"
                     + "\n".join(failures)
-                    + f"\n  body text 抜粋:\n{page_text[:400]!r}"
+                    + f"\n  body text 抜粋:\n{page_text[:600]!r}"
                 )
 
+            bets_desc = " / ".join(
+                f"{_CONFIRM_LABEL[b['type']]} {_deme_str(b['type'], b['cars'])}"
+                f" ¥{b['amount']}" for b in bets
+            )
             print(
-                f"[execute_purchase] 確認画面 OK: 複勝 / {race_date} / "
-                f"{venue_jp} {race_no}R / {car_no}号 / 1組1票 / {amount}円 "
-                f"を全て確認",
+                f"[execute_purchase] 確認画面 OK: {race_date} / "
+                f"{venue_jp} {race_no}R / {n_bets}組 / 合計¥{total_yen} / "
+                f"{bets_desc} を全て確認",
                 file=sys.stderr,
             )
 
@@ -498,8 +627,8 @@ async def execute_buy(
                     "dry_run": True,
                     "url": page.url,
                     "message": (
-                        f"dry-run OK: 確認画面到達 ({page.url})、"
-                        f"複勝 {car_no}号 ¥{amount} 投票画面表示済"
+                        f"dry-run OK: 確認画面到達、{n_bets}組 合計¥{total_yen} "
+                        f"({bets_desc}) 表示済"
                     ),
                 }
 
@@ -613,29 +742,37 @@ async def execute_buy(
                     file=sys.stderr,
                 )
 
-                # exact match を探す:
+                # exact match を探す (全 bet について):
                 #   - createdAt が click_started_at - 30秒 (grace) 以後
-                #   - packs に betType=FUKUSHOU かつ packDeme=str(car_no)
+                #   - packs に betType=gql_type かつ packDeme=期待出目
                 #     かつ voteAmount=amount のものがある
+                # 全 bet が match して初めて history_ok=True。
                 #
-                # Codex 5 次 review (P2): grace 30秒を入れることで、PC 時計
-                # ↔ サーバ時計のズレ / 秒丸め / 注文生成時刻が click 直前扱い
-                # で取り逃すケースを防ぐ。false-negative (実購入後に失敗扱い)
-                # は運用上紛らわしいため明示的に許容。
+                # Codex 5 次 review (P2): grace 30秒で PC 時計↔サーバ時計のズレ
+                # / 秒丸め / 注文生成時刻ズレによる取り逃しを防ぐ。
                 CLICK_GRACE = _dt.timedelta(seconds=30)
                 lower_bound = click_started_at - CLICK_GRACE
+
+                # 期待 bet の (gql_type, deme, amount) 集合
+                expected = []
+                for b in bets:
+                    expected.append({
+                        "gql_type": BET_META[b["type"]]["gql_type"],
+                        "deme": _deme_str(b["type"], b["cars"]),
+                        "amount": int(b["amount"]),
+                        "type": b["type"],
+                        "matched": False,
+                    })
+
                 matches = []
                 for o in orders:
                     created_str = o.get("createdAt", "")
                     try:
-                        # ISO8601 想定: "2026-05-09T11:39:41+09:00" or
-                        # "...Z" or naive
                         s = created_str.replace("Z", "+00:00")
                         created = _dt.datetime.fromisoformat(s)
                         if created.tzinfo is None:
                             created = created.replace(tzinfo=_jst)
                     except Exception:
-                        # createdAt parse 失敗は skip (false-positive 防止)
                         continue
                     if created < lower_bound:
                         continue
@@ -643,36 +780,43 @@ async def execute_buy(
                         bet_type = str(p.get("betType", "")).strip()
                         deme = str(p.get("packDeme", "")).strip()
                         vote_amt = int(p.get("voteAmount", 0))
-                        if (
-                            bet_type == "FUKUSHOU"
-                            and deme == str(car_no)
-                            and vote_amt == amount
-                        ):
-                            matches.append({
-                                "order_id": o.get("id"),
-                                "created_at": created.isoformat(),
-                                "betType": bet_type,
-                                "packDeme": deme,
-                                "voteAmount": vote_amt,
-                            })
-                            break
+                        for exp in expected:
+                            if exp["matched"]:
+                                continue
+                            if (bet_type == exp["gql_type"]
+                                    and deme == exp["deme"]
+                                    and vote_amt == exp["amount"]):
+                                exp["matched"] = True
+                                matches.append({
+                                    "order_id": o.get("id"),
+                                    "created_at": created.isoformat(),
+                                    "betType": bet_type,
+                                    "packDeme": deme,
+                                    "voteAmount": vote_amt,
+                                })
+                                break
 
-                if matches:
+                n_matched = sum(1 for e in expected if e["matched"])
+                if n_matched == len(expected):
                     history_ok = True
                     history_match_info = (
-                        f"{len(matches)} 件 exact match: "
-                        f"{matches[0]}"
+                        f"{n_matched}/{len(expected)} bet exact match: "
+                        f"{matches}"
                     )
                     print(
-                        f"[execute_purchase] ✅ GraphQL exact match: "
+                        f"[execute_purchase] ✅ GraphQL exact match (全 bet): "
                         f"{history_match_info}",
                         file=sys.stderr,
                     )
                 else:
+                    unmatched = [
+                        f"{e['gql_type']}/{e['deme']}/¥{e['amount']}"
+                        for e in expected if not e["matched"]
+                    ]
                     print(
-                        f"[execute_purchase] ⚠️ GraphQL exact match なし "
-                        f"(orders={len(orders)} 件、click 以降 / 複勝 "
-                        f"{car_no}号 / ¥{amount} に該当せず)",
+                        f"[execute_purchase] ⚠️ GraphQL exact match 不足 "
+                        f"({n_matched}/{len(expected)}、未一致: {unmatched}、"
+                        f"orders={len(orders)} 件)",
                         file=sys.stderr,
                     )
             except Exception as e:
@@ -683,10 +827,21 @@ async def execute_buy(
 
             # 成功根拠の総合判定 (Codex 4 次 review):
             # (a) failure_hits: 即 fail (既に上で raise されている)
-            # (b) history_ok: GraphQL exact match (server-side 成立確定)
+            # (b) history_ok: GraphQL exact match (全 bet 成立確定)
             # (c) success keyword: fallback (受付番号付き完了画面)
             # (d) URL 遷移: ログ用、成功根拠にしない
-            if not history_ok and not success_hits:
+            # 複数 bet 時は history_ok (全 bet 一致) を必須にする
+            # (success keyword だけでは「全 bet 通った」保証にならないため)。
+            multi_bet = len(bets) > 1
+            if multi_bet:
+                if not history_ok:
+                    raise RuntimeError(
+                        f"まとめ買い投票の全 bet 成立確認が取れない "
+                        f"(GraphQL exact match 不足)。"
+                        f"\n  URL: {final_url}"
+                        f"\n  body text 抜粋: {completion_text[:400]!r}"
+                    )
+            elif not history_ok and not success_hits:
                 raise RuntimeError(
                     f"投票完了の確認が取れない "
                     f"(GraphQL exact match NG / success keyword なし)。"
@@ -712,7 +867,7 @@ async def execute_buy(
                     "url_changed": url_changed_to_done,
                 },
                 "message": (
-                    f"投票完了: 複勝 {car_no}号 ¥{amount} "
+                    f"投票完了: {bets_desc} "
                     f"@ {race_date} place_code={place_code} R{race_no}"
                 ),
             }
@@ -729,8 +884,13 @@ def main() -> None:
     p.add_argument("--race-date", required=True, help="YYYY-MM-DD")
     p.add_argument("--place", type=int, required=True, help="place_code (2-6)")
     p.add_argument("--race", type=int, required=True, help="race number")
-    p.add_argument("--car", type=int, required=True, help="car number")
-    p.add_argument("--amount", type=int, required=True, help="bet amount in yen")
+    p.add_argument("--car", type=int, default=None, help="car number (単一複勝時)")
+    p.add_argument("--amount", type=int, default=None,
+                   help="bet amount in yen (単一複勝時)")
+    p.add_argument("--bets-json", type=str, default=None,
+                   help='まとめ買い: \'[{"type":"fns","cars":[6],"amount":300},'
+                        '{"type":"rt3","cars":[6,5,4],"amount":100},'
+                        '{"type":"rf3","cars":[4,5,6],"amount":100}]\'')
     p.add_argument("--dry-run", action="store_true",
                    help="navigate のみ、実投票はしない (default: 実投票)")
     args = p.parse_args()
@@ -740,19 +900,56 @@ def main() -> None:
     except Exception:
         pass
 
-    # === P3 hardening: amount <= MAX_AMOUNT_YEN (Codex 3 次 review 由来) ===
-    # recommended_bet_yen() が場×R 別に最適額を返すので、上限チェックのみ。
-    if args.amount > MAX_AMOUNT_YEN:
-        print(
-            f"[execute_purchase] ❌ amount {args.amount} > {MAX_AMOUNT_YEN} (safety limit)",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    if args.amount % 100 != 0 or args.amount < 100:
-        print(
-            f"[execute_purchase] ❌ amount {args.amount} は 100 円単位で 100 円以上",
-            file=sys.stderr,
-        )
+    # === bets 構築 (--bets-json 優先、無ければ --car/--amount から単一複勝) ===
+    bets = None
+    if args.bets_json:
+        try:
+            bets = json.loads(args.bets_json)
+        except Exception as e:
+            print(f"[execute_purchase] ❌ --bets-json parse 失敗: {e}",
+                  file=sys.stderr)
+            sys.exit(2)
+        if not isinstance(bets, list) or not bets:
+            print("[execute_purchase] ❌ --bets-json は非空 list 必須",
+                  file=sys.stderr)
+            sys.exit(2)
+    else:
+        if args.car is None or args.amount is None:
+            print("[execute_purchase] ❌ --bets-json も --car/--amount も無い",
+                  file=sys.stderr)
+            sys.exit(2)
+        bets = [{"type": "fns", "cars": [args.car], "amount": args.amount}]
+
+    # === 値域・上限チェック (全 bet 共通) ===
+    total = 0
+    for b in bets:
+        bt = b.get("type")
+        if bt not in BET_META:
+            print(f"[execute_purchase] ❌ 未知の券種: {bt}", file=sys.stderr)
+            sys.exit(2)
+        cars = b.get("cars", [])
+        if len(cars) != BET_META[bt]["n_cars"]:
+            print(f"[execute_purchase] ❌ {bt} cars 数不正: {cars}",
+                  file=sys.stderr)
+            sys.exit(2)
+        for c in cars:
+            if not (1 <= int(c) <= 8):
+                print(f"[execute_purchase] ❌ {bt} 車番不正: {c}",
+                      file=sys.stderr)
+                sys.exit(2)
+        if bt in ("rt3", "rf3") and len(set(int(c) for c in cars)) != 3:
+            print(f"[execute_purchase] ❌ {bt} 車番重複: {cars}",
+                  file=sys.stderr)
+            sys.exit(2)
+        amt = int(b.get("amount", 0))
+        if amt > MAX_AMOUNT_YEN or amt < 100 or amt % 100 != 0:
+            print(f"[execute_purchase] ❌ {bt} amount 不正 "
+                  f"(100-{MAX_AMOUNT_YEN}, 100円単位): {amt}", file=sys.stderr)
+            sys.exit(2)
+        total += amt
+    if total > MAX_TOTAL_YEN:
+        print(f"[execute_purchase] ❌ 合計 {total} > {MAX_TOTAL_YEN} (safety)",
+              file=sys.stderr)
         sys.exit(2)
 
     # === P1 hardening: race_date が「現在開催中の日付」 ===
@@ -773,7 +970,7 @@ def main() -> None:
         )
         sys.exit(2)
 
-    # place_code / race_no / car_no の値域もここで弾く
+    # place_code / race_no の値域
     if args.place not in (2, 3, 4, 5, 6):
         print(
             f"[execute_purchase] ❌ place_code {args.place} 不正 (2-6 期待)",
@@ -786,22 +983,14 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(2)
-    if not (1 <= args.car <= 8):
-        print(
-            f"[execute_purchase] ❌ car_no {args.car} 不正 (1-8 期待)",
-            file=sys.stderr,
-        )
-        sys.exit(2)
 
     # 注意: 本番モード (`--dry-run` なし) は実投票を発生させる。
-    # P1-P3 hardening 完了 (Codex 1-5 次 review、commit e06a200..c100df1)。
-    # 詳細: Opinion/codex_briefs/execute_purchase_hardening.md
-    # 1 回限りの本番テストはユーザー立ち会いで `--amount 100` のみ。
+    # 三連系まとめ買い対応 (2026-05-30)。dry-run で確認画面検証後に本番。
 
     try:
         result = asyncio.run(execute_buy(
-            args.race_date, args.place, args.race, args.car, args.amount,
-            dry_run=args.dry_run,
+            args.race_date, args.place, args.race,
+            dry_run=args.dry_run, bets=bets,
         ))
     except Exception as e:
         print(json.dumps({"success": False, "error": str(e)},
