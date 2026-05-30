@@ -387,49 +387,93 @@ async def execute_buy(
                   file=sys.stderr)
 
             # === Step 1.5: カートクリア (前回 dry-run 残骸対策) ===
+            # 「全削除 → reload → 空を確認」を最大 4 回。空にできなければ abort
+            # (dirty cart に積み増しすると別レース/別出目を誤投票するリスク)。
             print(f"[execute_purchase] step 1.5: 既存カートクリア",
                   file=sys.stderr)
-            try:
-                # confirm 画面の dialog (確認 prompt 等) は自動 accept
-                page.on(
-                    'dialog',
-                    lambda d: asyncio.create_task(d.accept()),
-                )
-                confirm_url = (
-                    f"https://vote.autorace.jp/vote/confirm"
-                    f"?vel_code={vel_code}&race_num={race_no}"
-                )
+            # confirm 画面の dialog (削除確認 prompt 等) は自動 accept
+            page.on(
+                'dialog',
+                lambda d: asyncio.create_task(d.accept()),
+            )
+            confirm_url = (
+                f"https://vote.autorace.jp/vote/confirm"
+                f"?vel_code={vel_code}&race_num={race_no}"
+            )
+
+            async def _cart_item_count() -> int:
+                """確認画面の「N組」表記からカート内の組数を取得 (取れなければ
+                全削除ボタンの有無で 0/1 を返す)。"""
+                try:
+                    txt = await page.evaluate("() => document.body.innerText")
+                except Exception:
+                    txt = ""
+                import re as _re2
+                m = _re2.search(r"投票数\s*\n?\s*(\d+)\s*組", txt)
+                if m:
+                    return int(m.group(1))
+                # fallback: 全削除ボタンがあれば非空とみなす
+                cnt = await page.locator('button:has-text("全削除")').count()
+                return 1 if cnt > 0 else 0
+
+            cart_cleared = False
+            for attempt in range(4):
                 await page.goto(confirm_url, wait_until="domcontentloaded",
                                 timeout=30000)
                 await asyncio.sleep(2)
-                # /login にリダイレクトされてないか確認
                 if "/login" in page.url:
                     raise RuntimeError(
                         f"login 画面に redirect されました ({page.url}) — "
                         "session 切れ"
                     )
-                # 「全削除」 button が visible なら click(カート空でない)
-                delete_btn = page.locator(
-                    'button:has-text("全削除")'
-                ).first
-                if await delete_btn.count() > 0:
-                    try:
-                        await delete_btn.click(timeout=5000)
-                        await asyncio.sleep(2)
-                        print(f"[execute_purchase] カートクリア OK",
+                n = await _cart_item_count()
+                if n == 0:
+                    cart_cleared = True
+                    print(f"[execute_purchase] カート空を確認 (試行 {attempt})",
+                          file=sys.stderr)
+                    break
+                print(f"[execute_purchase] カート {n}組 残存 → 全削除 "
+                      f"(試行 {attempt + 1}/4)", file=sys.stderr)
+                delete_btn = page.locator('button:has-text("全削除")').first
+                if await delete_btn.count() == 0:
+                    # N組 検出だが全削除ボタン無し → 想定外、念のため continue
+                    await asyncio.sleep(1)
+                    continue
+                try:
+                    await delete_btn.click(timeout=5000)
+                    await asyncio.sleep(1)
+                    # 全削除クリックで「ベット削除 / 削除してもよろしいでしょうか？」
+                    # の HTML モーダルが出る。OK ボタン (.modal button--primary)
+                    # を押さないと削除されない (2026-05-30 inspect_cart_clear で確定)。
+                    ok_btn = page.locator(
+                        '.modal button:has-text("OK")'
+                    ).first
+                    if await ok_btn.count() > 0:
+                        await ok_btn.click(timeout=5000)
+                        print("[execute_purchase]   削除確認モーダル OK click",
                               file=sys.stderr)
-                    except Exception as e:
-                        print(
-                            f"[execute_purchase] 全削除 click 失敗(継続): {e}",
-                            file=sys.stderr,
-                        )
-                else:
-                    print(f"[execute_purchase] カートは元々空", file=sys.stderr)
-            except RuntimeError:
-                raise
-            except Exception as e:
-                print(f"[execute_purchase] カートクリアスキップ: {e}",
-                      file=sys.stderr)
+                    else:
+                        # fallback: モーダル外の OK / 確認系も試す
+                        for s in ['button:has-text("OK")',
+                                  'button:has-text("削除する")',
+                                  'button:has-text("はい")']:
+                            b = page.locator(s).first
+                            if await b.count() > 0:
+                                await b.click(timeout=4000)
+                                print(f"[execute_purchase]   確認 click: {s}",
+                                      file=sys.stderr)
+                                break
+                    await asyncio.sleep(2)  # 削除反映待ち
+                except Exception as e:
+                    print(f"[execute_purchase] 全削除 click 失敗: {e}",
+                          file=sys.stderr)
+                    await asyncio.sleep(1)
+
+            if not cart_cleared:
+                raise RuntimeError(
+                    "カートを空にできませんでした (全削除を 4 回試行後も残存)。"
+                    "誤投票防止のため中断。手動でカートを確認してください。"
+                )
 
             # === Step 2: 投票画面に navigate ===
             target_url = (
@@ -622,6 +666,28 @@ async def execute_buy(
                     file=sys.stderr,
                 )
                 await asyncio.sleep(3)  # 目視用
+                # dry-run の買い目はカートに残るため掃除 (次回への持ち越し防止)
+                # /vote/confirm に移動してから全削除 → モーダル OK
+                try:
+                    await page.goto(
+                        f"https://vote.autorace.jp/vote/confirm"
+                        f"?vel_code={vel_code}&race_num={race_no}",
+                        wait_until="domcontentloaded", timeout=30000)
+                    await asyncio.sleep(2)
+                    del_btn = page.locator('button:has-text("全削除")').first
+                    if await del_btn.count() > 0:
+                        await del_btn.click(timeout=5000)
+                        await asyncio.sleep(1)
+                        ok_btn = page.locator(
+                            '.modal button:has-text("OK")').first
+                        if await ok_btn.count() > 0:
+                            await ok_btn.click(timeout=5000)
+                        await asyncio.sleep(2)
+                        print("[execute_purchase] dry-run: カート掃除 OK",
+                              file=sys.stderr)
+                except Exception as e:
+                    print(f"[execute_purchase] dry-run カート掃除失敗(無害): {e}",
+                          file=sys.stderr)
                 return {
                     "success": True,
                     "dry_run": True,

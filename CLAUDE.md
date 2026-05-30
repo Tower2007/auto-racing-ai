@@ -114,6 +114,14 @@ reports/               # 各種分析レポート(commit 対象)
 三連単 1 点 + 三連複 1 点を追加推奨 (2026-05-29 導入、paper 記録 `data/rt3_paper.csv`)。
 過去検証 `scripts/ev_3point_by_place.py` thr=1.80:
 rt3 浜松 ROI 530% / 山陽 ROI 141%、rf3 浜松 ROI 330% / 山陽 ROI 185%。
+
+三連系まとめ買い click-to-buy (2026-05-30 本番稼働): 浜松・山陽 EV>=1.80 のメールに
+「💰 3点購入」ボタンを出し、1 click で 複勝(推奨額)+三連単(¥100)+三連複(¥100) を
+まとめて投票。`daily_predict.py:RT3_BUY_ENABLED` で on/off。実装は
+`execute_purchase.py --bets-json`(複数券種をシート追加→1回投票、三連複=BOX列)、
+`buy_token.py` の bets payload、`buy_app.py` の 3 券種表示。投票前にカート全削除
+(モーダル OK)→確認画面で N組/合計額/各出目を構造検証→投票後 GraphQL で全 bet 照合。
+浜松 R7 で本番テスト成功 (¥500 投票受付完了) 済。
 場ごとに開催形態(通常/ナイター/ミッドナイト)が変わっても `liveStartTime` / `liveEndTime`
 で自動追従するため取り逃がしなし。賭け運用は手動投票(自動投票は ToS グレーで非実施)。
 

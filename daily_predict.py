@@ -68,10 +68,10 @@ RT3_ELIGIBLE_PLACES = {4, 6}  # 浜松, 山陽
 RT3_THR = 1.80
 RT3_PAPER_LOG = DATA / "rt3_paper.csv"
 # 三連系まとめ買い (複勝+三連単+三連複 を 1 ボタンで購入) の click-to-buy 有効化フラグ。
-# execute_purchase.py の --bets-json 実装 + dry-run 検証が完了するまで False。
-# False の間は浜松・山陽でも従来通り「複勝のみ」の購入ボタンを出す
-# (三連系はメールの推奨表示のみ = paper trading)。
-RT3_BUY_ENABLED = False
+# 2026-05-30: 浜松 R7 で本番テスト成功 (複勝5¥300 + 三連単5-6-7¥100 +
+# 三連複5=6=7¥100 = ¥500 投票受付完了) を確認し True に。
+# False に戻すと浜松・山陽でも従来通り「複勝のみ」の購入ボタンになる。
+RT3_BUY_ENABLED = True
 
 # Shadow 判定用パラメータ (本番には影響しない、記録のみ)
 SHADOW_DRIFT_FACTORS = [0.70, 0.80]  # close_ev_est = fire_ev * factor
