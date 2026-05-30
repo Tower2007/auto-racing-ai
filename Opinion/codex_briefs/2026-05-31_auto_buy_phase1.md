@@ -30,8 +30,8 @@
 AUTO_BUY_ENABLED = False      # マスタースイッチ (デフォルト OFF)
 AUTO_BUY_DRY_RUN = True       # 実投票せず log のみ (Week 1 はこれ)
 AUTO_BUY_HOURS = (22, 6)      # 自動投票許可時間帯 (22:00 〜 翌 06:00)
-MAX_DAILY_AUTO_YEN = 1500     # 1 日合計上限
-DAILY_LOSS_STOP_YEN = -1000   # 当日累積これを下回ったら以降 skip
+MAX_DAILY_AUTO_YEN = 2000     # 1 日合計上限
+DAILY_LOSS_STOP_YEN = -1500   # 当日累積これを下回ったら以降 skip (上限 ¥2000 の 75%)
 EV_ANOMALY_CAP = 10.0         # EV がこれを超える R は skip (バグ防御)
 CONSECUTIVE_FAILURES_STOP = 3 # 連続 Playwright エラー回数で停止
 ```
