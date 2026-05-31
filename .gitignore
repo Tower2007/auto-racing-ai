@@ -64,3 +64,6 @@ dist/
 build/
 .env.vote
 data/*.har
+
+# 月次レポートの自動生成 CSV (regenerable)
+reports/monthly/

@@ -64,6 +64,7 @@ daily_predict.py       # 当日対象場の EV ベース買い候補メール送
 dynamic_scheduler.py   # 各レース発走 LEAD_MIN (現在 5) 分前に daily_predict を
                        # 1R 単位で起動する schtasks one-shot を毎朝生成
 weekly_status.py       # 週次ステータスメール
+monthly_report.py      # 月次収支レポート(推奨仮想+実購入、Gmail HTML、毎月1日)
 gmail_notify.py        # Gmail SMTP 送信
 scripts/
   ev_*.py              # EV 戦略 5 段階検証
@@ -92,6 +93,7 @@ reports/               # 各種分析レポート(commit 対象)
 | `AutoraceDyn_{venue}_R{n}` | 各レース発走 LEAD_MIN 分前(現在 4 分前、動的) | `python daily_predict.py --venues {pc} --races {n} --suppress-noresult-email`: 1 R 単位で予測、候補ありのみメール送信。near-miss retry 廃止、処理 ~10 秒で締切 ~2 分前に到着 |
 | `AutoraceWeeklyRetrain` | 毎日曜 03:00 | 本番モデル再学習 |
 | `AutoraceWeeklyStatus` | 毎月曜 07:20 | 週次ステータス報告 |
+| `AutoraceMonthlyReport` | 毎月 1 日 08:00 | `python monthly_report.py --send-email`: 前月の月次収支レポート(推奨仮想+実購入+券種別+場別+月次ROI推移+通算)を Gmail 送信。keiba の月次レポートと同枠組み |
 | `AutoraceFetchOrderHistory` | 毎日 02:30 | `python scripts/daily_fetch_order_history.py`: vote.autorace.jp の購入履歴を `--since 2d --detail --cookie-source playwright` で取得し `data/bet_history.csv` / `bet_history_detail.csv` にマージ。失敗時のみ Gmail 通知。**2026-05-08 から Playwright auto-login** に切替(SBI IPO project と同じパターン)。資格情報は `accounts.json`(.gitignore)。実装: `scripts/auto_login_autorace.py`。旧 Firefox cookie 方式は `--cookie-source firefox` で fallback 可。経緯: memory `ml_baseline_findings.md` 2026-05-08 |
 
 #### 設計
