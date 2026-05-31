@@ -77,7 +77,11 @@ AUTO_BUY_ENABLED = _env_bool("AUTO_BUY_ENABLED", False)
 AUTO_BUY_DRY_RUN = _env_bool("AUTO_BUY_DRY_RUN", True)
 # 三連系 (rt3+rf3) も自動対象にするか。Week2 は複勝のみ (False)、Week3 で True。
 AUTO_BUY_INCLUDE_RT3 = _env_bool("AUTO_BUY_INCLUDE_RT3", False)
+# 時間帯ガードを無視して常時自動発注するか (2026-05-31 ユーザー要望でデフォ True)。
+# False にすると下の AUTO_BUY_HOUR_START/END の夜間限定に戻る。
+AUTO_BUY_ANYTIME = _env_bool("AUTO_BUY_ANYTIME", True)
 # 自動投票を許可する時間帯 (JST hour)。(22, 6) = 22:00〜翌06:00。
+# AUTO_BUY_ANYTIME=False の時のみ有効。
 AUTO_BUY_HOUR_START = _env_int("AUTO_BUY_HOUR_START", 22)
 AUTO_BUY_HOUR_END = _env_int("AUTO_BUY_HOUR_END", 6)
 MAX_DAILY_AUTO_YEN = _env_int("MAX_DAILY_AUTO_YEN", 2000)
@@ -179,6 +183,7 @@ def check_guards(
     race_amount: int,
     ev: float,
     *,
+    anytime: bool = AUTO_BUY_ANYTIME,
     hour_start: int = AUTO_BUY_HOUR_START,
     hour_end: int = AUTO_BUY_HOUR_END,
     max_daily_yen: int = MAX_DAILY_AUTO_YEN,
@@ -186,8 +191,11 @@ def check_guards(
     ev_cap: float = EV_ANOMALY_CAP,
     consecutive_stop: int = CONSECUTIVE_FAILURES_STOP,
 ) -> tuple[bool, str]:
-    """5 ガードを順に評価。全通過で (True, "ok")、不可なら (False, 理由)。"""
-    if not in_buy_hours(now, hour_start, hour_end):
+    """ガードを順に評価。全通過で (True, "ok")、不可なら (False, 理由)。
+
+    anytime=True (デフォルト) の時は時間帯ガードを無視 (常時発注)。
+    """
+    if not anytime and not in_buy_hours(now, hour_start, hour_end):
         return False, f"skip_hours (JST {now.hour:02d}時、許可 {hour_start}-{hour_end})"
     if ev > ev_cap:
         return False, f"skip_ev_anomaly (EV {ev:.2f} > {ev_cap})"
@@ -204,6 +212,27 @@ def check_guards(
 
 
 # ─── bets 構築 ────────────────────────────────────────────────
+
+_BET_JP = {"fns": "複勝", "rt3": "三連単", "rf3": "三連複"}
+_BET_JP_SEP = {"fns": "", "rt3": "→", "rf3": "="}
+
+
+def format_bets_jp(bets: list[dict]) -> str:
+    """通知用の読みやすい買い目表記。
+
+    例: '複勝 5号 ¥300 / 三連単 5→6→7 ¥100 / 三連複 5=6=7 ¥100'
+    """
+    parts = []
+    for b in bets:
+        bt = b["type"]
+        cars = [int(c) for c in b["cars"]]
+        if bt == "fns":
+            deme = f"{cars[0]}号"
+        else:
+            deme = _BET_JP_SEP[bt].join(str(c) for c in cars)
+        parts.append(f"{_BET_JP.get(bt, bt)} {deme} ¥{int(b['amount'])}")
+    return " / ".join(parts)
+
 
 def build_bets(car_no: int, rec_yen: int,
                rt3_ref: dict | None,
@@ -298,8 +327,9 @@ def run_auto_buy(candidates: list[dict],
                     f"profit ¥{state['profit_yen']}")
             continue
 
-        bets_desc = " / ".join(
-            f"{b['type']}:{b['cars']}¥{b['amount']}" for b in c["bets"])
+        bets_desc = format_bets_jp(c["bets"])  # 読みやすい日本語表記
+        venue_jp = c.get("venue_jp", "?")
+        race_jp = f"{venue_jp} R{c['race_no']} ({c['race_date']})"
         if dry:
             logger.info("[auto_buy][DRY-RUN] %s 投票相当: %s (¥%d)",
                         race_label, bets_desc, amount)
@@ -309,9 +339,13 @@ def run_auto_buy(candidates: list[dict],
                    "timestamp": now.isoformat()}
             state["executions"].append(rec)
             results.append(rec)
-            _notify(f"[AUTO-BUY][DRY-RUN] {race_label} ¥{amount}",
-                    f"{race_label} (実投票なし)\n買い目: {bets_desc}\n"
-                    f"当日 spent(模擬) ¥{state['spent_yen']}")
+            _notify(
+                f"[AUTO-BUY][DRY-RUN] {venue_jp} R{c['race_no']} 計¥{amount}",
+                f"【自動発注 DRY-RUN(実投票なし)】\n"
+                f"{race_jp}\n\n"
+                f"買い目:\n  {bets_desc}\n\n"
+                f"合計: ¥{amount}\n"
+                f"当日 自動発注額(模擬): ¥{state['spent_yen']}")
             save_state(state)
             continue
 
@@ -333,12 +367,16 @@ def run_auto_buy(candidates: list[dict],
         state["executions"].append(rec)
         results.append(rec)
         _notify(
-            f"[AUTO-BUY] {race_label} ¥{amount} "
-            f"{'受付完了' if success else '失敗'}",
-            f"{race_label}\n買い目: {bets_desc}\n結果: {verdict}\n"
-            f"詳細: {detail[-300:]}\n"
-            f"当日 spent ¥{state['spent_yen']} / "
-            f"連続失敗 {state['consecutive_failures']}")
+            f"[AUTO-BUY] {venue_jp} R{c['race_no']} 計¥{amount} "
+            f"{'投票完了' if success else '失敗'}",
+            f"【自動発注 {'投票完了' if success else '失敗'}】\n"
+            f"{race_jp}\n\n"
+            f"買い目:\n  {bets_desc}\n\n"
+            f"合計: ¥{amount}\n"
+            f"結果: {verdict}\n"
+            f"当日 自動発注額: ¥{state['spent_yen']} / "
+            f"連続失敗 {state['consecutive_failures']}\n\n"
+            f"詳細: {detail[-300:]}")
         save_state(state)
 
     save_state(state)

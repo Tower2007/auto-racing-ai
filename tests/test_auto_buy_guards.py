@@ -40,9 +40,19 @@ def test_in_buy_hours_wraparound():
     assert auto_buy.in_buy_hours(dt.datetime(2026, 6, 1, 5, 59, tzinfo=JST), 22, 6) is True
 
 
-def test_skip_hours():
+def test_anytime_default_ignores_hours():
+    # デフォルト anytime=True: 昼でも時間帯では skip しない
     ok, reason = auto_buy.check_guards(_state(), DAY, 300, 1.9)
+    assert ok is True and reason == "ok"
+
+
+def test_skip_hours_when_anytime_false():
+    # anytime=False の時のみ夜間限定ガードが効く
+    ok, reason = auto_buy.check_guards(_state(), DAY, 300, 1.9, anytime=False)
     assert ok is False and "hours" in reason
+    # 夜間なら通る
+    ok2, _ = auto_buy.check_guards(_state(), NIGHT, 300, 1.9, anytime=False)
+    assert ok2 is True
 
 
 def test_skip_ev_anomaly():
