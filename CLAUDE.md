@@ -122,6 +122,17 @@ rt3 浜松 ROI 530% / 山陽 ROI 141%、rf3 浜松 ROI 330% / 山陽 ROI 185%。
 `buy_token.py` の bets payload、`buy_app.py` の 3 券種表示。投票前にカート全削除
 (モーダル OK)→確認画面で N組/合計額/各出目を構造検証→投票後 GraphQL で全 bet 照合。
 浜松 R7 で本番テスト成功 (¥500 投票受付完了) 済。
+
+夜間限定 自動投票 Phase 1 (2026-05-31 導入、`auto_buy.py`): 寝てる時間帯
+(山陽ミッドナイト + 川口ナイター後半) の機会損失対策。`AUTO_BUY_ENABLED`
+(デフォルト OFF) が True の時のみ、daily_predict のメール送信直前に厳格ガード
+(夜間 22-6時 / 1日上限¥2000 / 当日損失-¥1500停止 / EV異常>10除外 / 連続失敗3回停止)
+を全通過した候補を `execute_purchase.py` で自動投票。state は `data/auto_buy_state.json`
+(atomic write・日次 reset)、毎回 Gmail 即時通知。段階導入: Week1 `AUTO_BUY_DRY_RUN=True`
+(判定のみ) → Week2 複勝のみ live → Week3 `AUTO_BUY_INCLUDE_RT3=True` で三連系含む。
+設定は全て .env で上書き可。ガード単体テスト `tests/test_auto_buy_guards.py`。
+ToS グレー (約定書13条「自ら申込む」) をユーザー承知の上で進行。
+依頼書: `Opinion/codex_briefs/2026-05-31_auto_buy_phase1.md`。
 場ごとに開催形態(通常/ナイター/ミッドナイト)が変わっても `liveStartTime` / `liveEndTime`
 で自動追従するため取り逃がしなし。賭け運用は手動投票(自動投票は ToS グレーで非実施)。
 

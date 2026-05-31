@@ -1266,6 +1266,42 @@ def main():
         else:
             picks = pd.DataFrame()
 
+        # ─── 夜間限定 自動投票 (Phase 1、AUTO_BUY_ENABLED=False の間は no-op) ───
+        # click-to-buy を壊さず、寝てる時間帯のみガード付きで自動投票。
+        try:
+            import auto_buy
+            if auto_buy.AUTO_BUY_ENABLED and not picks.empty:
+                rt3_map = {
+                    (int(r["place_code"]), int(r["race_no"])): r
+                    for r in rt3_refs
+                }
+                candidates = []
+                for _, r in picks.iterrows():
+                    pc = int(r["place_code"])
+                    rno = int(r["race_no"])
+                    rec_yen = recommended_bet_yen(pc, rno)
+                    bets = auto_buy.build_bets(
+                        int(r["car_no"]), rec_yen, rt3_map.get((pc, rno)))
+                    candidates.append({
+                        "race_date": target_date,
+                        "place_code": pc,
+                        "venue": r["venue"],
+                        "venue_jp": {2: "川口", 3: "伊勢崎", 4: "浜松",
+                                     5: "飯塚", 6: "山陽"}.get(pc, "?"),
+                        "race_no": rno,
+                        "car_no": int(r["car_no"]),
+                        "ev": float(r["ev_avg_calib"]),
+                        "bets": bets,
+                        "amount": sum(int(b["amount"]) for b in bets),
+                    })
+                verdicts = auto_buy.run_auto_buy(candidates)
+                logger.info("[auto_buy] %d 候補処理 (dry_run=%s): %s",
+                            len(candidates), auto_buy.AUTO_BUY_DRY_RUN,
+                            [v.get("verdict") for v in verdicts])
+        except Exception as e:
+            logger.error("[auto_buy] 自動投票処理エラー(継続): %s", e)
+            logger.error(traceback.format_exc())
+
         # 候補ありの場合 buy_app + ngrok トンネルを起動 (スマホからの 1-click 購入用)
         # 4 分後に両方自動停止する cleanup プロセスも spawn
         BUY_TTL_SEC = 240  # 4 分
