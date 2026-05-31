@@ -87,6 +87,26 @@ def _deme_str(bet_type: str, cars: list) -> str:
     return sep.join(str(int(c)) for c in cars)
 
 
+def _parse_balance(text: str) -> dict:
+    """確認/完了画面テキストから残高を抽出。
+
+    例: 'ポイント残高\\n2,700pt' / '払戻金残高\\n2,200円'
+    返り値: {"points": int|None, "cash": int|None, "total": int|None}
+    total = points + cash (両方取れた時のみ、片方でも取れれば加算)。
+    """
+    import re as _re
+    out = {"points": None, "cash": None, "total": None}
+    mp = _re.search(r"ポイント残高\s*\n?\s*([\d,]+)\s*pt", text)
+    mc = _re.search(r"払戻金残高\s*\n?\s*([\d,]+)\s*円", text)
+    if mp:
+        out["points"] = int(mp.group(1).replace(",", ""))
+    if mc:
+        out["cash"] = int(mc.group(1).replace(",", ""))
+    if out["points"] is not None or out["cash"] is not None:
+        out["total"] = (out["points"] or 0) + (out["cash"] or 0)
+    return out
+
+
 def _deme_match(bet_type: str, exp_cars: list, actual_deme: str) -> bool:
     """GraphQL packDeme と期待出目を券種別に照合。
 
@@ -601,6 +621,12 @@ async def execute_buy(
                 print(f"[execute_purchase] body.innerText 取得失敗: {e}",
                       file=sys.stderr)
 
+            # 残高抽出 (確認画面に ポイント残高 / 払戻金残高 が出る)
+            balance = _parse_balance(page_text)
+            print(f"[execute_purchase] 残高: points={balance['points']} "
+                  f"cash={balance['cash']} total={balance['total']}",
+                  file=sys.stderr)
+
             # Codex 2 次 review: dry-run 用に body.innerText を保存
             # (regex の妥当性検証や画面表記の変化追跡に使う)
             try:
@@ -713,6 +739,7 @@ async def execute_buy(
                     "success": True,
                     "dry_run": True,
                     "url": page.url,
+                    "balance": balance,
                     "message": (
                         f"dry-run OK: 確認画面到達、{n_bets}組 合計¥{total_yen} "
                         f"({bets_desc}) 表示済"
@@ -948,6 +975,7 @@ async def execute_buy(
                 "success": True,
                 "dry_run": False,
                 "url": final_url,
+                "balance": balance,
                 "success_evidence": {
                     "history_ok": history_ok,
                     "history_match_info": history_match_info,

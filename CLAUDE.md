@@ -132,6 +132,8 @@ rt3 浜松 ROI 530% / 山陽 ROI 141%、rf3 浜松 ROI 330% / 山陽 ROI 185%。
 直前に厳格ガード (1日上限¥3000 / 当日損失-¥3000停止 / EV異常>10除外 / 連続失敗3回停止)
 を全通過した候補を `execute_purchase.py` で自動投票。state は `data/auto_buy_state.json`
 (atomic write・日次 reset)、**毎回 Gmail 即時通知 (券種・出目・金額を日本語で明記)**。
+残高警告: 投票後に確認画面から残高(ポイント+払戻金)を抽出し、合計が
+`AUTO_BUY_LOW_BALANCE_YEN` (デフォルト¥3000) 以下なら警告メール (1日1回、state で重複抑止)。
 2026-05-31 ユーザー要望で **`AUTO_BUY_ANYTIME=True` (デフォルト) = 時間帯制限なし常時発注**。
 False にすると夜間限定 (`AUTO_BUY_HOUR_START`/`END`、22-6時) に戻る。段階導入:
 Week1 `AUTO_BUY_DRY_RUN=True` (判定のみ) → Week2 複勝のみ live →

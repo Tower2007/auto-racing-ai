@@ -88,6 +88,8 @@ MAX_DAILY_AUTO_YEN = _env_int("MAX_DAILY_AUTO_YEN", 3000)
 DAILY_LOSS_STOP_YEN = _env_int("DAILY_LOSS_STOP_YEN", -3000)
 EV_ANOMALY_CAP = _env_float("EV_ANOMALY_CAP", 10.0)
 CONSECUTIVE_FAILURES_STOP = _env_int("CONSECUTIVE_FAILURES_STOP", 3)
+# 残高 (ポイント+払戻金 合計) がこれ以下になったら警告メール (1 日 1 回)
+AUTO_BUY_LOW_BALANCE_YEN = _env_int("AUTO_BUY_LOW_BALANCE_YEN", 3000)
 
 
 # ─── 時刻 / state ─────────────────────────────────────────────
@@ -270,8 +272,12 @@ def _notify(subject: str, body: str) -> None:
 
 
 def _run_execute_purchase(race_date: str, place_code: int, race_no: int,
-                          bets: list[dict]) -> tuple[bool, str]:
-    """execute_purchase.py を subprocess 実行 (実投票)。(success, detail)。"""
+                          bets: list[dict]) -> tuple[bool, str, dict | None]:
+    """execute_purchase.py を subprocess 実行 (実投票)。
+
+    返り値: (success, detail, balance)
+      balance = {"points","cash","total"} or None (確認画面から抽出)
+    """
     cmd = [
         sys.executable, str(EXECUTE_SCRIPT),
         "--race-date", race_date,
@@ -307,13 +313,45 @@ def _run_execute_purchase(race_date: str, place_code: int, race_no: int,
     else:
         detail = (out or (r.stderr or ""))[-300:]
 
+    # 残高 (execute_purchase が確認画面から抽出して返す)
+    balance = parsed.get("balance") if isinstance(parsed, dict) else None
+
     # returncode を主判定にする (0=happy path 完走=success:true、
     # 1=例外/検証失敗、2=引数不正)。parsed.success は sanity check。
     if r.returncode == 0:
         if parsed is not None and parsed.get("success") is False:
-            return False, detail
-        return True, detail
-    return False, detail
+            return False, detail, balance
+        return True, detail, balance
+    return False, detail, balance
+
+
+def _maybe_low_balance_alert(state: dict, balance: dict | None) -> None:
+    """残高 (ポイント+払戻金 合計) が AUTO_BUY_LOW_BALANCE_YEN 以下なら
+    警告メール。1 日 1 回まで (state["low_balance_alerted"] で重複抑止、
+    state は日次 reset)。"""
+    if not balance:
+        return
+    total = balance.get("total")
+    if total is None:
+        return
+    # 最新残高を state に記録 (週次等で参照可)
+    state["last_balance"] = balance
+    if total > AUTO_BUY_LOW_BALANCE_YEN:
+        return
+    if state.get("low_balance_alerted"):
+        return
+    state["low_balance_alerted"] = True
+    pts = balance.get("points")
+    cash = balance.get("cash")
+    _notify(
+        f"[AUTO-BUY] ⚠️ 残高警告 合計¥{total:,} (≤¥{AUTO_BUY_LOW_BALANCE_YEN:,})",
+        f"【残高低下警告】\n\n"
+        f"投票残高 (ポイント+払戻金) が ¥{total:,} まで低下しました。\n"
+        f"  ポイント残高: {pts if pts is not None else '?'} pt\n"
+        f"  払戻金残高:   ¥{cash if cash is not None else '?'}\n\n"
+        f"しきい値: ¥{AUTO_BUY_LOW_BALANCE_YEN:,}\n"
+        f"自動投票を続けるにはチャージを検討してください。\n"
+        f"(この警告は本日分は1回のみ。明日また低ければ再通知)")
 
 
 def run_auto_buy(candidates: list[dict],
@@ -375,7 +413,7 @@ def run_auto_buy(candidates: list[dict],
         # 実投票
         logger.info("[auto_buy][LIVE] %s 投票: %s (¥%d)",
                     race_label, bets_desc, amount)
-        success, detail = _run_execute_purchase(
+        success, detail, balance = _run_execute_purchase(
             c["race_date"], int(c["place_code"]), int(c["race_no"]), c["bets"])
         if success:
             state["spent_yen"] += amount
@@ -384,6 +422,8 @@ def run_auto_buy(candidates: list[dict],
         else:
             state["consecutive_failures"] += 1
             verdict = "failed"
+        # 残高低下警告 (ポイント+払戻金 合計 ≤ しきい値、1 日 1 回)
+        _maybe_low_balance_alert(state, balance)
         rec = {"race": race_label, "amount": amount, "verdict": verdict,
                "bets": bets_desc, "detail": detail[-200:],
                "timestamp": now.isoformat()}
