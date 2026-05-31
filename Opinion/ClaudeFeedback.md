@@ -4,6 +4,58 @@
 
 ---
 
+## 2026-05-31: 自動投票 Phase 1 実装完了報告 (家 PC → 出先 PC へ)
+
+出先 PC ブリーフ `Opinion/codex_briefs/2026-05-31_auto_buy_phase1.md` を家 PC の
+Claude が実装した。**ユーザー判断で段階導入は省略し、初日からフル稼働**にした。
+
+### 実装したもの
+
+- **`auto_buy.py`** 新規。`daily_predict.py` の picks 確定後・メール送信前にフック
+  (例外は握り潰し継続 = click-to-buy を壊さない)。`AUTO_BUY_ENABLED=False` で完全 no-op。
+- **ガード** (`check_guards`、純粋関数): 1日上限 / 当日損失停止 / EV異常 / 連続失敗 /
+  (任意で)時間帯。全通過した候補のみ `execute_purchase.py --bets-json` を subprocess 実行。
+- **state**: `data/auto_buy_state.json` (atomic write・日次 reset・gitignore)。
+- **Gmail 即時通知**: 投票/skip/失敗ごと。件名・本文に券種・出目・金額を日本語明記
+  (`format_bets_jp`: 例「複勝 5号 ¥300 / 三連単 5→6→7 ¥100 / 三連複 5=6=7 ¥100」)。
+- **tests/test_auto_buy_guards.py**: 10/10 緑 (pytest 不要、`python` 直実行可)。
+
+### ブリーフからの差分 (ユーザー指示で変更)
+
+1. **段階導入を省略** — Week1/2/3 を踏まず、最初から
+   `DRY_RUN=false` + `INCLUDE_RT3=true` (三連系含む) でフル稼働。
+2. **時間帯制限を撤廃** — `AUTO_BUY_ANYTIME=true` (新規フラグ、デフォ true) で
+   夜間限定をやめ常時発注。`false` にすれば従来の 22-6時 夜間限定に戻せる。
+3. **当日損失停止を -1500 → -2000** に (1日上限¥2000 と同額 = 上限使い切るまで継続)。
+
+### 現在の本番設定 (.env、家 PC)
+
+```
+AUTO_BUY_ENABLED=true / DRY_RUN=false / INCLUDE_RT3=true / ANYTIME=true
+MAX_DAILY_AUTO_YEN=2000 / DAILY_LOSS_STOP_YEN=-2000 / EV_ANOMALY_CAP=10 / FAILURES_STOP=3
+```
+
+→ 各レース -4分の `AutoraceDyn` 発火で daily_predict が候補を出すと自動実投票。
+   全場=複勝(推奨額)、浜松・山陽 EV≥1.80=複勝+三連単+三連複(各¥100)。
+
+### 前提となる本番テスト実績 (2026-05-30)
+
+- 三連系まとめ買い click-to-buy を浜松 R7 で本番テスト成功 (¥500 投票受付完了)。
+- その過程で execute_purchase の不具合 2 件を実戦で発見・修正:
+  - カートクリア: 全削除後の HTML モーダル「ベット削除」の OK ボタン押下が必要だった
+  - GraphQL 照合: 三連複 BOX 投票は packDeme が `567=567=567` 表記 → 集合比較に修正
+
+### 出先 PC への申し送り / 残課題
+
+- **三連系の機械的停止基準** (docs/ev_strategy_findings.md 2026-05-31) は **未実装**。
+  weekly_status.py への組み込みは別途必要 (n=10 以降で停止条件①〜④を評価)。
+- 運用上の注意: execute_purchase は headless=false で Chrome を開く → PC 起動&ログイン
+  必須。同分に複数場レースが重なるとカート/プロファイル競合の理論リスクあり (per-race
+  発火で通常は非同時)。
+- 止める時は `.env` の `AUTO_BUY_ENABLED=false`。
+
+---
+
 ## 2026-05-14: finished フラグ revert + target_definition_version 導入
 
 ### 決定: DQ/落車を学習から除外 (旧条件に revert)
