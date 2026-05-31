@@ -125,7 +125,7 @@ rt3 浜松 ROI 530% / 山陽 ROI 141%、rf3 浜松 ROI 330% / 山陽 ROI 185%。
 
 自動投票 Phase 1 (2026-05-31 導入、`auto_buy.py`): 機会損失対策の自動発注。
 `AUTO_BUY_ENABLED` (デフォルト OFF) が True の時のみ、daily_predict のメール送信
-直前に厳格ガード (1日上限¥2000 / 当日損失-¥2000停止 / EV異常>10除外 / 連続失敗3回停止)
+直前に厳格ガード (1日上限¥3000 / 当日損失-¥3000停止 / EV異常>10除外 / 連続失敗3回停止)
 を全通過した候補を `execute_purchase.py` で自動投票。state は `data/auto_buy_state.json`
 (atomic write・日次 reset)、**毎回 Gmail 即時通知 (券種・出目・金額を日本語で明記)**。
 2026-05-31 ユーザー要望で **`AUTO_BUY_ANYTIME=True` (デフォルト) = 時間帯制限なし常時発注**。
