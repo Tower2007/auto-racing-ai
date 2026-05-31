@@ -12,8 +12,9 @@
 設計:
 - 中間モデル(オッズあり・試走なし、AUC 0.80)
 - 校正: isotonic regression(walk-forward 予測で fit 済み)
-- 選別: 各レースで予測 top-1 車 × ev_avg_calib >= thr(default 2.00、
-  2026-05-31 ev_threshold_sweep で ROI/頑健性の最適点として 1.50→2.00 に変更)
+- 選別: 各レースで予測 top-1 車 × ev_avg_calib >= thr(default 1.50)
+  ※ 2026-05-31 ev_threshold_sweep で 2.00 (ROI効率185%) も検討したが、総利益と
+    賭け機会(本数)を優先して 1.50 (ROI136%・総利益¥68,510・〜2.5本/日) を維持。
 - 出力: ログ + メール(候補ありの場合のみ)
 - --time-slot: Hold/Today の liveStartTime に応じて --venues を動的フィルタ
   morning=<13:00, noon=13:00-17:00, evening=>=17:00。山陽の開催形態
@@ -1086,7 +1087,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--venues", type=int, nargs="+", required=True)
     p.add_argument("--date", type=str, default=None, help="YYYY-MM-DD (default: 今日)")
-    p.add_argument("--thr", type=float, default=2.00)
+    p.add_argument("--thr", type=float, default=1.50)
     p.add_argument("--no-email", action="store_true")
     p.add_argument("--time-label", type=str, default=None,
                    help="メール件名・ログ用ラベル(default: venues / slot から自動)")

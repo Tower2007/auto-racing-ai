@@ -109,10 +109,10 @@ reports/               # 各種分析レポート(commit 対象)
 - 問題: 09:00 はオッズ未公開 → 10:00 に変更 → それでも morning slot 後半 R(11:00–13:00 開始)で odds 薄く NaN → 取りこぼし発生
 - 動的方式に置換。`AutoraceMorningPredict` / `NoonPredict` / `EveningPredict` は 動的稼働確認後に disable / 削除予定
 
-戦略仕様: `docs/ev_strategy_findings.md` 参照(thr=2.00、中間モデル、複勝 top-1)。
+戦略仕様: `docs/ev_strategy_findings.md` 参照(thr=1.50、中間モデル、複勝 top-1)。
 EV 閾値は 2026-05-31 の `scripts/ev_threshold_sweep.py` (walk-forward 25ヶ月) で
-1.50→2.00 に変更。thr=2.00 は ROI 185% / 全25ヶ月プラス(月最小119%) / n=717 と
-ROI と頑健性のバランス点 (1.50 は ROI 136%、3.00 は ROI 297% だが n=202 で下振れ大)。
+2.00 (ROI効率185%・〜1本/日) も検討したが、総利益(¥68,510 > ¥60,930)と賭け機会
+(〜2.5本/日)を優先して **1.50 を維持** (ROI 136%・全25ヶ月プラス)。
 レポート: `reports/ev_threshold_sweep_2026-05-31.md`。
 三連系 (rt3 + rf3) 推奨: 浜松(4) + 山陽(6) 限定、ev_avg_calib >= 1.80 で pred top-3 の
 三連単 1 点 + 三連複 1 点を追加推奨 (2026-05-29 導入、paper 記録 `data/rt3_paper.csv`)。
