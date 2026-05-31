@@ -202,11 +202,15 @@ def build_month_data(start: dt.date, end: dt.date,
     v_venues = virtual_by_venue(v_sub)
 
     # 実購入
+    a_sub = None
     if summary is not None:
         a_sub = _filter_month_actual(summary, start, end)
-        a_summary = bh._agg(a_sub) if (a_sub is not None and not a_sub.empty) \
-            else {"n": 0, "bet": 0, "refund": 0, "profit": 0, "roi": 0.0}
-        a_venues = bh.by_venue(a_sub) if (a_sub is not None and not a_sub.empty) else []
+        if a_sub is not None and not a_sub.empty:
+            a_summary = bh._agg(a_sub)
+            a_venues = bh.by_venue(a_sub)
+        else:
+            a_summary = {"n": 0, "bet": 0, "refund": 0, "profit": 0, "roi": 0.0}
+            a_venues = []
     else:
         a_summary = {"n": 0, "bet": 0, "refund": 0, "profit": 0, "roi": 0.0}
         a_venues = []
@@ -216,25 +220,54 @@ def build_month_data(start: dt.date, end: dt.date,
     else:
         bet_types = []
 
-    # レース別 推奨ピック (当月)
-    race_rows = []
+    # 実購入を (date, place_code, race_no) でレース単位に集約 (複数券種は合算)
+    actual_by_race: dict[tuple, dict] = {}
+    if a_sub is not None and not a_sub.empty:
+        for _, r in a_sub.iterrows():
+            key = (r["date"].isoformat() if hasattr(r["date"], "isoformat")
+                   else str(r["date"]), int(r["place_code"]), int(r["race_no"]))
+            acc = actual_by_race.setdefault(key, {"bet": 0, "return": 0, "profit": 0})
+            acc["bet"] += int(r.get("bet_amount", 0) or 0)
+            acc["return"] += int(r.get("refund_amount", 0) or 0)
+            acc["profit"] += int(r.get("profit", 0) or 0)
+
+    # レース別: 推奨ピックと実購入をマージ (どちらか一方しか無い R も含める)
+    rows_by_key: dict[tuple, dict] = {}
     if v_sub is not None and not v_sub.empty:
-        cols = v_sub.sort_values(["race_date", "place_code", "race_no"])
-        for _, r in cols.iterrows():
+        for _, r in v_sub.iterrows():
+            key = (r["race_date"].date().isoformat(), int(r["place_code"]),
+                   int(r["race_no"]))
             if r["has_result"]:
                 result = "的中" if r["hit"] else "外"
             else:
                 result = "結果待ち"
-            race_rows.append({
-                "race_date": r["race_date"].date().isoformat(),
+            rows_by_key[key] = {
+                "race_date": key[0],
                 "venue": r.get("venue", VENUE_NAMES.get(int(r["place_code"]), "?")),
-                "race_no": int(r["race_no"]),
+                "race_no": key[2],
                 "car_no": int(r["car_no"]),
                 "ev": float(r.get("ev_avg_calib", 0) or 0),
                 "result": result,
-                "payout": int(round(float(r.get("payout", 0) or 0))),
-                "profit": (int(round(float(r["payout"]) - BET)) if r["has_result"] else 0),
-            })
+                "v_profit": (int(round(float(r["payout"]) - BET))
+                             if r["has_result"] else None),
+                "a_bet": None, "a_return": None, "a_profit": None,
+            }
+    # 実購入をマージ (推奨が無い R は推奨側を空欄で行追加)
+    for key, acc in actual_by_race.items():
+        row = rows_by_key.get(key)
+        if row is None:
+            row = {
+                "race_date": key[0],
+                "venue": VENUE_NAMES.get(key[1], str(key[1])),
+                "race_no": key[2], "car_no": None, "ev": None,
+                "result": "(推奨外)", "v_profit": None,
+                "a_bet": None, "a_return": None, "a_profit": None,
+            }
+            rows_by_key[key] = row
+        row["a_bet"] = acc["bet"]
+        row["a_return"] = acc["return"]
+        row["a_profit"] = acc["profit"]
+    race_rows = [rows_by_key[k] for k in sorted(rows_by_key)]
 
     return {"virtual": v_summary, "v_venues": v_venues,
             "actual": a_summary, "a_venues": a_venues,
@@ -332,11 +365,21 @@ def render_text(month_label: str, data: dict, v_trend: list, a_trend: list,
 
     L.append("【レース別 推奨と結果 (当月)】")
     if not data["race_rows"]:
-        L.append("  推奨ピックなし")
+        L.append("  推奨/購入なし")
     for r in data["race_rows"]:
+        car = f"車{r['car_no']}" if r["car_no"] is not None else "  - "
+        ev = f"EV{r['ev']:.2f}" if r["ev"] is not None else "EV  - "
+        vp = f"仮想{r['v_profit']:+,}円" if r["v_profit"] is not None else "仮想    - "
+        if r["a_bet"] is not None:
+            ap = f"実購入{r['a_profit']:+,}円(投{r['a_bet']:,}/戻{r['a_return']:,})"
+        else:
+            ap = "実購入 -"
         L.append(f"  {r['race_date']} {r['venue']:8s} R{r['race_no']:<2d} "
-                 f"車{r['car_no']} EV{r['ev']:.2f} {r['result']:6s} "
-                 f"仮想{r['profit']:+,}円")
+                 f"{car} {ev} {r['result']:7s} {vp:<12s} {ap}")
+    if data["race_rows"]:
+        tv = sum(r["v_profit"] or 0 for r in data["race_rows"])
+        ta = sum(r["a_profit"] or 0 for r in data["race_rows"])
+        L.append(f"  合計: 仮想{tv:+,}円 / 実購入{ta:+,}円")
     L.append("")
 
     L.append("【通算収支 (全期間)】")
@@ -435,25 +478,36 @@ def render_html(month_label: str, data: dict, v_trend: list, a_trend: list,
                 f'<td>{_color_profit_html(y["profit"]) if y else "—"}</td></tr>')
         out.append('</tbody></table>')
 
-    # E. レース別 推奨と結果
+    # E. レース別 推奨と結果 + 実購入
     out.append('<h3>レース別 推奨と結果 (当月)</h3>')
     if not data["race_rows"]:
-        out.append('<p>推奨ピックなし</p>')
+        out.append('<p>推奨/購入なし</p>')
     else:
         out.append('<table><thead><tr><th>日</th><th>場</th><th>R</th><th>車</th>'
-                   '<th>EV</th><th>結果</th><th>仮想損益</th></tr></thead><tbody>')
+                   '<th>EV</th><th>結果</th><th>仮想損益</th>'
+                   '<th>実購入投資</th><th>実購入損益</th></tr></thead><tbody>')
         for r in data["race_rows"]:
-            rc = {"的中": "#c00", "外": "#06c", "結果待ち": "#888"}.get(r["result"], "#444")
+            rc = {"的中": "#c00", "外": "#06c", "結果待ち": "#888",
+                  "(推奨外)": "#999"}.get(r["result"], "#444")
+            car = r["car_no"] if r["car_no"] is not None else "—"
+            ev = f'{r["ev"]:.2f}' if r["ev"] is not None else "—"
+            vp = _color_profit_html(r["v_profit"]) if r["v_profit"] is not None else "—"
+            abet = f'¥{r["a_bet"]:,}' if r["a_bet"] is not None else "—"
+            ap = _color_profit_html(r["a_profit"]) if r["a_profit"] is not None else "—"
             out.append(f'<tr><td>{r["race_date"][5:]}</td><td>{r["venue"]}</td>'
-                       f'<td>R{r["race_no"]}</td><td>{r["car_no"]}</td>'
-                       f'<td>{r["ev"]:.2f}</td>'
+                       f'<td>R{r["race_no"]}</td><td>{car}</td>'
+                       f'<td>{ev}</td>'
                        f'<td style="color:{rc};">{r["result"]}</td>'
-                       f'<td>{_color_profit_html(r["profit"])}</td></tr>')
-        tr_v = sum(r["profit"] for r in data["race_rows"])
+                       f'<td>{vp}</td><td>{abet}</td><td>{ap}</td></tr>')
+        tr_v = sum(r["v_profit"] or 0 for r in data["race_rows"])
+        tr_a = sum(r["a_profit"] or 0 for r in data["race_rows"])
         out.append('<tr style="background:#ffecec;font-weight:bold;">'
-                   '<td colspan="6">合計 (仮想・月次ROI)</td>'
+                   '<td colspan="6">合計</td>'
                    f'<td>{_color_profit_html(tr_v)}'
-                   f'<br><small style="color:#555;">ROI {_roi(v["roi"])}</small></td></tr>')
+                   f'<br><small style="color:#555;">仮想ROI {_roi(v["roi"])}</small></td>'
+                   '<td></td>'
+                   f'<td>{_color_profit_html(tr_a)}'
+                   f'<br><small style="color:#555;">実ROI {_roi(a["roi"] if a["bet"] else None)}</small></td></tr>')
         out.append('</tbody></table>')
 
     # F. 通算
@@ -490,7 +544,7 @@ def write_csv(month_label: str, data: dict) -> Path:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     path = REPORT_DIR / f"monthly_{month_label}.csv"
     fields = ["race_date", "venue", "race_no", "car_no", "ev", "result",
-              "payout", "profit"]
+              "v_profit", "a_bet", "a_return", "a_profit"]
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
