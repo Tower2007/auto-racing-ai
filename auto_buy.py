@@ -281,16 +281,34 @@ def _run_execute_purchase(race_date: str, place_code: int, race_no: int,
         )
     except subprocess.TimeoutExpired:
         return False, "timeout >180s"
-    # stdout 最終行の JSON を解釈
-    out = (r.stdout or "").strip().splitlines()
-    detail = out[-1] if out else (r.stderr or "")[-300:]
-    if r.returncode == 0:
+
+    # execute_purchase は stdout に結果 JSON を indent=2 で複数行出力する。
+    # → 最終行 ('}') だけでなく stdout 全体 / 最後の {...} ブロックを解釈する。
+    out = (r.stdout or "").strip()
+    parsed = None
+    if out:
         try:
-            j = json.loads(out[-1])
-            return bool(j.get("success")), detail
+            parsed = json.loads(out)
         except Exception:
-            return False, f"出力 parse 失敗: {detail}"
-    return False, detail[-300:]
+            i, j = out.find("{"), out.rfind("}")
+            if i != -1 and j > i:
+                try:
+                    parsed = json.loads(out[i:j + 1])
+                except Exception:
+                    parsed = None
+    # detail: 成否メッセージ (parse 出来れば message/error、無ければ末尾)
+    if parsed is not None:
+        detail = str(parsed.get("message") or parsed.get("error") or parsed)[:300]
+    else:
+        detail = (out or (r.stderr or ""))[-300:]
+
+    # returncode を主判定にする (0=happy path 完走=success:true、
+    # 1=例外/検証失敗、2=引数不正)。parsed.success は sanity check。
+    if r.returncode == 0:
+        if parsed is not None and parsed.get("success") is False:
+            return False, detail
+        return True, detail
+    return False, detail
 
 
 def run_auto_buy(candidates: list[dict],
