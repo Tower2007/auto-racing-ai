@@ -875,8 +875,8 @@ with st.sidebar:
     )
     recommend_thr = st.number_input(
         "💎 購入推奨 EV 閾値",
-        min_value=1.0, max_value=3.0, value=1.50, step=0.05,
-        help="top1 の ev_avg_calib がこの値以上で「💎 推奨」を表示。本番運用は 1.50。",
+        min_value=1.0, max_value=3.0, value=2.00, step=0.05,
+        help="top1 の ev_avg_calib がこの値以上で「💎 推奨」を表示。本番運用は 2.00 (2026-05-31〜)。",
     )
     # 結果表示 checkbox はリプレイ専用 (ライブでは未走 R が結果なし、
     # 確定済 R は別ロジックで表示するため checkbox を出しても意味無し)
@@ -1572,5 +1572,5 @@ else:
 st.markdown("---")
 st.caption(
     "⚠️ エンタメ用途。控除率 25% のため長期 ROI は 80% 前後 (=月10%程度の損失)。"
-    "ガチ勝負は本番運用 (top1 + EV>=1.50 + 複勝) を使うこと。"
+    "ガチ勝負は本番運用 (top1 + EV>=2.00 + 複勝) を使うこと。"
 )
