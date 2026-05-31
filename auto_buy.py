@@ -254,11 +254,16 @@ def build_bets(car_no: int, rec_yen: int,
 # ─── 実行 ─────────────────────────────────────────────────────
 
 def _notify(subject: str, body: str) -> None:
-    """Gmail 即時通知。AUTO_BUY_NOTIFY_TO 優先、無ければ MAIL_TO。"""
+    """Gmail 即時通知。AUTO_BUY_NOTIFY_TO 優先、無ければ MAIL_TO。
+
+    件名は他の通知と揃えて [autorace] を前置する。
+    """
     try:
         from gmail_notify import send_email
         to = os.environ.get("AUTO_BUY_NOTIFY_TO", "").strip()
         recipients = [a.strip() for a in to.split(",") if a.strip()] or None
+        if not subject.startswith("[autorace]"):
+            subject = f"[autorace] {subject}"
         send_email(subject=subject, body=body, recipients=recipients)
     except Exception as e:
         logger.error("auto_buy Gmail 通知失敗: %s", e)
