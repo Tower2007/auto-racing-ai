@@ -67,6 +67,14 @@ EXPECTED_VOTES_CSV = DATA / "expected_votes.csv"  # 場×R別 typical 票数 →
 RT3_ELIGIBLE_PLACES = {4, 6}  # 浜松, 山陽
 RT3_THR = 1.80
 RT3_PAPER_LOG = DATA / "rt3_paper.csv"
+# weekly_status の停止基準が発動すると書かれる kill-switch。
+# 存在する間は三連系まとめ買い(購入)を停止 (複勝・参考メール表示は継続)。
+RT3_STOP_FLAG = DATA / "rt3_stop.flag"
+
+
+def rt3_buy_active() -> bool:
+    """三連系まとめ買い(購入)が現在有効か。フラグ ON なら停止。"""
+    return RT3_BUY_ENABLED and not RT3_STOP_FLAG.exists()
 # 三連系まとめ買い (複勝+三連単+三連複 を 1 ボタンで購入) の click-to-buy 有効化フラグ。
 # 2026-05-30: 浜松 R7 で本番テスト成功 (複勝5¥300 + 三連単5-6-7¥100 +
 # 三連複5=6=7¥100 = ¥500 投票受付完了) を確認し True に。
@@ -732,7 +740,7 @@ def render_html(picks: pd.DataFrame, today: str, time_label: str, thr: float,
                 try:
                     pc = int(r["place_code"])
                     rno = int(r["race_no"])
-                    rt3_ref = rt3_lookup.get((pc, rno)) if RT3_BUY_ENABLED else None
+                    rt3_ref = rt3_lookup.get((pc, rno)) if rt3_buy_active() else None
                     base_payload = {
                         "race_date": today,
                         "place_code": pc,
@@ -1275,13 +1283,17 @@ def main():
                     (int(r["place_code"]), int(r["race_no"])): r
                     for r in rt3_refs
                 }
+                # 停止フラグ ON 時は三連系を自動投票に含めない (複勝のみ)
+                _ab_include_rt3 = (auto_buy.AUTO_BUY_INCLUDE_RT3
+                                   and rt3_buy_active())
                 candidates = []
                 for _, r in picks.iterrows():
                     pc = int(r["place_code"])
                     rno = int(r["race_no"])
                     rec_yen = recommended_bet_yen(pc, rno)
                     bets = auto_buy.build_bets(
-                        int(r["car_no"]), rec_yen, rt3_map.get((pc, rno)))
+                        int(r["car_no"]), rec_yen, rt3_map.get((pc, rno)),
+                        include_rt3=_ab_include_rt3)
                     candidates.append({
                         "race_date": target_date,
                         "place_code": pc,

@@ -45,10 +45,17 @@ MAX_DAILY_AUTO_YEN=2000 / DAILY_LOSS_STOP_YEN=-2000 / EV_ANOMALY_CAP=10 / FAILUR
   - カートクリア: 全削除後の HTML モーダル「ベット削除」の OK ボタン押下が必要だった
   - GraphQL 照合: 三連複 BOX 投票は packDeme が `567=567=567` 表記 → 集合比較に修正
 
-### 出先 PC への申し送り / 残課題
+### 残課題の解決 (同日追記)
 
-- **三連系の機械的停止基準** (docs/ev_strategy_findings.md 2026-05-31) は **未実装**。
-  weekly_status.py への組み込みは別途必要 (n=10 以降で停止条件①〜④を評価)。
+- **三連系の機械的停止基準を実装完了** (`weekly_status.py:check_3point_health`)。
+  停止条件①初期下振れ(10<=n<=30 で ROI<50%) / ②絶対損失(≤-¥5000) を concrete 評価、
+  ③drift逆転 / ④失格率増加は best-effort (n/データ不足時は未評価)。①②④発動で
+  `data/rt3_stop.flag` を書き、`daily_predict.rt3_buy_active()` と auto_buy が参照して
+  三連系購入を自動停止 (複勝・参考表示は継続)。n<10 はノイズ規律で評価保留。
+  週次メールに三連系セクション + subject に 🛑RT3停止 タグ。再開は flag 削除。
+  現状 n=3 で全条件 INFO/OK (停止なし)。
+
+### 出先 PC への申し送り (残り)
 - 運用上の注意: execute_purchase は headless=false で Chrome を開く → PC 起動&ログイン
   必須。同分に複数場レースが重なるとカート/プロファイル競合の理論リスクあり (per-race
   発火で通常は非同時)。

@@ -330,6 +330,224 @@ def check_bet_history_health(days: int = 7) -> dict:
     return out
 
 
+# ─── 三連系 (rt3+rf3) 機械的停止基準 (docs/ev_strategy_findings.md 2026-05-31) ──
+
+RT3_STOP_FLAG = DATA / "rt3_stop.flag"   # 存在すると daily_predict/auto_buy が三連系購入を停止
+RT3_BET_TYPES = ("rt3", "rf3")
+RT3_PLACES = (4, 6)                      # 浜松・山陽
+RT3_EVAL_MIN_N = 10                      # n<10 は損益をノイズ扱い (評価開始しない)
+RT3_EARLY_WINDOW_N = 30                  # ① 初期下振れ停止の評価窓 (n<=30)
+RT3_EARLY_ROI_FLOOR = 0.50               # ① ROI < 50% で停止
+RT3_ABS_LOSS_STOP = -5000                # ② 絶対損失 ≤ -¥5000 で停止
+
+
+def check_3point_health() -> dict:
+    """三連系まとめ買い (浜松・山陽 rt3+rf3) の機械的停止基準を評価。
+
+    停止条件 (docs/ev_strategy_findings.md 2026-05-31):
+      ① 初期下振れ: 10<=n<=30 で 累積 ROI < 50%
+      ② 絶対損失:  三連系累積損失 ≤ -¥5,000 (n 問わずリアルタイム)
+      ③ drift 逆転: live ROI が backtest の 30% 未満を 30 picks 連続 (n>=30 必要)
+      ④ 失格増加:  浜松・山陽 失格率が 6ヶ月平均の 1.5 倍超が 2ヶ月連続
+    ①② を concrete 評価し、いずれか発動で stop。③④ は n / データ不足時は「未評価」。
+
+    n<10 は評価開始せず (個別 R 損益はノイズ規律)。
+    発動時は RT3_STOP_FLAG を書き出し、daily_predict/auto_buy が三連系購入を停止
+    (複勝・参考メール表示は継続)。
+    """
+    out: dict = {
+        "n_picks": 0, "invest": 0, "payout": 0, "profit": 0, "roi": None,
+        "conditions": [],          # [(id, level, msg)]
+        "triggered": False, "stop_reason": None,
+        "flag_exists": RT3_STOP_FLAG.exists(),
+    }
+    detail_p = DATA / "bet_history_detail.csv"
+    if not (detail_p.exists() and detail_p.stat().st_size > 0):
+        out["conditions"].append(("-", "INFO", "bet_history_detail.csv なし — 三連系未評価"))
+        return out
+    try:
+        df = pd.read_csv(detail_p)
+    except Exception as e:
+        out["conditions"].append(("-", "WARN", f"detail 読込失敗: {e}"))
+        return out
+
+    need = {"bet_type_code", "place_code", "vote_amount", "hit_amount",
+            "date", "race_no"}
+    if not need.issubset(df.columns):
+        out["conditions"].append(("-", "INFO", "detail に必要列なし — 三連系未評価"))
+        return out
+
+    sub = df[df["bet_type_code"].isin(RT3_BET_TYPES)
+             & df["place_code"].astype(int).isin(RT3_PLACES)].copy()
+    if sub.empty:
+        out["conditions"].append(("-", "INFO", "三連系の購入実績なし — 未評価"))
+        return out
+
+    out["n_picks"] = int(
+        sub[["date", "place_code", "race_no"]].drop_duplicates().shape[0])
+    out["invest"] = int(sub["vote_amount"].fillna(0).astype(float).sum())
+    out["payout"] = int(sub["hit_amount"].fillna(0).astype(float).sum())
+    out["profit"] = out["payout"] - out["invest"]
+    out["roi"] = (out["payout"] / out["invest"]) if out["invest"] > 0 else None
+
+    n = out["n_picks"]
+    roi = out["roi"]
+
+    # ② 絶対損失停止 (n 問わず)
+    if out["profit"] <= RT3_ABS_LOSS_STOP:
+        out["conditions"].append((
+            "②", "NG",
+            f"絶対損失停止: 累積損失 ¥{out['profit']:,} ≤ ¥{RT3_ABS_LOSS_STOP:,}"))
+        out["triggered"] = True
+        out["stop_reason"] = f"②絶対損失 ¥{out['profit']:,}"
+
+    # 評価開始は n>=10
+    if n < RT3_EVAL_MIN_N:
+        out["conditions"].append((
+            "①", "INFO",
+            f"n={n} < {RT3_EVAL_MIN_N} → 初期下振れ評価は保留 (ノイズ規律)"))
+    else:
+        # ① 初期下振れ停止 (10<=n<=30 で ROI<50%)
+        if n <= RT3_EARLY_WINDOW_N:
+            if roi is not None and roi < RT3_EARLY_ROI_FLOOR:
+                out["conditions"].append((
+                    "①", "NG",
+                    f"初期下振れ停止: n={n} 累積 ROI {roi*100:.0f}% "
+                    f"< {RT3_EARLY_ROI_FLOOR*100:.0f}%"))
+                out["triggered"] = True
+                if not out["stop_reason"]:
+                    out["stop_reason"] = f"①初期下振れ ROI {roi*100:.0f}%"
+            else:
+                out["conditions"].append((
+                    "①", "OK",
+                    f"初期下振れ OK: n={n} ROI {roi*100:.0f}% "
+                    f">= {RT3_EARLY_ROI_FLOOR*100:.0f}%"))
+        else:
+            out["conditions"].append((
+                "①", "INFO", f"n={n} > {RT3_EARLY_WINDOW_N} → ①窓外 (③へ移行)"))
+
+    # ③ drift 逆転 (n>=30 必要、live vs close EV は別途。現状は未評価)
+    if n < RT3_EARLY_WINDOW_N:
+        out["conditions"].append((
+            "③", "INFO", f"drift 逆転: n={n} < {RT3_EARLY_WINDOW_N} で未評価"))
+    else:
+        out["conditions"].append((
+            "③", "INFO",
+            "drift 逆転: live/close EV 比較は未実装 (要 odds_snapshots 連携)"))
+
+    # ④ 失格率増加 (浜松・山陽、月次 6ヶ月平均比) — best-effort
+    try:
+        dq = _check_3point_dq_rate()
+        out["conditions"].append(dq)
+        if dq[1] == "NG":
+            out["triggered"] = True
+            if not out["stop_reason"]:
+                out["stop_reason"] = "④失格率増加"
+    except Exception as e:
+        out["conditions"].append(("④", "INFO", f"失格率評価スキップ: {e}"))
+
+    return out
+
+
+def _check_3point_dq_rate() -> tuple:
+    """④ 浜松・山陽の失格率が 6ヶ月平均の 1.5 倍超の月が 2ヶ月連続か。
+
+    race_results.csv の accident_code (非空=事故/失格/欠車) を月次集計。
+    返り値: (id, level, msg)
+    """
+    res_p = DATA / "race_results.csv"
+    if not res_p.exists():
+        return ("④", "INFO", "race_results.csv なし — 失格率未評価")
+    cols = pd.read_csv(res_p, nrows=0).columns
+    acc_col = next((c for c in ("accident_code", "accidentCode") if c in cols), None)
+    if acc_col is None:
+        return ("④", "INFO", "accident 列なし — 失格率未評価")
+    df = pd.read_csv(res_p, usecols=["race_date", "place_code", acc_col])
+    df = df[df["place_code"].astype(int).isin(RT3_PLACES)].copy()
+    if df.empty:
+        return ("④", "INFO", "浜松・山陽の結果なし — 失格率未評価")
+    df["race_date"] = pd.to_datetime(df["race_date"], errors="coerce")
+    df = df.dropna(subset=["race_date"])
+    df["ym"] = df["race_date"].dt.to_period("M")
+    df["is_dq"] = df[acc_col].notna() & (df[acc_col].astype(str).str.strip() != "")
+    monthly = df.groupby("ym").agg(n=("is_dq", "size"), dq=("is_dq", "sum"))
+    monthly["rate"] = monthly["dq"] / monthly["n"].clip(lower=1)
+    if len(monthly) < 7:
+        return ("④", "INFO", f"月数 {len(monthly)} < 7 で 6ヶ月平均比 未評価")
+    monthly = monthly.sort_index()
+    recent2 = monthly.iloc[-2:]
+    base6 = monthly.iloc[-8:-2]["rate"].mean()
+    if base6 <= 0:
+        return ("④", "INFO", "6ヶ月平均失格率 0 — 比較不能")
+    over = (recent2["rate"] > base6 * 1.5).all()
+    msg = (f"失格率 直近2ヶ月 {recent2['rate'].mean()*100:.1f}% vs "
+           f"6ヶ月平均 {base6*100:.1f}% (x1.5={base6*1.5*100:.1f}%)")
+    return ("④", "NG" if over else "OK", msg)
+
+
+def write_rt3_stop_flag(reason: str) -> None:
+    """三連系購入の停止フラグを書き出す (daily_predict/auto_buy が参照)。"""
+    try:
+        DATA.mkdir(parents=True, exist_ok=True)
+        RT3_STOP_FLAG.write_text(
+            f"stopped_at={dt.datetime.now().isoformat(timespec='seconds')}\n"
+            f"reason={reason}\n"
+            f"# このファイルがあると三連系まとめ買い (rt3+rf3) を停止します。\n"
+            f"# 複勝と参考メール表示は継続。再開するにはこのファイルを削除。\n",
+            encoding="utf-8")
+    except Exception as e:
+        print(f"[weekly_status] rt3_stop.flag 書き込み失敗: {e}", file=sys.stderr)
+
+
+def render_3point_text(tp: dict) -> str:
+    if not tp:
+        return ""
+    lines = ["", "【🎯 三連系まとめ買い 停止基準監視 (浜松・山陽 rt3+rf3)】"]
+    if tp.get("flag_exists"):
+        lines.append("  🛑 停止フラグ ON (data/rt3_stop.flag) — 三連系購入は現在停止中")
+    roi = tp.get("roi")
+    lines.append(
+        f"  n={tp['n_picks']} / 投資 ¥{tp['invest']:,} / 払戻 ¥{tp['payout']:,} "
+        f"/ 損益 ¥{tp['profit']:,} / ROI "
+        + (f"{roi*100:.0f}%" if roi is not None else "—"))
+    for cid, level, msg in tp.get("conditions", []):
+        mark = {"NG": "🔴", "WARN": "🟡", "OK": "🟢", "INFO": "ℹ️"}.get(level, "")
+        lines.append(f"    {mark} [{cid}] {msg}")
+    if tp.get("triggered"):
+        lines.append(f"  🔴 停止発動: {tp['stop_reason']} → RT3 購入停止 "
+                     f"(複勝継続)。再開は data/rt3_stop.flag 削除。")
+    return "\n".join(lines)
+
+
+def render_3point_html(tp: dict) -> str:
+    if not tp:
+        return ""
+    roi = tp.get("roi")
+    flag_banner = (
+        '<p style="color:#c62828; font-weight:bold; margin:4px 0;">'
+        '🛑 停止フラグ ON (data/rt3_stop.flag) — 三連系購入は停止中</p>'
+        if tp.get("flag_exists") else "")
+    rows = []
+    for cid, level, msg in tp.get("conditions", []):
+        color = {"NG": "#c62828", "WARN": "#e65100",
+                 "OK": "#2e7d32", "INFO": "#666"}.get(level, "#444")
+        rows.append(f'<li style="color:{color}"><b>[{cid}] {level}</b>: {msg}</li>')
+    trig = (
+        f'<p style="color:#c62828; font-weight:bold;">🔴 停止発動: '
+        f'{tp["stop_reason"]} → RT3 購入停止 (複勝継続)。'
+        f'再開は data/rt3_stop.flag 削除。</p>' if tp.get("triggered") else "")
+    return (
+        '<h4 style="margin:14px 0 4px 0; font-size:13px;">'
+        '🎯 三連系まとめ買い 停止基準監視 (浜松・山陽 rt3+rf3)</h4>'
+        + flag_banner
+        + f'<p style="margin:2px 0; font-size:12px;">'
+        f'n={tp["n_picks"]} / 投資 ¥{tp["invest"]:,} / 払戻 ¥{tp["payout"]:,} '
+        f'/ 損益 <b>¥{tp["profit"]:,}</b> / ROI '
+        + (f'<b>{roi*100:.0f}%</b>' if roi is not None else "—") + '</p>'
+        + '<ul style="margin:4px 0 0 18px; font-size:12px;">'
+        + "".join(rows) + '</ul>' + trig)
+
+
 def check_schtasks_health() -> dict:
     """schtasks LastRunResult 監視(Codex R6 + R7 提案)。
 
@@ -1239,6 +1457,23 @@ def main() -> None:
     except Exception as e:
         text += f"\n\n(実購入損益スキップ: {e})"
 
+    # 三連系まとめ買い 停止基準監視 + 発動時 kill-switch
+    tp_health: dict = {}
+    try:
+        tp_health = check_3point_health()
+        text += "\n\n" + render_3point_text(tp_health)
+        tp_html = render_3point_html(tp_health)
+        html = html.replace(
+            '<hr style="border:none;',
+            tp_html + '\n<hr style="border:none;',
+            1,
+        )
+        if tp_health.get("triggered") and not tp_health.get("flag_exists"):
+            write_rt3_stop_flag(tp_health.get("stop_reason", "stop"))
+            text += "\n  → data/rt3_stop.flag を書き出しました (三連系購入を停止)。"
+    except Exception as e:
+        text += f"\n\n(三連系停止基準スキップ: {e})"
+
     print(text)
 
     if args.no_email:
@@ -1266,9 +1501,15 @@ def main() -> None:
     health_emoji = {"OK": "🟢", "WARN": "🟡", "NG": "🔴", "?": "❔"}.get(
         health_overall, "❔"
     )
+    rt3_tag = ""
+    if tp_health.get("triggered"):
+        rt3_tag = " 🛑RT3停止"
+    elif tp_health.get("flag_exists"):
+        rt3_tag = " 🛑RT3停止中"
     subject = (
         f"[autorace] 週次 {today} ingest={ingest_status} "
         f"health={health_emoji}{health_overall} (OK {ok_count}/{len(days)})"
+        f"{rt3_tag}"
     )
 
     send_email(subject=subject, body=text, html=html)
