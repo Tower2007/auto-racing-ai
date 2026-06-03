@@ -871,7 +871,7 @@ with st.sidebar:
         st.stop()
 
     bet_amount = st.number_input(
-        "1 券種あたり金額 (¥)", min_value=100, max_value=10000, value=100, step=100
+        "1 券種あたり金額 (¥)", min_value=100, max_value=10000, value=200, step=100
     )
     recommend_thr = st.number_input(
         "💎 購入推奨 EV 閾値",

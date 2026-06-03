@@ -107,12 +107,12 @@ _VOTES_LOOKUP = None
 
 def recommended_bet_yen(place_code: int, race_no: int) -> int:
     """場×R 別の推奨ベット額 (オッズ低下 ≦ 10%、100円単位)。
-    expected_votes.csv が無い or 行が無ければ ¥100 を返す。
+    expected_votes.csv が無い or 行が無ければ ¥200 を返す。
     """
     global _VOTES_LOOKUP
     if _VOTES_LOOKUP is None:
         _VOTES_LOOKUP = _load_votes_lookup()
-    return max(100, _VOTES_LOOKUP.get((place_code, race_no), 100))
+    return max(200, _VOTES_LOOKUP.get((place_code, race_no), 200))
 
 
 def cumulative_performance() -> dict | None:
@@ -556,7 +556,7 @@ def render_text(picks: pd.DataFrame, today: str, time_label: str, thr: float,
             f"  推奨¥{rec}"
         )
     lines.append("")
-    lines.append(f"計 {len(picks)} 候補 / 投資 ¥{len(picks)*100:,} (=¥100 均一)")
+    lines.append(f"計 {len(picks)} 候補 / 投資 ¥{len(picks)*200:,} (=¥200 均一)")
     lines.append(f"        推奨額合計 ¥{total_rec:,} (オッズ低下≦10% 目安、過去180日中央値ベース)")
     lines.append("")
     lines.append("【オッズ確認 / 投票】")
@@ -761,8 +761,8 @@ def render_html(picks: pd.DataFrame, today: str, time_label: str, thr: float,
                         base_payload["bets"] = [
                             {"type": "fns", "cars": [int(r["car_no"])],
                              "amount": rec_yen},
-                            {"type": "rt3", "cars": cars_ord, "amount": 100},
-                            {"type": "rf3", "cars": cars_srt, "amount": 100},
+                            {"type": "rt3", "cars": cars_ord, "amount": 200},
+                            {"type": "rf3", "cars": cars_srt, "amount": 200},
                         ]
                         btn_label = "💰 3点購入"
                     else:
@@ -1389,7 +1389,7 @@ def main():
                     f" [{', '.join(nan_races)}]" if nan_races else "")
         if not picks.empty:
             append_picks_log(picks, time_label)
-            logger.info("候補数: %d / 投資 ¥%d", len(picks), len(picks) * 100)
+            logger.info("候補数: %d / 投資 ¥%d", len(picks), len(picks) * 200)
         else:
             logger.info("候補なし")
 
