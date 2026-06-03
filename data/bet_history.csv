@@ -53,3 +53,10 @@ date,place_code,place_name,race_no,bet_amount,refund_amount,profit
 2026-05-30,4,hamamatsu,6,300,200,-100
 2026-05-30,4,hamamatsu,7,500,0,-500
 2026-05-30,4,hamamatsu,9,300,0,-300
+2026-05-31,4,hamamatsu,5,300,380,80
+2026-06-01,2,kawaguchi,2,100,100,0
+2026-06-01,5,iizuka,1,100,180,80
+2026-06-01,5,iizuka,5,100,100,0
+2026-06-02,5,iizuka,1,100,110,10
+2026-06-02,5,iizuka,2,100,100,0
+2026-06-02,5,iizuka,6,100,0,-100
