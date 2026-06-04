@@ -890,10 +890,11 @@ target_ts = pd.Timestamp(target_date)
 
 if is_live_mode:
     # API 再取得イベント: R 毎に発走 (-3min, 0min, +6min) の 3 タイミング。
-    # 0min = レース開始時、+6min = 結果反映待ち余裕込み。
+    # -2min = 自動発注発火タイミング (LEAD_MIN=2) に合わせた直前スナップショット。
+    # 0min = レース開始時、+5min = 結果反映待ち余裕込み。
     # 起動時・場所変更時・更新ボタンは別経路で fetch される (cache miss / 手動 clear)。
-    REFETCH_EVENTS_MIN = [-3, 0, 6]  # 発走時刻からのオフセット (分)
-    HOT_WINDOW_MIN = 5               # この範囲に最近イベントがあれば「ホット」帯
+    REFETCH_EVENTS_MIN = [-2, 0, 5]  # 発走時刻からのオフセット (分)
+    HOT_WINDOW_MIN = 4               # この範囲に最近イベントがあれば「ホット」帯
 
     # 更新ボタン
     col_btn, col_now = st.columns([1, 4])
@@ -996,7 +997,7 @@ if is_live_mode:
     with col_now:
         st.caption(
             f"⏰ {now.strftime('%H:%M')} ／ {rerun_caption}、"
-            f"各 R 発走 -3 / +1 / +5 min で API 再取得"
+            f"各 R 発走 -2 / 0 / +5 min で API 再取得"
         )
 
     valid_races = [r for r, info in live_data.items() if info["top_cars"]]
