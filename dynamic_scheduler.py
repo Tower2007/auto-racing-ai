@@ -33,11 +33,12 @@ LOG_FILE = DATA / "dynamic_scheduler.log"
 TASK_PREFIX = "AutoraceDyn_"
 DEFAULT_RACE_INTERVAL_MIN = 30  # liveEndTime 取得失敗時のフォールバック
 # 発走 LEAD_MIN 分前に発火。
-# 30→15→10→5→2→4 分前へ変遷。
+# 30→15→10→5→2→4→3 分前へ変遷。
 # 2 分前 (2026-05-14〜05-17): 処理+メール送信で締切ギリギリに到着する問題。
 # 4 分前に戻し near-miss retry を廃止することで、通知が締切 ~2 分前に安定到着。
-# drift は 5 分前 (-20%) より軽微と判断。
-LEAD_MIN = 4
+# 3 分前 (2026-06-04〜): retry 廃止済みのため安全。自動売買導入により1分前注文で
+# 十分だが締切超えリスクを避け3分に設定。オッズ鮮度は4分前より1分改善。
+LEAD_MIN = 3
 RACES_PER_DAY = 12
 # 最終R終了時刻 = R12 発走 + おおよそレース3分 + 払戻数分。
 # liveEndTime からこの分を差し引いて R12 発走時刻と扱う。
