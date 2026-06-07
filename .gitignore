@@ -67,3 +67,6 @@ data/*.har
 
 # 月次レポートの自動生成 CSV (regenerable)
 reports/monthly/
+
+# 出先 PC 専用 streamlit 常駐ランチャ
+_run_streamlit_app.cmd
