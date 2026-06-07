@@ -32,17 +32,20 @@ LOG_FILE = DATA / "dynamic_scheduler.log"
 
 TASK_PREFIX = "AutoraceDyn_"
 DEFAULT_RACE_INTERVAL_MIN = 30  # liveEndTime 取得失敗時のフォールバック
-# 発走 LEAD_MIN 分前に発火。
-# 30→15→10→5→2→4→3→2→3→4 分前へ変遷。
+# 発走 LEAD_MIN 分前に発火。場別に設定。
+# 30→15→10→5→2→4→3→2→3→4→場別 分前へ変遷。
 # 2 分前 (2026-05-14〜05-17): 処理+メール送信で締切ギリギリに到着する問題。
 # 4 分前に戻し near-miss retry を廃止することで、通知が締切 ~2 分前に安定到着。
 # 3 分前 (2026-06-04): retry 廃止済みのため安全。
 # 2 分前 (2026-06-04): 投票締切が発走 -2:30 のため、-2:00 発火では締切後ページになり失敗。
 # ※ 2026-06-06 確認: vote.autorace.jp の発注締切は発走 -2:30 (2分30秒前)。
-# 3 分前 (2026-06-05〜06-06): 発火〜締切が 30s のみ。RT3(複勝+三連単+三連複=3点)は
-#   Playwright 49〜57s かかるため締切後になり失敗(2026-06-07 山陽R3 で確認)。
-# 4 分前 (2026-06-07〜): 発火〜締切が 90s → RT3 でも余裕をもって完了可能。
-LEAD_MIN = 4
+# 3 分前 (2026-06-05〜06-06): RT3(複勝+三連単+三連複=3点)は Playwright 49〜57s かかり
+#   締切後になり失敗(2026-06-07 山陽R3 で確認)。
+# 場別 (2026-06-07〜): RT3 対象場(浜松/山陽)は 4 分前、他は 3 分前。
+LEAD_MIN_DEFAULT = 3          # 複勝 1点のみ(川口/伊勢崎/飯塚): 締切まで 60s 余裕あり
+LEAD_MIN_RT3_VENUES = 4       # RT3 対象場(浜松/山陽): Playwright ~58s のため締切まで 90s 確保
+# RT3 対象場コード (daily_predict.py RT3_ELIGIBLE_PLACES と同値)
+LEAD_MIN_VENUE_MAP = {4: LEAD_MIN_RT3_VENUES, 6: LEAD_MIN_RT3_VENUES}  # 浜松, 山陽
 RACES_PER_DAY = 12
 # 最終R終了時刻 = R12 発走 + おおよそレース3分 + 払戻数分。
 # liveEndTime からこの分を差し引いて R12 発走時刻と扱う。
@@ -313,7 +316,8 @@ def main() -> int:
             else:
                 skipped_other += 1
                 continue
-            fire_at = race_start - dt.timedelta(minutes=LEAD_MIN)
+            lead_min = LEAD_MIN_VENUE_MAP.get(pc, LEAD_MIN_DEFAULT)
+            fire_at = race_start - dt.timedelta(minutes=lead_min)
 
             if fire_at <= now + dt.timedelta(minutes=1):
                 skipped_past += 1
@@ -327,9 +331,9 @@ def main() -> int:
             )
 
             if register_one_shot(task_name, fire_at, command):
-                logging.info("registered %s @ %s (race=%s, %s)",
+                logging.info("registered %s @ %s (race=%s, lead=%dm, %s)",
                              task_name, fire_at.strftime("%H:%M"),
-                             race_start.strftime("%H:%M"), source)
+                             race_start.strftime("%H:%M"), lead_min, source)
                 registered += 1
 
     logging.info("=== dynamic_scheduler done: registered=%d skipped_past=%d skipped_other=%d ===",
