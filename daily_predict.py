@@ -62,11 +62,13 @@ SANYO_RF3_PAPER_LOG = DATA / "sanyo_rf3_paper.csv"  # 山陽 三連複 paper tra
 SANYO_PLACE_CODE = 6  # 山陽 (過去検証で rf3 のみ構造的 edge: 月勝率40% median84%)
 EXPECTED_VOTES_CSV = DATA / "expected_votes.csv"  # 場×R別 typical 票数 → 推奨ベット額算出
 
-# 三連系 (rt3 + rf3) 推奨: 浜松(4) + 山陽(6) 限定, ev_avg_calib >= 1.80
-# 過去検証 ev_3point_by_place (2026-05-29):
-#   浜松 thr=1.80: rt3 ROI 530% hit 8.0% / rf3 ROI 330% hit 25.6%
-#   山陽 thr=1.80: rt3 ROI 141% hit 9.1% / rf3 ROI 185% hit 30.7%
-RT3_ELIGIBLE_PLACES = {4, 6}  # 浜松, 山陽
+# 三連系推奨: ev_avg_calib >= 1.80 の場合に発動
+# 過去検証 ev_3point_by_place / ev_3point_policy_sim (2026-06-09 rt2_rf4 policy):
+#   RT3(三連単): 浜松 ROI 530% / 山陽 ROI 141%
+#   RF3(三連複): 伊勢崎 ROI 377% / 浜松 ROI 330% / 飯塚 ROI 114% / 山陽 ROI 185%
+#   → RT3=2場・RF3=4場 policy が ROI 202% と最高効率
+RT3_ELIGIBLE_PLACES = {4, 6}       # 三連単 購入対象: 浜松, 山陽
+RF3_ELIGIBLE_PLACES = {3, 4, 5, 6}  # 三連複 購入対象: 伊勢崎, 浜松, 飯塚, 山陽
 RT3_THR = 1.80
 RT3_PAPER_LOG = DATA / "rt3_paper.csv"
 # weekly_status の停止基準が発動すると書かれる kill-switch。
@@ -490,26 +492,36 @@ def predict_race(
 # ─── 通知 ─────────────────────────────────────────────────────
 
 def _render_rt3_text(refs: list[dict]) -> list[str]:
-    """三連系 (rt3 + rf3) 推奨セクション (text)。浜松 + 山陽限定。"""
+    """三連系 (rt3+rf3 or rf3 only) 推奨セクション (text)。
+    has_rt3=True: 浜松・山陽 → 三連単+三連複
+    has_rt3=False: 伊勢崎・飯塚 → 三連複のみ
+    """
     if not refs:
         return []
     lines = [
         "",
         "=" * 40,
-        "🎯 三連系 推奨 (浜松・山陽 限定, EV>=1.80)",
+        "🎯 三連系 推奨 発注 (浜松・山陽 限定, EV>=1.80)",
         "  rt3: 浜松 ROI 530% / 山陽 ROI 141%",
-        "  rf3: 浜松 ROI 330% / 山陽 ROI 185%",
+        "  rf3: 浜松 ROI 330% / 山陽 ROI 185% / 伊勢崎 ROI 377% / 飯塚 ROI 114%",
     ]
     for ref in refs:
-        rt3_odds = ref.get("rt3_odds")
+        has_rt3 = ref.get("has_rt3", True)
         rf3_odds = ref.get("rf3_odds")
-        rt3_str = f"{rt3_odds:.1f}倍" if rt3_odds else "(?)"
         rf3_str = f"{rf3_odds:.1f}倍" if rf3_odds else "(?)"
-        lines.append(
-            f"  {ref.get('venue_jp', '?')} R{ref['race_no']}: "
-            f"三連単 {ref.get('deme_rt3', '?')} {rt3_str} / "
-            f"三連複 {ref.get('deme_rf3', '?')} {rf3_str}"
-        )
+        if has_rt3:
+            rt3_odds = ref.get("rt3_odds")
+            rt3_str = f"{rt3_odds:.1f}倍" if rt3_odds else "(?)"
+            lines.append(
+                f"  {ref.get('venue_jp', '?')} R{ref['race_no']}: "
+                f"三連単 {ref.get('deme_rt3', '?')} {rt3_str} / "
+                f"三連複 {ref.get('deme_rf3', '?')} {rf3_str}"
+            )
+        else:
+            lines.append(
+                f"  {ref.get('venue_jp', '?')} R{ref['race_no']}: "
+                f"三連複 {ref.get('deme_rf3', '?')} {rf3_str} (RF3のみ)"
+            )
     lines.append("=" * 40)
     return lines
 
@@ -579,42 +591,59 @@ def render_text(picks: pd.DataFrame, today: str, time_label: str, thr: float,
 
 
 def _render_rt3_html(refs: list[dict], today: str) -> str:
-    """三連系 (rt3 + rf3) 推奨セクション (HTML)。浜松 + 山陽限定。"""
+    """三連系 推奨セクション (HTML)。
+    has_rt3=True(浜松・山陽): 三連単+三連複 / has_rt3=False(伊勢崎・飯塚): 三連複のみ
+    """
     if not refs:
         return ""
     rows_html = []
     for ref in refs:
-        rt3_odds = ref.get("rt3_odds")
+        has_rt3 = ref.get("has_rt3", True)
         rf3_odds = ref.get("rf3_odds")
-        rt3_str = f"{rt3_odds:.1f}倍" if rt3_odds else "(?)"
         rf3_str = f"{rf3_odds:.1f}倍" if rf3_odds else "(?)"
         venue = ref.get("venue", "")
         race_no = ref["race_no"]
         odds_url = (
             f"https://autorace.jp/race_info/Odds/{venue}/{today}/{race_no}"
         )
-        rows_html.append(
-            f'<tr>'
-            f'<td style="padding:4px 8px;">{ref.get("venue_jp", "?")}</td>'
-            f'<td style="padding:4px 8px;">R{race_no}</td>'
-            f'<td style="padding:4px 8px; font-weight:bold;">'
-            f'{ref.get("deme_rt3", "?")}</td>'
-            f'<td style="padding:4px 8px; color:#c62828;">{rt3_str}</td>'
-            f'<td style="padding:4px 8px; font-weight:bold;">'
-            f'{ref.get("deme_rf3", "?")}</td>'
-            f'<td style="padding:4px 8px; color:#1565c0;">{rf3_str}</td>'
-            f'<td style="padding:4px 8px;">'
-            f'<a href="{odds_url}" style="color:#1565c0;">オッズ</a></td>'
-            f'</tr>'
-        )
+        if has_rt3:
+            rt3_odds = ref.get("rt3_odds")
+            rt3_str = f"{rt3_odds:.1f}倍" if rt3_odds else "(?)"
+            rows_html.append(
+                f'<tr>'
+                f'<td style="padding:4px 8px;">{ref.get("venue_jp", "?")}</td>'
+                f'<td style="padding:4px 8px;">R{race_no}</td>'
+                f'<td style="padding:4px 8px; font-weight:bold;">'
+                f'{ref.get("deme_rt3", "?")}</td>'
+                f'<td style="padding:4px 8px; color:#c62828;">{rt3_str}</td>'
+                f'<td style="padding:4px 8px; font-weight:bold;">'
+                f'{ref.get("deme_rf3", "?")}</td>'
+                f'<td style="padding:4px 8px; color:#1565c0;">{rf3_str}</td>'
+                f'<td style="padding:4px 8px;">'
+                f'<a href="{odds_url}" style="color:#1565c0;">オッズ</a></td>'
+                f'</tr>'
+            )
+        else:
+            rows_html.append(
+                f'<tr>'
+                f'<td style="padding:4px 8px;">{ref.get("venue_jp", "?")}</td>'
+                f'<td style="padding:4px 8px;">R{race_no}</td>'
+                f'<td style="padding:4px 8px; color:#999;" colspan="2">—</td>'
+                f'<td style="padding:4px 8px; font-weight:bold;">'
+                f'{ref.get("deme_rf3", "?")}</td>'
+                f'<td style="padding:4px 8px; color:#1565c0;">{rf3_str}</td>'
+                f'<td style="padding:4px 8px;">'
+                f'<a href="{odds_url}" style="color:#1565c0;">オッズ</a></td>'
+                f'</tr>'
+            )
     return (
         '<div style="margin-top:16px; padding:10px 14px; '
         'background:#e8f5e9; border:1px solid #66bb6a; border-radius:6px; '
         'font-size:13px; color:#222;">'
-        '<b style="color:#2e7d32;">🎯 三連系 推奨 (浜松・山陽 限定, EV≥1.80)</b>'
+        '<b style="color:#2e7d32;">🎯 三連系 推奨 発注 (EV≥1.80)</b>'
         '<p style="margin:4px 0; font-size:12px; color:#555;">'
-        'rt3: 浜松 ROI 530% / 山陽 ROI 141% &nbsp;|&nbsp; '
-        'rf3: 浜松 ROI 330% / 山陽 ROI 185%</p>'
+        'rt3(三連単): 浜松 ROI 530% / 山陽 ROI 141% &nbsp;|&nbsp; '
+        'rf3(三連複): 伊勢崎 ROI 377% / 浜松 ROI 330% / 飯塚 ROI 114% / 山陽 ROI 185%</p>'
         '<table style="margin:4px 0; border-collapse:collapse;">'
         '<tr style="background:#c8e6c9; font-size:12px;">'
         '<th style="padding:4px 8px;">場</th>'
@@ -1253,20 +1282,29 @@ def main():
                     except Exception as e:
                         logger.warning("  山陽 rf3 参考生成失敗 R%d: %s", race_no, e)
 
-                # 浜松 + 山陽: 三連系 (rt3 + rf3) 推奨 (EV>=1.80, paper 記録)
-                if pc in RT3_ELIGIBLE_PLACES and top1_ev >= RT3_THR:
+                # RF3 対象場(伊勢崎/浜松/飯塚/山陽): 三連系推奨 (EV>=1.80, paper 記録)
+                # RT3(三連単)は浜松・山陽のみ、RF3(三連複)は4場全て
+                if pc in RF3_ELIGIBLE_PLACES and top1_ev >= RT3_THR:
                     try:
                         rt3_ref = build_rt3_reference(
                             client, df, target_date, race_no, pc)
                         if rt3_ref:
+                            # has_rt3: 三連単を購入するか(浜松・山陽のみ True)
+                            rt3_ref["has_rt3"] = pc in RT3_ELIGIBLE_PLACES
                             rt3_refs.append(rt3_ref)
                             append_rt3_paper(rt3_ref)
-                            logger.info(
-                                "  [3point] rt3 %s (%s) / rf3 %s (%s)",
-                                rt3_ref.get("deme_rt3"),
-                                rt3_ref.get("rt3_odds"),
-                                rt3_ref.get("deme_rf3"),
-                                rt3_ref.get("rf3_odds"))
+                            if rt3_ref["has_rt3"]:
+                                logger.info(
+                                    "  [3point] rt3 %s (%s) / rf3 %s (%s)",
+                                    rt3_ref.get("deme_rt3"),
+                                    rt3_ref.get("rt3_odds"),
+                                    rt3_ref.get("deme_rf3"),
+                                    rt3_ref.get("rf3_odds"))
+                            else:
+                                logger.info(
+                                    "  [rf3only] rf3 %s (%s)",
+                                    rt3_ref.get("deme_rf3"),
+                                    rt3_ref.get("rf3_odds"))
                     except Exception as e:
                         logger.warning("  3point 推奨生成失敗 R%d: %s", race_no, e)
 

@@ -241,14 +241,16 @@ def build_bets(car_no: int, rec_yen: int,
                include_rt3: bool = AUTO_BUY_INCLUDE_RT3) -> list[dict]:
     """自動投票用の bets list を構築。
 
-    複勝 (推奨額) を必ず含み、include_rt3 かつ rt3_ref があれば
-    三連単・三連複 (各¥100) を追加。render_html と同じ構成。
+    複勝 (推奨額) を必ず含み、include_rt3 かつ rt3_ref があれば三連系を追加。
+    rt3_ref["has_rt3"]=True(浜松・山陽): 三連単+三連複 を追加。
+    rt3_ref["has_rt3"]=False(伊勢崎・飯塚): 三連複のみ追加。
     """
     bets = [{"type": "fns", "cars": [int(car_no)], "amount": int(rec_yen)}]
     if include_rt3 and rt3_ref:
         cars_ord = [int(c) for c in rt3_ref["cars_ordered"]]
         cars_srt = [int(c) for c in rt3_ref["cars_sorted"]]
-        bets.append({"type": "rt3", "cars": cars_ord, "amount": 100})
+        if rt3_ref.get("has_rt3", True):  # 浜松・山陽: 三連単も追加
+            bets.append({"type": "rt3", "cars": cars_ord, "amount": 100})
         bets.append({"type": "rf3", "cars": cars_srt, "amount": 100})
     return bets
 
