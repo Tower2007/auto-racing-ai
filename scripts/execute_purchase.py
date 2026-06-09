@@ -674,12 +674,25 @@ async def execute_buy(
                     _re.escape(lbl),
                     f"券種 {lbl} が確認画面に無い",
                 ))
-                # 出目の各車番が確認画面テキストに含まれるか (緩め: 桁の存在のみ)
-                for c in b["cars"]:
+                # 出目の各車番が確認画面テキストに含まれるか
+                # rf3 (三連複 BOX): 確認画面では車番が "567" と連結表示されるため
+                #   \b5\b / \b6\b は "567" 内で word boundary が取れず NG になる。
+                #   ソート済み連結文字列 ("567") がテキストに含まれるかで代替。
+                # fns / rt3: 車番が単独 or 着順ハイフン区切りで表示されるので \b OK。
+                if b["type"] == "rf3":
+                    sorted_deme = "".join(
+                        str(c) for c in sorted(int(x) for x in b["cars"])
+                    )
                     checks.append((
-                        rf"\b{int(c)}\b",
-                        f"{lbl} の車番 {int(c)} 表示確認失敗",
+                        _re.escape(sorted_deme),
+                        f"{lbl} 出目 {sorted_deme} が確認画面に無い",
                     ))
+                else:
+                    for c in b["cars"]:
+                        checks.append((
+                            rf"\b{int(c)}\b",
+                            f"{lbl} の車番 {int(c)} 表示確認失敗",
+                        ))
 
             failures: list[str] = []
             for pattern, errmsg in checks:
