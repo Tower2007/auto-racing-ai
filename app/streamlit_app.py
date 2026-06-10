@@ -617,23 +617,69 @@ st.markdown("""
 /* === エキサイトバイク風 走行アニメ === */
 .bike-track {
     position: relative;
-    height: 64px;
+    height: 96px;
     background:
         linear-gradient(180deg,
-            #87CEEB 0%, #87CEEB 38%,           /* 空 */
-            #5C8A3A 38%, #5C8A3A 50%,          /* 草 */
-            #C9A878 50%, #B8956A 100%);        /* オレンジ土の路面 */
-    border-radius: 6px;
+            #6ec0ea 0px,  #9fdcf5 24px,        /* 空 */
+            #b9bcc4 24px, #a7aab4 34px,        /* 観客スタンド */
+            #4e7d35 34px, #5C8A3A 42px,        /* 草 */
+            #C9A878 42px, #a8835a 96px);       /* オレンジ土の路面 */
+    border-radius: 8px;
     overflow: hidden;
     margin: 8px 0 16px 0;
-    box-shadow: inset 0 -3px 0 rgba(0,0,0,0.3),
-                inset 0 2px 4px rgba(255,255,255,0.2);
+    box-shadow: inset 0 -4px 0 rgba(0,0,0,0.3),
+                inset 0 2px 4px rgba(255,255,255,0.2),
+                0 4px 14px rgba(0,0,0,0.25);
+}
+/* 観客 (カラフルなドットがゆっくり流れる = パララックス遠景) */
+.bike-track .crowd {
+    position: absolute;
+    top: 25px; height: 9px;
+    left: 0; right: 0;
+    background:
+        radial-gradient(circle at 3px 3px,  #e74c3c 1.3px, transparent 1.7px),
+        radial-gradient(circle at 9px 5px,  #3498db 1.3px, transparent 1.7px),
+        radial-gradient(circle at 15px 2px, #f1c40f 1.3px, transparent 1.7px),
+        radial-gradient(circle at 21px 5px, #ecf0f1 1.3px, transparent 1.7px),
+        radial-gradient(circle at 27px 3px, #9b59b6 1.3px, transparent 1.7px);
+    background-size: 32px 9px;
+    animation: crowd-scroll 5s linear infinite;
+    opacity: 0.95;
+}
+@keyframes crowd-scroll {
+    to { background-position-x: -32px; }
+}
+/* フェンス (白い柵、中景パララックス) */
+.bike-track .fence {
+    position: absolute;
+    top: 35px; height: 7px;
+    left: 0; right: 0;
+    border-top: 2px solid rgba(255,255,255,0.9);
+    background: repeating-linear-gradient(
+        90deg,
+        rgba(255,255,255,0.85) 0px, rgba(255,255,255,0.85) 2px,
+        transparent 2px, transparent 14px
+    );
+    animation: fence-scroll 1.1s linear infinite;
+}
+@keyframes fence-scroll {
+    to { background-position-x: -14px; }
+}
+/* ゴールライン (チェッカー柄の縦帯) */
+.bike-track .finish-line {
+    position: absolute;
+    top: 42px; bottom: 0;
+    right: 26px; width: 7px;
+    background: repeating-conic-gradient(#111 0% 25%, #eee 0% 50%);
+    background-size: 7px 7px;
+    opacity: 0.85;
+    box-shadow: 0 0 6px rgba(0,0,0,0.4);
 }
 /* 路面の白い破線 (走行レーン) */
 .bike-track::before {
     content: "";
     position: absolute;
-    bottom: 14px;
+    bottom: 22px;
     left: 0; right: 0;
     height: 2px;
     background: repeating-linear-gradient(
@@ -643,6 +689,7 @@ st.markdown("""
         transparent 16px, transparent 32px
     );
     animation: lane-scroll 0.6s linear infinite;
+    z-index: 0;
 }
 @keyframes lane-scroll {
     0% { background-position-x: 0; }
@@ -669,17 +716,18 @@ st.markdown("""
     filter: drop-shadow(2px 2px 0 rgba(0,0,0,0.3));
 }
 .bike-lane svg { display: block; }
-/* 各バイクの個性 (速度・位置・遅延) — 8 車実装 */
-.lane-1 { bottom: 14px; animation-duration: 5.2s; animation-delay: 0s;    }
-.lane-2 { bottom: 19px; animation-duration: 5.8s; animation-delay: -0.7s; }
-.lane-3 { bottom: 11px; animation-duration: 4.4s; animation-delay: -1.4s; }
-.lane-4 { bottom: 23px; animation-duration: 6.0s; animation-delay: -2.1s; }
-.lane-5 { bottom: 16px; animation-duration: 5.0s; animation-delay: -2.8s; }
-.lane-6 { bottom: 20px; animation-duration: 5.5s; animation-delay: -3.5s; }
-.lane-7 { bottom: 13px; animation-duration: 4.7s; animation-delay: -4.2s; }
-.lane-8 { bottom: 24px; animation-duration: 6.3s; animation-delay: -4.9s; }
+/* 各バイクの個性 (速度・位置・遅延) — 8 車実装。
+   下のレーンほど手前 = z-index 大きく重なり順を整合 */
+.lane-1 { bottom: 12px; animation-duration: 5.2s; animation-delay: 0s;    z-index: 6; }
+.lane-2 { bottom: 19px; animation-duration: 5.8s; animation-delay: -0.7s; z-index: 4; }
+.lane-3 { bottom: 6px;  animation-duration: 4.4s; animation-delay: -1.4s; z-index: 8; }
+.lane-4 { bottom: 26px; animation-duration: 6.0s; animation-delay: -2.1s; z-index: 2; }
+.lane-5 { bottom: 15px; animation-duration: 5.0s; animation-delay: -2.8s; z-index: 5; }
+.lane-6 { bottom: 22px; animation-duration: 5.5s; animation-delay: -3.5s; z-index: 3; }
+.lane-7 { bottom: 9px;  animation-duration: 4.7s; animation-delay: -4.2s; z-index: 7; }
+.lane-8 { bottom: 26px; animation-duration: 6.3s; animation-delay: -4.9s; z-index: 1; }
 @keyframes bike-ride {
-    0%   { left: -50px; }
+    0%   { left: -70px; }
     100% { left: 100%; }
 }
 /* バイクが走るときの上下バウンド */
@@ -728,11 +776,11 @@ st.markdown("""
 /* === ゴールのチェッカーフラッグ (走行バナー右端で振られる) === */
 .finish-flag {
     position: absolute;
-    right: 8px; top: 3px;
+    right: 16px; top: 22px;
     font-size: 20px;
     transform-origin: bottom center;
     animation: flag-wave 0.9s ease-in-out infinite;
-    z-index: 3;
+    z-index: 9;
     filter: drop-shadow(1px 1px 0 rgba(0,0,0,0.4));
 }
 @keyframes flag-wave {
@@ -748,9 +796,9 @@ st.markdown("""
     animation: speed-dash linear infinite;
     border-radius: 2px;
 }
-.sl-1 { bottom: 18px; animation-duration: 0.9s; animation-delay: 0s;    }
-.sl-2 { bottom: 26px; animation-duration: 1.2s; animation-delay: -0.4s; }
-.sl-3 { bottom: 10px; animation-duration: 0.7s; animation-delay: -0.2s; }
+.sl-1 { bottom: 24px; animation-duration: 0.9s; animation-delay: 0s;    }
+.sl-2 { bottom: 38px; animation-duration: 1.2s; animation-delay: -0.4s; }
+.sl-3 { bottom: 12px; animation-duration: 0.7s; animation-delay: -0.2s; }
 @keyframes speed-dash {
     0%   { left: 110%; opacity: 0; }
     10%  { opacity: 0.7; }
@@ -785,32 +833,95 @@ _CAR_COLORS = {
 
 
 def _autorace_bike_svg(num: int) -> str:
-    """オートレース風 (低姿勢・前傾ライダー) のバイク SVG。ヘルメット色 = 車番色。"""
+    """オートレース車両 SVG (実車準拠 2026-06-11 改訂)。
+
+    実車の特徴を反映:
+    - ライダーは前傾ではなく上体が起きた姿勢 (低いハンドルへ腕を伸ばす)
+    - カウル/タンクなしのむき出しフレーム (ナケッドな細い車体)
+    - 前後輪ほぼ同径の細いスポークホイール (回転アニメ)
+    - 胸に車番色のゼッケンビブ、ヘルメットも車番色
+    - 排気管は低く後方へ、炎フリッカー
+    """
     helm_bg, txt = _CAR_COLORS[num]
-    body = helm_bg if num != 1 else "#dddddd"  # 1号車の白いボディは見にくいので薄灰に
+    body = helm_bg if num != 1 else "#e8e8e8"  # 1号車の白は薄灰に (空と同化防止)
+    dur = 0.35 + (num % 3) * 0.05  # ホイール回転速度に個体差
     return (
-        f'<svg width="44" height="22" viewBox="0 0 44 22" xmlns="http://www.w3.org/2000/svg">'
-        # 後輪 (大きめ・スポーク感)
-        f'<circle cx="9" cy="17" r="4.5" fill="#1a1a1a"/>'
-        f'<circle cx="9" cy="17" r="1.5" fill="#999"/>'
-        # 前輪 (やや小さめ)
-        f'<circle cx="35" cy="17" r="4.2" fill="#1a1a1a"/>'
-        f'<circle cx="35" cy="17" r="1.4" fill="#999"/>'
-        # 低い水平フレーム + エンジン部の塊
-        f'<rect x="11" y="13" width="20" height="3" fill="#3a3a3a" rx="1"/>'
-        f'<rect x="14" y="10" width="14" height="4" fill="{body}" stroke="#000" stroke-width="0.4" rx="1"/>'
-        # ゼッケン番号 (車体側面)
-        f'<text x="21" y="13.5" font-size="5" font-weight="bold" fill="{txt}" '
-        f'text-anchor="middle" font-family="Arial,sans-serif">{num}</text>'
-        # ハンドル / フロントフォーク (短く前傾)
-        f'<line x1="29" y1="11" x2="34" y2="8" stroke="#555" stroke-width="1.8" stroke-linecap="round"/>'
-        # ライダー (前傾・ハンドルに伏せた形)
-        f'<path d="M 18 10 Q 23 5 30 8" stroke="{body}" stroke-width="3.5" fill="none" '
+        f'<svg width="58" height="33" viewBox="0 0 64 36" '
+        f'xmlns="http://www.w3.org/2000/svg">'
+        # 排気炎 (2 層フリッカー: 橙 + 黄、排気管末端)
+        f'<path d="M 7 26.5 q -5 0.3 -7 -0.5 q 2.5 2.3 7 2 z" fill="#ff9500">'
+        f'<animate attributeName="opacity" values="1;0.25;0.8;0.4;1" '
+        f'dur="0.18s" repeatCount="indefinite"/></path>'
+        f'<path d="M 7 26.8 q -3.5 0.2 -5 -0.3 q 1.8 1.5 5 1.3 z" fill="#ffd60a">'
+        f'<animate attributeName="opacity" values="0.9;0.4;1;0.3;0.9" '
+        f'dur="0.13s" repeatCount="indefinite"/></path>'
+        # 排気管 (エンジン下から低く後方へ)
+        f'<path d="M 26 25 L 7 26 L 7 28 L 26 27.5 Z" fill="#8a8f97"/>'
+        # 後輪 (細いタイヤのスポークホイール、回転)
+        f'<g transform="translate(13,28)">'
+        f'<circle r="7" fill="none" stroke="#16161a" stroke-width="2.4"/>'
+        f'<circle r="5" fill="none" stroke="#3a3a42" stroke-width="0.8"/>'
+        f'<g stroke="#b9bec6" stroke-width="0.7">'
+        f'<line x1="-5" y1="0" x2="5" y2="0"/>'
+        f'<line x1="0" y1="-5" x2="0" y2="5"/>'
+        f'<line x1="-3.5" y1="-3.5" x2="3.5" y2="3.5"/>'
+        f'<line x1="-3.5" y1="3.5" x2="3.5" y2="-3.5"/>'
+        f'<animateTransform attributeName="transform" type="rotate" '
+        f'from="0" to="360" dur="{dur}s" repeatCount="indefinite"/>'
+        f'</g>'
+        f'<circle r="1.5" fill="#d7dbe0"/>'
+        f'</g>'
+        # 前輪 (後輪とほぼ同径、回転)
+        f'<g transform="translate(51,28)">'
+        f'<circle r="6.6" fill="none" stroke="#16161a" stroke-width="2.2"/>'
+        f'<circle r="4.7" fill="none" stroke="#3a3a42" stroke-width="0.8"/>'
+        f'<g stroke="#b9bec6" stroke-width="0.7">'
+        f'<line x1="-4.6" y1="0" x2="4.6" y2="0"/>'
+        f'<line x1="0" y1="-4.6" x2="0" y2="4.6"/>'
+        f'<line x1="-3.2" y1="-3.2" x2="3.2" y2="3.2"/>'
+        f'<line x1="-3.2" y1="3.2" x2="3.2" y2="-3.2"/>'
+        f'<animateTransform attributeName="transform" type="rotate" '
+        f'from="0" to="360" dur="{dur}s" repeatCount="indefinite"/>'
+        f'</g>'
+        f'<circle r="1.4" fill="#d7dbe0"/>'
+        f'</g>'
+        # フレーム (むき出し: シートチューブ + メインチューブ + フロントフォーク)
+        f'<line x1="13" y1="28" x2="20" y2="17" stroke="#50555c" stroke-width="1.8"/>'
+        f'<line x1="20" y1="17" x2="45" y2="15" stroke="#50555c" stroke-width="1.8"/>'
+        f'<line x1="45" y1="15" x2="51" y2="28" stroke="#666c75" stroke-width="2"/>'
+        # エンジンブロック (小ぶり、フレーム中央下)
+        f'<rect x="26" y="20" width="11" height="6" rx="1.5" fill="#3c4048"/>'
+        f'<rect x="28" y="21" width="4" height="3.6" rx="0.8" fill="#565b64"/>'
+        # シート (後方の小さなパッド)
+        f'<rect x="15.5" y="15.3" width="7" height="2.6" rx="1" fill="#23262b"/>'
+        # ハンドル (低い位置、ヘッドから後上方へ短く)
+        f'<line x1="45" y1="14.5" x2="41" y2="11.5" stroke="#444" '
+        f'stroke-width="1.6" stroke-linecap="round"/>'
+        # ライダー: 太腿 (腰→膝) + 脛 (膝→ステップ)、白パンツ (実車準拠)
+        f'<path d="M 21.5 15.5 L 29.5 20.5" stroke="#dde1e6" stroke-width="3.2" '
         f'stroke-linecap="round"/>'
-        # ヘルメット (車番色)
-        f'<circle cx="32" cy="6" r="2.7" fill="{helm_bg}" stroke="#000" stroke-width="0.6"/>'
-        # マフラー (後輪後ろから少し出す)
-        f'<rect x="2" y="15.5" width="6" height="1.5" fill="#888" rx="0.5"/>'
+        f'<path d="M 29.5 20.5 L 31 25.5" stroke="#dde1e6" stroke-width="2.6" '
+        f'stroke-linecap="round"/>'
+        # ブーツ
+        f'<circle cx="31.2" cy="25.8" r="1.6" fill="#23262b"/>'
+        # ライダー: 上体 (起きた姿勢、やや前傾 ~30度、車番色スーツ)
+        f'<path d="M 21 15 L 30 5.5" stroke="{body}" stroke-width="4.5" '
+        f'stroke-linecap="round"/>'
+        # 腕 (肩→肘→低いハンドルへ = オートレース特有の伸ばし姿勢)
+        f'<path d="M 29.5 7 L 35.5 10.5 L 42 12.3" stroke="{body}" '
+        f'stroke-width="2.6" fill="none" stroke-linecap="round" '
+        f'stroke-linejoin="round"/>'
+        # グローブ (グリップ位置)
+        f'<circle cx="42" cy="12.3" r="1.3" fill="#23262b"/>'
+        # ゼッケンビブ (胸、車番色 + 白枠)
+        f'<rect x="22" y="7.5" width="7.5" height="6.5" rx="1.2" '
+        f'fill="{helm_bg}" stroke="#fff" stroke-width="0.9"/>'
+        f'<text x="25.7" y="12.7" font-size="5.4" font-weight="bold" fill="{txt}" '
+        f'text-anchor="middle" font-family="Arial,sans-serif">{num}</text>'
+        # ヘルメット (車番色) + バイザー
+        f'<circle cx="31.5" cy="3.9" r="3.6" fill="{helm_bg}" '
+        f'stroke="#111" stroke-width="0.7"/>'
+        f'<path d="M 33.5 2.4 a 3.6 3.6 0 0 1 1.5 2.9 l -2.8 0.1 z" fill="#222"/>'
         f'</svg>'
     )
 
@@ -825,6 +936,9 @@ _dusts_html = (
     '<span class="dust dust-3">💨</span>'
 )
 _fx_html = (
+    '<div class="crowd"></div>'
+    '<div class="fence"></div>'
+    '<div class="finish-line"></div>'
     '<span class="finish-flag">🏁</span>'
     '<span class="speedline sl-1"></span>'
     '<span class="speedline sl-2"></span>'
