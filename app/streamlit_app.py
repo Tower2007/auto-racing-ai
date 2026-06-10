@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from sklearn.isotonic import IsotonicRegression
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -706,6 +707,64 @@ st.markdown("""
     20% { opacity: 0.5; }
     100% { left: 100%; opacity: 0; }
 }
+/* === 推奨バナー シャインスイープ (光の反射が走る) === */
+.recommend-banner {
+    position: relative;
+    overflow: hidden;
+}
+.recommend-banner .shine {
+    position: absolute;
+    top: 0; left: -60%;
+    width: 40%; height: 100%;
+    background: linear-gradient(100deg,
+        transparent 0%, rgba(255,255,255,0.55) 50%, transparent 100%);
+    animation: shine-sweep 1.8s ease-in-out infinite;
+    pointer-events: none;
+}
+@keyframes shine-sweep {
+    0%   { left: -60%; }
+    60%, 100% { left: 120%; }
+}
+/* === ゴールのチェッカーフラッグ (走行バナー右端で振られる) === */
+.finish-flag {
+    position: absolute;
+    right: 8px; top: 3px;
+    font-size: 20px;
+    transform-origin: bottom center;
+    animation: flag-wave 0.9s ease-in-out infinite;
+    z-index: 3;
+    filter: drop-shadow(1px 1px 0 rgba(0,0,0,0.4));
+}
+@keyframes flag-wave {
+    0%, 100% { transform: rotate(-8deg); }
+    50%      { transform: rotate(12deg); }
+}
+/* === スピードライン (路面を流れる残像) === */
+.speedline {
+    position: absolute;
+    height: 1.5px;
+    width: 60px;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.8));
+    animation: speed-dash linear infinite;
+    border-radius: 2px;
+}
+.sl-1 { bottom: 18px; animation-duration: 0.9s; animation-delay: 0s;    }
+.sl-2 { bottom: 26px; animation-duration: 1.2s; animation-delay: -0.4s; }
+.sl-3 { bottom: 10px; animation-duration: 0.7s; animation-delay: -0.2s; }
+@keyframes speed-dash {
+    0%   { left: 110%; opacity: 0; }
+    10%  { opacity: 0.7; }
+    100% { left: -15%; opacity: 0; }
+}
+/* === ヒーロータイトル シマー (グラデが流れる) === */
+.hero-title {
+    background-size: 200% auto;
+    animation: hero-shimmer 3s linear infinite;
+}
+@keyframes hero-shimmer {
+    0%   { background-position: 0% 50%; }
+    100% { background-position: 200% 50%; }
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -765,7 +824,13 @@ _dusts_html = (
     '<span class="dust dust-2">💨</span>'
     '<span class="dust dust-3">💨</span>'
 )
-st.markdown(f'<div class="bike-track">{_dusts_html}{_bikes_html}</div>', unsafe_allow_html=True)
+_fx_html = (
+    '<span class="finish-flag">🏁</span>'
+    '<span class="speedline sl-1"></span>'
+    '<span class="speedline sl-2"></span>'
+    '<span class="speedline sl-3"></span>'
+)
+st.markdown(f'<div class="bike-track">{_fx_html}{_dusts_html}{_bikes_html}</div>', unsafe_allow_html=True)
 
 st.caption("中間モデル(直前) + 公式 AI 予想(前売) を時間で自動切替。5〜7 券種を提示します。")
 
@@ -1296,6 +1361,7 @@ if is_live_mode:
             rec_yen = recommended_bet_yen(pc, r)
             st.markdown(
                 f'<div class="recommend-banner">'
+                f'<span class="shine"></span>'
                 f'<span class="gem">💎</span> BUY RECOMMENDED <span class="gem">💎</span>'
                 f'&nbsp;&nbsp;R{r} {start_time_str or ""}&nbsp;&nbsp;'
                 f'予想 {top_cars[0]} 号  EV <b>{top1_ev:.2f}</b>'
@@ -1304,6 +1370,62 @@ if is_live_mode:
                 f'</div>',
                 unsafe_allow_html=True,
             )
+            # ⏱ 投票締切カウントダウンボード (締切 = 発走 -2:30、JS でリアルタイム)
+            # race_start_dt は within_5min_window 計算 (is_recommended の前提条件)
+            # で必ずセット済み。推奨ウィンドウは -5:00〜発走、締切まで残り最大 150s。
+            _deadline_dt = race_start_dt - dt.timedelta(seconds=150)
+            _remain_sec = max(0, int((_deadline_dt - jst_now()).total_seconds()))
+            _cd_html = """
+<style>
+.cd-board{font-family:'Segoe UI',sans-serif;background:#101418;border:2px solid #2c3440;
+  border-radius:10px;padding:10px 16px;display:flex;align-items:center;gap:14px;
+  box-shadow:0 0 14px rgba(255,170,0,.25), inset 0 0 18px rgba(0,0,0,.6);}
+.cd-label{color:#aab4c0;font-size:14px;font-weight:700;letter-spacing:1px;white-space:nowrap;}
+.cd-digits{font-family:'Consolas','Courier New',monospace;font-size:30px;font-weight:900;
+  color:#ffb300;text-shadow:0 0 10px rgba(255,179,0,.8);min-width:96px;text-align:center;}
+.cd-digits.hurry{color:#ff3b30;text-shadow:0 0 12px rgba(255,59,48,.9);
+  animation:cd-blink .5s step-end infinite;}
+.cd-digits.closed{color:#777;text-shadow:none;animation:none;font-size:20px;}
+@keyframes cd-blink{50%{opacity:.35}}
+.cd-bar{flex:1;height:10px;background:#222a33;border-radius:6px;overflow:hidden;}
+.cd-fill{height:100%;border-radius:6px;
+  background:linear-gradient(90deg,#ff3d00,#ffd600,#00e676);transition:width 1s linear;}
+</style>
+<div class="cd-board">
+  <span class="cd-label">⏱ 投票締切まで</span>
+  <span class="cd-digits" id="cd">--:--</span>
+  <div class="cd-bar"><div class="cd-fill" id="fill" style="width:100%"></div></div>
+</div>
+<script>
+let remain = __REMAIN__;
+const total = Math.max(__TOTAL__, 1);
+const el = document.getElementById('cd');
+const fill = document.getElementById('fill');
+function tick(){
+  if (remain <= 0){
+    el.textContent = '締切'; el.classList.remove('hurry'); el.classList.add('closed');
+    fill.style.width = '0%';
+    return;
+  }
+  const m = Math.floor(remain/60), s = remain % 60;
+  el.textContent = String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+  if (remain <= 60) el.classList.add('hurry');
+  fill.style.width = Math.min(100, remain/total*100) + '%';
+  remain -= 1;
+  setTimeout(tick, 1000);
+}
+tick();
+</script>
+"""
+            _cd_html = (_cd_html
+                        .replace("__REMAIN__", str(_remain_sec))
+                        .replace("__TOTAL__", "150"))
+            components.html(_cd_html, height=66)
+            # 💎 推奨検出時に 1 回だけ toast (rerun 毎の重複防止)
+            _tkey = f"rec_toast_{target_date}_{venue}_{r}"
+            if not st.session_state.get(_tkey):
+                st.toast(f"💎 R{r} BUY 推奨! EV {top1_ev:.2f} 締切まで急げ!", icon="💎")
+                st.session_state[_tkey] = True
             # オッズ確認 + 投票の 2 ボタン
             bcol1, bcol2 = st.columns(2)
             with bcol1:
