@@ -42,6 +42,10 @@ def setup_logging() -> None:
             logging.FileHandler(LOG_FILE, encoding="utf-8"),
             logging.StreamHandler(sys.stdout),
         ],
+        # ingest_day.py が import 時に basicConfig 済みのため、force が無いと
+        # ここが no-op になり FileHandler が付かない (ログが2026-04-28から
+        # 一度も書かれていなかった原因)
+        force=True,
     )
 
 
