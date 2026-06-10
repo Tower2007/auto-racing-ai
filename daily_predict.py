@@ -51,10 +51,30 @@ sys.path.insert(0, str(ROOT))
 from src.client import AutoraceClient, VENUE_CODES
 from src.parser import (
     parse_program_entries, parse_program_stats, parse_odds_summary,
+    parse_odds_combo,
 )
+from src.storage import append_rows
 
 DATA = ROOT / "data"
 LOG_FILE = DATA / "daily_predict.log"
+
+
+def _snapshot_combo_odds(place_code: int, race_date: str, race_no: int,
+                         odds_body: dict) -> None:
+    """発火時の連勝式オッズ板を odds_combo_snapshots.csv に記録。
+
+    closing オッズ (odds_combo.csv) との drift 検証用。
+    記録失敗しても予測フローは止めない。
+    """
+    try:
+        rows = parse_odds_combo(place_code, race_date, race_no, odds_body)
+        ts = dt.datetime.now().isoformat(timespec="seconds")
+        for r in rows:
+            r["captured_at"] = ts
+        append_rows("odds_combo_snapshots.csv", rows)
+    except Exception as e:  # noqa: BLE001 — 観測系の失敗は本体に影響させない
+        logging.warning("combo odds snapshot failed (%s %s R%d): %s",
+                        race_date, place_code, race_no, e)
 PRODUCTION_LOG = DATA / "daily_predict_picks.csv"
 ODDS_SNAPSHOT_LOG = DATA / "odds_snapshots.csv"  # 発火時オッズスナップ (信号 persistence 解析用)
 SHADOW_LOG = DATA / "shadow_picks.csv"  # shadow 判定ログ (drift 補正 / 閾値変更の仮想評価)
@@ -476,6 +496,9 @@ def predict_race(
                 if attempt > 0:
                     logging.info("predict_race(%d, %s, %d): リトライ %d 回目で top1 EV=%.2f を取得",
                                  place_code, race_date, race_no, attempt, top1_ev)
+                # 発火時の連勝式オッズ板を記録 (live はこの瞬間しか取れない。
+                # closing は odds_combo.csv に ingest が保存 → drift 検証用)
+                _snapshot_combo_odds(place_code, race_date, race_no, odds_body)
                 return feat
             if attempt < PREDICT_RETRY_MAX:
                 logging.info("predict_race(%d, %s, %d): top1 EV=NaN, %d 秒後にリトライ (試行 %d/%d)",

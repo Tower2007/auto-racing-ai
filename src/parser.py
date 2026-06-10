@@ -271,3 +271,68 @@ def parse_odds_summary(
             "ai_expect_code": _clean_int(p.get("aiExpectCode")),
         })
     return rows
+
+
+def parse_odds_combo(
+    place_code: int, race_date: str, race_no: int, body: dict,
+) -> list[dict]:
+    """Odds API body → 連勝式オッズ行リスト (2連単/2連複/ワイド/3連単/3連複)。
+
+    API構造 (docs/url-structure.md §6、確定済みレースでも取得可能):
+      rtwOddsList / rfwOddsList: {car1: {car2: odds}}
+      widOddsList:               {car1: {car2: {"min": x, "max": y}}}
+      rt3OddsList / rf3OddsList: {car1: {car2: {car3: odds}}}
+    オッズ未発表時は dict ではなく None / 空 list が返るため安全にスキップする。
+    """
+    rows: list[dict] = []
+
+    def _row(bet_type, c1, c2, c3, odds=None, omin=None, omax=None):
+        rows.append({
+            "race_date": race_date,
+            "place_code": place_code,
+            "race_no": race_no,
+            "bet_type": bet_type,
+            "car_no_1": _clean_int(c1),
+            "car_no_2": _clean_int(c2),
+            "car_no_3": _clean_int(c3),
+            "odds": _clean_odds(odds),
+            "odds_min": _clean_odds(omin),
+            "odds_max": _clean_odds(omax),
+        })
+
+    # 2階層 (2連単/2連複)
+    for bet_type in ("rtw", "rfw"):
+        tree = body.get(f"{bet_type}OddsList")
+        if not isinstance(tree, dict):
+            continue
+        for c1, level2 in tree.items():
+            if not isinstance(level2, dict):
+                continue
+            for c2, odds in level2.items():
+                _row(bet_type, c1, c2, None, odds=odds)
+
+    # ワイド (2階層 + min/max)
+    wid = body.get("widOddsList")
+    if isinstance(wid, dict):
+        for c1, level2 in wid.items():
+            if not isinstance(level2, dict):
+                continue
+            for c2, mm in level2.items():
+                if isinstance(mm, dict):
+                    _row("wid", c1, c2, None,
+                         omin=mm.get("min"), omax=mm.get("max"))
+
+    # 3階層 (3連単/3連複)
+    for bet_type in ("rt3", "rf3"):
+        tree = body.get(f"{bet_type}OddsList")
+        if not isinstance(tree, dict):
+            continue
+        for c1, level2 in tree.items():
+            if not isinstance(level2, dict):
+                continue
+            for c2, level3 in level2.items():
+                if not isinstance(level3, dict):
+                    continue
+                for c3, odds in level3.items():
+                    _row(bet_type, c1, c2, c3, odds=odds)
+    return rows

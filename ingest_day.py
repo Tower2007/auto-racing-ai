@@ -18,6 +18,7 @@ from src.parser import (
     parse_race_laps,
     parse_payouts,
     parse_odds_summary,
+    parse_odds_combo,
 )
 from src.storage import append_rows, has_race_day
 
@@ -93,6 +94,9 @@ def ingest_one_day(client: AutoraceClient, place_code: int, race_date: str) -> d
             if not isinstance(odds_body, list):
                 odds_rows = parse_odds_summary(place_code, race_date, race_no, odds_body)
                 counts["odds"] = counts.get("odds", 0) + append_rows("odds_summary.csv", odds_rows)
+                # 連勝式オッズ (2連単/2連複/ワイド/3連単/3連複) も同じレスポンスから保存
+                combo_rows = parse_odds_combo(place_code, race_date, race_no, odds_body)
+                counts["odds_combo"] = counts.get("odds_combo", 0) + append_rows("odds_combo.csv", combo_rows)
         except Exception as e:
             logger.error("  Odds R%d failed: %s", race_no, e)
 

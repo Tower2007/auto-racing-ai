@@ -52,6 +52,19 @@ CSV_SCHEMAS: dict[str, list[str]] = {
         "st_ave", "good_track_trial_ave", "good_track_race_ave",
         "good_track_race_best", "ai_expect_code",
     ],
+    # 連勝式オッズ (2連単/2連複/ワイド/3連単/3連複)。
+    # wid のみ odds_min/odds_max、他は odds に値が入る。約500行/レース。
+    "odds_combo.csv": [
+        "race_date", "place_code", "race_no", "bet_type",
+        "car_no_1", "car_no_2", "car_no_3",
+        "odds", "odds_min", "odds_max",
+    ],
+    # 発火時 (発走約4分前) の連勝式オッズ板スナップショット。closing との drift 検証用
+    "odds_combo_snapshots.csv": [
+        "race_date", "place_code", "race_no", "bet_type",
+        "car_no_1", "car_no_2", "car_no_3",
+        "odds", "odds_min", "odds_max", "captured_at",
+    ],
 }
 
 
