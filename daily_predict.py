@@ -75,6 +75,35 @@ def _snapshot_combo_odds(place_code: int, race_date: str, race_no: int,
     except Exception as e:  # noqa: BLE001 — 観測系の失敗は本体に影響させない
         logging.warning("combo odds snapshot failed (%s %s R%d): %s",
                         race_date, place_code, race_no, e)
+
+
+def _snapshot_weather(client: AutoraceClient, place_code: int,
+                      race_date: str, race_no: int) -> None:
+    """発火時点の気象 (温度/湿度/天候) を Hold/Today から記録。
+
+    Hold/Today はリアルタイム値のみで過去日は取れないため、発火時に取るのが唯一の手段。
+    記録失敗しても予測フローは止めない。
+    """
+    try:
+        hold = client.get_today_hold()
+        for v in (hold.get("body") or {}).get("today", []):
+            if int(v.get("placeCode", -1)) == int(place_code):
+                append_rows("weather_snapshots.csv", [{
+                    "race_date": race_date,
+                    "place_code": place_code,
+                    "race_no": race_no,
+                    "temp": v.get("temp"),
+                    "humid": v.get("humid"),
+                    "roadtemp": v.get("roadtemp"),  # 走路温度
+                    "weather": v.get("weather"),
+                    "weather_code": v.get("weatherCode"),
+                    "situation_code": v.get("situationCode"),
+                    "captured_at": dt.datetime.now().isoformat(timespec="seconds"),
+                }])
+                return
+    except Exception as e:  # noqa: BLE001
+        logging.warning("weather snapshot failed (%s %s R%d): %s",
+                        race_date, place_code, race_no, e)
 PRODUCTION_LOG = DATA / "daily_predict_picks.csv"
 ODDS_SNAPSHOT_LOG = DATA / "odds_snapshots.csv"  # 発火時オッズスナップ (信号 persistence 解析用)
 SHADOW_LOG = DATA / "shadow_picks.csv"  # shadow 判定ログ (drift 補正 / 閾値変更の仮想評価)
@@ -499,6 +528,7 @@ def predict_race(
                 # 発火時の連勝式オッズ板を記録 (live はこの瞬間しか取れない。
                 # closing は odds_combo.csv に ingest が保存 → drift 検証用)
                 _snapshot_combo_odds(place_code, race_date, race_no, odds_body)
+                _snapshot_weather(client, place_code, race_date, race_no)
                 return feat
             if attempt < PREDICT_RETRY_MAX:
                 logging.info("predict_race(%d, %s, %d): top1 EV=NaN, %d 秒後にリトライ (試行 %d/%d)",

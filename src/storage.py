@@ -65,6 +65,13 @@ CSV_SCHEMAS: dict[str, list[str]] = {
         "car_no_1", "car_no_2", "car_no_3",
         "odds", "odds_min", "odds_max", "captured_at",
     ],
+    # 発火時の気象 (Hold/Today はリアルタイムのみで遡及不能)。
+    # roadtemp=走路温度 (タイヤグリップに直結するオート固有の重要特徴量候補)
+    "weather_snapshots.csv": [
+        "race_date", "place_code", "race_no",
+        "temp", "humid", "roadtemp", "weather", "weather_code", "situation_code",
+        "captured_at",
+    ],
 }
 
 
