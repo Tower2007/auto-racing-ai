@@ -95,6 +95,7 @@ reports/               # 各種分析レポート(commit 対象)
 | `AutoraceWeeklyStatus` | 毎月曜 07:20 | 週次ステータス報告 |
 | `AutoraceMonthlyReport` | 毎月 1 日 08:00 | `python monthly_report.py --send-email`: 前月の月次収支レポート(推奨仮想+実購入+券種別+場別+月次ROI推移+通算)を Gmail 送信。keiba の月次レポートと同枠組み |
 | `AutoraceFetchOrderHistory` | 毎日 02:30 | `python scripts/daily_fetch_order_history.py`: vote.autorace.jp の購入履歴を `--since 2d --detail --cookie-source playwright` で取得し `data/bet_history.csv` / `bet_history_detail.csv` にマージ。失敗時のみ Gmail 通知。**2026-05-08 から Playwright auto-login** に切替(SBI IPO project と同じパターン)。資格情報は `accounts.json`(.gitignore)。実装: `scripts/auto_login_autorace.py`。旧 Firefox cookie 方式は `--cookie-source firefox` で fallback 可。経緯: memory `ml_baseline_findings.md` 2026-05-08 |
+| `AutoraceStreamlitApp` | ログオン時 (+手動 `schtasks /Run`) | `wscript //B scripts/run_streamlit_hidden.vbs`: streamlit_app.py を port 8501 で窓なし常駐起動。port 8501 応答中なら何もしない(二重起動ガード)。**Claude セッションから起動すると子プロセスとしてセッション終了時に巻き添え終了する**ため、Task Scheduler 経由で独立プロセス化 (2026-06-11) |
 
 #### 設計
 - 発走時刻取得: `/race_info/Program/Print/{venueKey}/{YYYY-MM-DD}` から R 毎の発走予定時刻を HTML スクレイプ。12 R 全て掲載されるので推定ではなく実時刻ベースで登録。
