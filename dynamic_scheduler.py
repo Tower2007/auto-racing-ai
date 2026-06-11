@@ -57,15 +57,16 @@ LIVE_END_TO_R12_START_OFFSET_MIN = 5
 VENUE_SHORT = {2: "kawaguchi", 3: "isesaki", 4: "hamamatsu", 5: "iizuka", 6: "sanyou"}
 
 PROJECT_DIR = str(ROOT)
-RUN_LOG = "data\\dynamic_run.log"
 
-# cmd /c で起動。chcp 65001 を頭に挟んで Python の UTF-8 出力を文字化けさせない
-CMD_TEMPLATE = (
-    'cmd /c chcp 65001 >nul && cd /d "{project}" && '
-    'python daily_predict.py --venues {pc} --races {race_no} '
-    '--suppress-noresult-email --time-label "{label}" '
-    '>> {run_log} 2>&1'
-)
+# VBScript ラッパー経由の非表示実行 (2026-06-11)。
+# 旧: 'cmd /c chcp 65001 ... python daily_predict.py ...' 直接実行
+#   → one-shot 発火のたびにコンソール窓が表示されていた (1日10回以上)。
+# 新: wscript //B + WshShell.Run(cmd, 0) でコンソール窓を出さない。
+#   対話セッションのまま動くので auto_buy の Playwright Chrome
+#   (headless=False) には影響しない。実コマンド組立・dynamic_run.log への
+#   redirect は scripts/run_predict_hidden.vbs 側 (project root は VBS が自己解決)。
+VBS_WRAPPER = ROOT / "scripts" / "run_predict_hidden.vbs"
+CMD_TEMPLATE = 'wscript.exe //B "{vbs}" {pc} {race_no} "{label}"'
 
 
 def setup_logging() -> None:
@@ -328,8 +329,7 @@ def main() -> int:
             task_name = f"{TASK_PREFIX}{venue_short}_R{race_no}"
             label = f"{venue_short}_R{race_no}"
             command = CMD_TEMPLATE.format(
-                project=PROJECT_DIR, pc=pc, race_no=race_no,
-                label=label, run_log=RUN_LOG,
+                vbs=VBS_WRAPPER, pc=pc, race_no=race_no, label=label,
             )
 
             if register_one_shot(task_name, fire_at, command):
