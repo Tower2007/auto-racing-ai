@@ -91,7 +91,7 @@ reports/               # 各種分析レポート(commit 対象)
 | `AutoraceDailyIngest` | 毎日 06:30 | データ収集 (catchup 2 日) |
 | `AutoraceDynamicScheduler` | 毎日 07:00 | `python dynamic_scheduler.py`: Program/Print ページから各場 R 毎の発走時刻を取得し、各レース発走 `LEAD_MIN` 分前 (現在 4 分前) の `AutoraceDyn_{venue}_R{n}` one-shot を 12 R × 場数ぶん登録(冪等、毎日再生成) |
 | `AutoraceDyn_{venue}_R{n}` | 各レース発走 LEAD_MIN 分前(現在 4 分前、動的) | `python daily_predict.py --venues {pc} --races {n} --suppress-noresult-email`: 1 R 単位で予測、候補ありのみメール送信。near-miss retry 廃止、処理 ~10 秒で締切 ~2 分前に到着 |
-| `AutoraceWeeklyRetrain` | 毎日曜 03:00 | 本番モデル再学習 |
+| `AutoraceWeeklyRetrain` | 毎日曜 03:00 | `python scripts/weekly_retrain.py`: 再学習チェーン wrapper。`ml.features`(特徴量parquet再生成) → `ml.walkforward_morning`(校正OOF parquet再生成) → `ml.train_production`(学習+品質ゲート) を順に実行。上流失敗時は学習に進まず中断。**2026-06-14 導入**: 旧 `python -m ml.train_production` 単発は学習入力(parquet)を再生成せず、5/24〜6/14 の4回が同一データ no-op 化しモデルが4/29塩漬けだったのを修正。経緯: memory `project_decisions.md` 2026-06-14。⚠️ 品質ゲートの永久凍結問題(凍結高値AUCを恒久ベースライン化)は未解決、別途 `_should_adopt` 再設計予定 |
 | `AutoraceWeeklyStatus` | 毎月曜 07:20 | 週次ステータス報告 |
 | `AutoraceMonthlyReport` | 毎月 1 日 08:00 | `python monthly_report.py --send-email`: 前月の月次収支レポート(推奨仮想+実購入+券種別+場別+月次ROI推移+通算)を Gmail 送信。keiba の月次レポートと同枠組み |
 | `AutoraceFetchOrderHistory` | 毎日 02:30 | `python scripts/daily_fetch_order_history.py`: vote.autorace.jp の購入履歴を `--since 2d --detail --cookie-source playwright` で取得し `data/bet_history.csv` / `bet_history_detail.csv` にマージ。失敗時のみ Gmail 通知。**2026-05-08 から Playwright auto-login** に切替(SBI IPO project と同じパターン)。資格情報は `accounts.json`(.gitignore)。実装: `scripts/auto_login_autorace.py`。旧 Firefox cookie 方式は `--cookie-source firefox` で fallback 可。経緯: memory `ml_baseline_findings.md` 2026-05-08 |
