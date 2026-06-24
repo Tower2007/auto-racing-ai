@@ -38,10 +38,18 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 
 
-def build_pick_stream(ev_thr: float) -> pd.DataFrame:
-    """予測 top-1 複勝ピックの時系列を作る。
-    返り値: race ごと 1 行、列 [race_date, place_code, race_no, car_no,
-            pred_calib, odds_mid, ev, mult] (mult=実払戻倍率, 0=外れ)。
+RACE_KEYS = ["race_date", "place_code", "race_no"]
+
+
+def build_pick_stream(ev_thr: float, bet_type: str = "fns") -> pd.DataFrame:
+    """予測ピックの時系列を作る。
+
+    bet_type:
+      fns : 予測 top-1 車の複勝。mult = 複勝払戻/100。
+      rf3 : 予測 top-3 車の三連複 BOX (1点)。3 車が実着順 top-3 と
+            集合一致で的中。mult = 三連複払戻/100。
+    EV は live と同じく **top-1 車の複勝 EV** を選別シグナルに使う
+    (fns は EV>=1.50, rf3 は EV>=1.80 が本番)。
     """
     wf = pd.read_parquet(DATA / "walkforward_predictions_morning_top3.parquet")
     wf["race_date"] = pd.to_datetime(wf["race_date"])
@@ -54,42 +62,62 @@ def build_pick_stream(ev_thr: float) -> pd.DataFrame:
     except Exception:
         wf["pred_calib"] = wf["pred"]
 
-    # 各レースの予測 top-1 車
-    idx = wf.groupby(["race_date", "place_code", "race_no"])["pred_calib"].idxmax()
-    picks = wf.loc[idx, ["race_date", "place_code", "race_no", "car_no",
-                         "pred_calib", "target_top3"]].copy()
+    wf["rank"] = wf.groupby(RACE_KEYS)["pred_calib"].rank(
+        ascending=False, method="first")
 
-    # 複勝オッズ結合
+    # 複勝オッズ (top-1 の EV 計算に使う)
     od = pd.read_csv(DATA / "odds_summary.csv", low_memory=False)
     od["race_date"] = pd.to_datetime(od["race_date"])
     od = od[["race_date", "place_code", "race_no", "car_no",
              "place_odds_min", "place_odds_max"]]
-    picks = picks.merge(od, on=["race_date", "place_code", "race_no", "car_no"],
-                        how="left")
-    picks["odds_mid"] = (picks["place_odds_min"] + picks["place_odds_max"]) / 2
-    picks["ev"] = picks["pred_calib"] * picks["odds_mid"]
 
-    # 実払戻 (payouts の fns、当該車)
+    # 各レースの top-1: EV シグナル
+    top1 = wf[wf["rank"] == 1].merge(
+        od, on=["race_date", "place_code", "race_no", "car_no"], how="left")
+    top1["odds_mid"] = (top1["place_odds_min"] + top1["place_odds_max"]) / 2
+    top1["ev"] = top1["pred_calib"] * top1["odds_mid"]
+    ev_tbl = top1[RACE_KEYS + ["ev", "car_no", "odds_mid"]].rename(
+        columns={"car_no": "top1_car"})
+
     pay = pd.read_csv(DATA / "payouts.csv", low_memory=False)
     pay["race_date"] = pd.to_datetime(pay["race_date"])
-    fns = pay[pay["bet_type"] == "fns"][
-        ["race_date", "place_code", "race_no", "car_no_1", "refund"]
-    ].rename(columns={"car_no_1": "car_no"})
-    picks = picks.merge(fns, on=["race_date", "place_code", "race_no", "car_no"],
-                        how="left")
-    picks["mult"] = (picks["refund"].fillna(0.0) / 100.0)  # 倍率, 0=外れ
 
-    picks = picks.dropna(subset=["odds_mid", "ev"])
+    if bet_type == "fns":
+        fns = pay[pay["bet_type"] == "fns"][
+            RACE_KEYS + ["car_no_1", "refund"]
+        ].rename(columns={"car_no_1": "car_no"})
+        picks = ev_tbl.rename(columns={"top1_car": "car_no"}).merge(
+            fns, on=RACE_KEYS + ["car_no"], how="left")
+        picks["mult"] = picks["refund"].fillna(0.0) / 100.0
+
+    elif bet_type == "rf3":
+        # 予測 top-3 車を集合キーに
+        top3 = wf[wf["rank"] <= 3].groupby(RACE_KEYS)["car_no"].apply(
+            lambda s: tuple(sorted(int(c) for c in s))).reset_index(
+            name="pick_set")
+        top3 = top3[top3["pick_set"].apply(len) == 3]
+        # 三連複 払戻 (当該レースの当選 3 車)
+        rf3 = pay[pay["bet_type"] == "rf3"].copy()
+        rf3 = rf3.dropna(subset=["car_no_1", "car_no_2", "car_no_3"])
+        rf3["win_set"] = rf3[["car_no_1", "car_no_2", "car_no_3"]].apply(
+            lambda r: tuple(sorted(int(x) for x in r)), axis=1)
+        rf3 = rf3[RACE_KEYS + ["win_set", "refund"]]
+        picks = top3.merge(ev_tbl, on=RACE_KEYS, how="left").merge(
+            rf3, on=RACE_KEYS, how="left")
+        is_hit = picks["pick_set"] == picks["win_set"]
+        picks["mult"] = np.where(is_hit, picks["refund"].fillna(0.0) / 100.0, 0.0)
+    else:
+        raise ValueError(f"unknown bet_type {bet_type}")
+
+    picks = picks.dropna(subset=["ev"])
     if ev_thr > 0:
-        # ⚠️ 注意: ここで使う odds_summary の複勝オッズは実払戻より系統的に過大
-        #   (的中車で odds中点 ~3.9 vs 実払戻 ~2.2、midpoint過大 + late money前)。
-        #   EV フィルタはこの盛れたオッズで選別するため backtest ROI が
-        #   楽観に出る (実弾 ~100% に対し EV>=1.5 backtest は ~135%)。
-        #   ステーク戦略の比較は --ev-thr 0 (素の予測top1) の honest 基準で見ること。
+        # ⚠️ EV フィルタは odds_summary の複勝オッズ(top-1)依存。これは実払戻より
+        #   系統的に過大 (的中車 odds中点~3.9 vs 実払戻~2.2) なため backtest ROI が
+        #   楽観に出る。ステーク戦略の地力比較は --ev-thr 0 を併用すること。
         print("[warn] EV フィルタは odds_summary の過大オッズ依存で楽観バイアス。"
-              "honest 評価は --ev-thr 0 を使うこと。", file=sys.stderr)
+              "地力評価は --ev-thr 0 も併用。", file=sys.stderr)
         picks = picks[picks["ev"] >= ev_thr]
-    picks = picks.sort_values(["race_date", "place_code", "race_no"]).reset_index(drop=True)
+    picks = picks.sort_values(RACE_KEYS).reset_index(drop=True)
     return picks
 
 
@@ -146,6 +174,8 @@ def main() -> int:
     ap.add_argument("--cap-ticket", type=int, default=1000, help="1券種上限¥")
     ap.add_argument("--bankroll", type=int, default=22000, help="破産判定残高¥")
     ap.add_argument("--ev-thr", type=float, default=1.5, help="EV閾値(0で無効)")
+    ap.add_argument("--bet-type", default="fns", choices=["fns", "rf3"],
+                    help="fns=複勝top1 / rf3=三連複top3 BOX")
     ap.add_argument("--mc", type=int, default=2000, help="モンテカルロ順序シャッフル回数")
     ap.add_argument("--strategies", default="flat,martingale",
                     help="カンマ区切り: flat,martingale,anti")
@@ -157,13 +187,14 @@ def main() -> int:
     except Exception:
         pass
 
-    picks = build_pick_stream(args.ev_thr)
+    picks = build_pick_stream(args.ev_thr, args.bet_type)
     mult = picks["mult"].values
     n = len(mult)
     hit = (mult > 0).mean()
     win = mult[mult > 0]
 
-    print(f"=== 複勝 top-1 ピック列 ({picks['race_date'].min().date()} 〜 "
+    bt_jp = {"fns": "複勝 top-1", "rf3": "三連複 top-3 BOX"}[args.bet_type]
+    print(f"=== {bt_jp} ピック列 ({picks['race_date'].min().date()} 〜 "
           f"{picks['race_date'].max().date()}, EV>={args.ev_thr}) ===")
     print(f"レース数 {n:,} / 的中率 {hit*100:.1f}% / 的中時倍率 平均{win.mean():.2f} "
           f"中央{np.median(win):.2f} / 2.0倍未満 {(win<2.0).mean()*100:.0f}%")
