@@ -77,6 +77,10 @@ AUTO_BUY_ENABLED = _env_bool("AUTO_BUY_ENABLED", False)
 AUTO_BUY_DRY_RUN = _env_bool("AUTO_BUY_DRY_RUN", True)
 # 三連系 (rt3+rf3) も自動対象にするか。Week2 は複勝のみ (False)、Week3 で True。
 AUTO_BUY_INCLUDE_RT3 = _env_bool("AUTO_BUY_INCLUDE_RT3", False)
+# 複勝 (fns) を自動投票に含めるか。2026-06-26: 複勝は実弾 ROI 93.6% で控除率の壁を
+# 越えず累計を削る主因と判明したため **デフォルト OFF (三連系一本)**。
+# 復活させる場合は env AUTO_BUY_INCLUDE_FNS=1。経緯: memory project_decisions.md 2026-06-26。
+AUTO_BUY_INCLUDE_FNS = _env_bool("AUTO_BUY_INCLUDE_FNS", False)
 # 時間帯ガードを無視して常時自動発注するか (2026-05-31 ユーザー要望でデフォ True)。
 # False にすると下の AUTO_BUY_HOUR_START/END の夜間限定に戻る。
 AUTO_BUY_ANYTIME = _env_bool("AUTO_BUY_ANYTIME", True)
@@ -238,14 +242,21 @@ def format_bets_jp(bets: list[dict]) -> str:
 
 def build_bets(car_no: int, rec_yen: int,
                rt3_ref: dict | None,
-               include_rt3: bool = AUTO_BUY_INCLUDE_RT3) -> list[dict]:
+               include_rt3: bool = AUTO_BUY_INCLUDE_RT3,
+               include_fns: bool = AUTO_BUY_INCLUDE_FNS) -> list[dict]:
     """自動投票用の bets list を構築。
 
-    複勝 (推奨額) を必ず含み、include_rt3 かつ rt3_ref があれば三連系を追加。
+    include_fns(デフォルト OFF, 2026-06-26〜): 複勝 (推奨額) を含める。
+    include_rt3 かつ rt3_ref があれば三連系を追加。
     rt3_ref["has_rt3"]=True(浜松・山陽): 三連単+三連複 を追加。
     rt3_ref["has_rt3"]=False(伊勢崎・飯塚): 三連複のみ追加。
+
+    複勝 OFF かつ三連系対象外のレースでは **空 list** を返す
+    (呼び出し側は空なら投票スキップ)。
     """
-    bets = [{"type": "fns", "cars": [int(car_no)], "amount": int(rec_yen)}]
+    bets: list[dict] = []
+    if include_fns:
+        bets.append({"type": "fns", "cars": [int(car_no)], "amount": int(rec_yen)})
     if include_rt3 and rt3_ref:
         cars_ord = [int(c) for c in rt3_ref["cars_ordered"]]
         cars_srt = [int(c) for c in rt3_ref["cars_sorted"]]
@@ -374,6 +385,8 @@ def run_auto_buy(candidates: list[dict],
 
     results = []
     for c in candidates:
+        if not c.get("bets"):  # 複勝 OFF かつ三連系対象外 → 投票なし (防御的スキップ)
+            continue
         amount = int(c["amount"])
         ev = float(c.get("ev", 0.0))
         race_label = f"{c.get('venue','?')}_R{c['race_no']}"

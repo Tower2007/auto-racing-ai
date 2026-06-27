@@ -1387,6 +1387,9 @@ def main():
                     bets = auto_buy.build_bets(
                         int(r["car_no"]), rec_yen, rt3_map.get((pc, rno)),
                         include_rt3=_ab_include_rt3)
+                    if not bets:
+                        # 複勝 OFF かつ三連系対象外 → 自動投票なし (予測メールは別途送る)
+                        continue
                     candidates.append({
                         "race_date": target_date,
                         "place_code": pc,

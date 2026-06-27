@@ -93,18 +93,28 @@ def test_cap_boundary_exact():
 
 
 def test_build_bets():
-    assert auto_buy.build_bets(5, 300, None, include_rt3=False) == \
-        [{"type": "fns", "cars": [5], "amount": 300}]
+    # 2026-06-26〜 複勝デフォルト OFF: 三連系対象外なら空 list
+    assert auto_buy.build_bets(5, 300, None, include_rt3=False) == []
+    # 複勝 OFF × 三連系 ON: rt3+rf3 のみ (fns なし)
     bets = auto_buy.build_bets(
         5, 300, {"cars_ordered": [5, 6, 7], "cars_sorted": [5, 6, 7]},
         include_rt3=True)
-    assert len(bets) == 3
-    assert bets[1]["type"] == "rt3" and bets[1]["amount"] == 100
-    assert bets[2]["type"] == "rf3" and bets[2]["amount"] == 100
-    # include_rt3=False なら rt3_ref があっても複勝のみ
-    assert len(auto_buy.build_bets(
+    assert [b["type"] for b in bets] == ["rt3", "rf3"]
+    assert all(b["amount"] == 100 for b in bets)
+    # has_rt3=False (伊勢崎・飯塚) は rf3 のみ
+    assert [b["type"] for b in auto_buy.build_bets(
+        5, 300, {"cars_ordered": [5, 6, 7], "cars_sorted": [5, 6, 7],
+                 "has_rt3": False}, include_rt3=True)] == ["rf3"]
+    # include_fns=True で復活: 複勝先頭 + 三連系
+    bets_fns = auto_buy.build_bets(
         5, 300, {"cars_ordered": [5, 6, 7], "cars_sorted": [5, 6, 7]},
-        include_rt3=False)) == 1
+        include_rt3=True, include_fns=True)
+    assert bets_fns[0] == {"type": "fns", "cars": [5], "amount": 300}
+    assert len(bets_fns) == 3
+    # 全 OFF (複勝 OFF × 三連系 OFF) は空
+    assert auto_buy.build_bets(
+        5, 300, {"cars_ordered": [5, 6, 7], "cars_sorted": [5, 6, 7]},
+        include_rt3=False) == []
 
 
 def _run_all():
