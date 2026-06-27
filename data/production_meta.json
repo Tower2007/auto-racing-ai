@@ -1,6 +1,7 @@
 {
-  "trained_at": "2026-04-29T15:17:09",
+  "trained_at": "2026-06-28T02:44:11",
   "target": "target_top3",
+  "target_definition_version": 1,
   "n_features": 55,
   "feature_columns": [
     "advance_final_count_90d",
@@ -75,21 +76,42 @@
   ],
   "data_date_range": {
     "min": "2021-04-26",
-    "max": "2026-04-26"
+    "max": "2026-06-26"
   },
   "train_metrics": {
-    "n_train": 236123,
-    "n_val": 26353,
-    "best_iteration": 271,
-    "train_auc": 0.8325414559699078,
-    "valid_auc": 0.8265856836523581,
-    "valid_logloss": 0.49901496055721983
+    "n_train": 244663,
+    "n_val": 27213,
+    "best_iteration": 194,
+    "train_auc": 0.8257271502198033,
+    "valid_auc": 0.8229999479606538,
+    "valid_logloss": 0.5053114809243765
   },
   "calib_metrics": {
-    "n_calib": 217578,
-    "raw_auc": 0.8091561036076702,
-    "calib_auc": 0.8094006318833646,
-    "raw_logloss": 0.5200227423742884,
-    "calib_logloss": 0.519386724259095
-  }
+    "fit_data_diagnostic": {
+      "n_calib": 226978,
+      "raw_auc": 0.8094637202072541,
+      "calib_auc": 0.8096944542699438,
+      "raw_logloss": 0.5197943919181167,
+      "calib_logloss": 0.5191957173575341,
+      "note": "in-sample (fit data 上の診断値)。honest 評価値として引用しないこと。校正性能の評価指標は honest_split を見ること。"
+    },
+    "honest_split": {
+      "cutoff": "2024-04",
+      "n_calib": 103360,
+      "n_eval": 123618,
+      "raw_auc": 0.8157985562391892,
+      "calib_auc": 0.8156761466675098,
+      "raw_logloss": 0.5125330424100109,
+      "calib_logloss": 0.5167879321187796,
+      "note": "honest: fit on test_month < 2024-04, eval on test_month >= 2024-04"
+    },
+    "n_calib": 226978,
+    "raw_auc": 0.8094637202072541,
+    "calib_auc": 0.8096944542699438,
+    "raw_logloss": 0.5197943919181167,
+    "calib_logloss": 0.5191957173575341,
+    "_legacy_keys_note": "n_calib/raw_auc/calib_auc/raw_logloss/calib_logloss は in-sample 値で 後方互換のため残置。新しいコードは fit_data_diagnostic か honest_split を参照。"
+  },
+  "quality_gate_verdict": "OK",
+  "adoption_reason": "同一val 公平比較: 候補0.8230 vs 現役0.8224 (diff=+0.0006, 許容-0.003)"
 }
