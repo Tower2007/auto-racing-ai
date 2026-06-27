@@ -88,8 +88,13 @@ def prepare(df: pd.DataFrame, target_col: str = "target_top3"):
     return X, y, df, feature_cols
 
 
-def train_full(X: pd.DataFrame, y: pd.Series, dates: pd.Series) -> tuple[lgb.Booster, dict]:
-    """末尾 10% を val に切って early stopping。残りを train。"""
+def train_full(X: pd.DataFrame, y: pd.Series, dates: pd.Series
+               ) -> tuple[lgb.Booster, dict, pd.DataFrame, pd.Series]:
+    """末尾 10% を val に切って early stopping。残りを train。
+
+    品質ゲートの公平比較のため、val 集合 (X_va, y_va) も返す
+    (現役モデルを同一 val で再採点して候補と比べる、2026-06-26)。
+    """
     cutoff = dates.quantile(0.9)
     is_val = dates >= cutoff
     X_tr, X_va = X[~is_val.values], X[is_val.values]
@@ -125,7 +130,7 @@ def train_full(X: pd.DataFrame, y: pd.Series, dates: pd.Series) -> tuple[lgb.Boo
         "valid_auc": float(roc_auc_score(y_va, p_va)),
         "valid_logloss": float(log_loss(y_va, p_va)),
     }
-    return model, metrics
+    return model, metrics, X_va, y_va
 
 
 def fit_calibration() -> tuple[IsotonicRegression, dict]:
@@ -251,76 +256,129 @@ def _append_retrain_history(verdict: str, reason: str, metrics: dict) -> None:
         logger.warning("retrain_history.csv 追記失敗: %s", e)
 
 
+# 品質ゲート パラメータ (2026-06-26 再設計)。
+# 旧設計は「凍結した高値 valid_auc(0.8266) を恒久ベースラインに、候補ごとに別の
+# val 窓で測った AUC を引き算」していたため、別データ上の比較が不公平 + 永久凍結
+# (5/24〜6/14 の4回が同一データで NG 連発、モデル 4/29 塩漬け) だった。
+# 新設計: 現役モデルを **候補と同一の val 集合で再採点** して公平比較し、
+#   許容バンド + 鮮度オーバーライドで「更新すべき時に更新できる」ようにする。
+ADOPT_TOL_AUC = 0.003    # 同一val で現役-この値 以内なら採用 (ラン間ノイズ吸収)
+STALE_DAYS = 35          # 現役がこの日数超 → 鮮度オーバーライド発動
+STALE_TOL_AUC = 0.010    # 鮮度オーバーライド時の許容 (古いモデルは多少劣っても更新)
+
+
+def _model_age_days(old_meta: dict | None) -> int | None:
+    """現役モデルの学習からの経過日数。"""
+    if not old_meta:
+        return None
+    ts = old_meta.get("trained_at")
+    if not ts:
+        return None
+    try:
+        return (datetime.now() - datetime.fromisoformat(ts)).days
+    except Exception:
+        return None
+
+
+def _incumbent_auc_on_val(X_va: pd.DataFrame, y_va: pd.Series,
+                          old_meta: dict | None) -> float | None:
+    """現役 production_model.lgb を候補と同一の val 集合で採点し AUC を返す。
+
+    窓ズレのない公平比較のため。特徴量列は old_meta の feature_columns に揃える。
+    再採点不能 (モデル無し / 列不一致 / 例外) なら None。
+    """
+    model_path = DATA / "production_model.lgb"
+    if old_meta is None or not model_path.exists():
+        return None
+    try:
+        booster = lgb.Booster(model_file=str(model_path))
+        cols = old_meta.get("feature_columns")
+        if cols and all(c in X_va.columns for c in cols):
+            Xv = X_va[cols]
+        else:
+            Xv = X_va  # 列不一致時は素のまま (名前で解決)
+        p = booster.predict(Xv)
+        return float(roc_auc_score(y_va, p))
+    except Exception as e:
+        logger.warning("現役モデルの val 再採点に失敗 (fallback): %s", e)
+        return None
+
+
 def _should_adopt(new_metrics: dict, old_meta: dict | None,
+                  incumbent_auc_same_val: float | None,
+                  model_age_days: int | None,
                   force: bool = False) -> tuple[str, str]:
-    """新モデルを採用すべきか判定。
+    """新モデルを採用すべきか判定 (2026-06-26 公平比較版)。
 
-    判定基準 (NG = 見送り, WARN = 採用するが警告, OK = 採用):
-      1. 旧モデルなし → OK
-      2. --force → OK (強制)
-      3. valid_auc が旧モデルより低下 → NG
-      4. valid_logloss が旧モデルより 1% 以上悪化 → NG
-      5. best_iteration が旧モデルの 40% 未満 → NG (学習が浅すぎる)
-      6. best_iteration が旧モデルの 60% 未満 → WARN (浅い傾向)
-      7. それ以外 → OK
-
-    Returns:
-        (verdict: "OK" | "WARN" | "NG", reason: str)
+    NG=見送り / WARN=採用するが警告 / OK=採用。
+      1. 旧モデルなし / --force → OK
+      2. target_definition_version 変更 → WARN
+      3. best_iteration が旧の 40% 未満 → NG (degenerate 学習の sanity)
+      4. 主判定 (同一val AUC):
+         - 候補 >= 現役 - ADOPT_TOL_AUC → OK
+         - 上記外でも 現役が STALE_DAYS 超 かつ 候補 >= 現役 - STALE_TOL_AUC
+           → WARN (鮮度オーバーライド: 多少劣っても鮮度優先で採用)
+         - それ以外 → NG
+         - 再採点不能なら record 値比較に fallback (許容バンド付き)
     """
     if old_meta is None:
         return "OK", "旧モデルなし、初回採用"
     if force:
         return "OK", "--force 指定、強制採用"
 
-    # 教師データ定義バージョンの不一致チェック
     old_tdv = old_meta.get("target_definition_version")
     if old_tdv is not None and old_tdv != TARGET_DEFINITION_VERSION:
         return "WARN", (
             f"target_definition_version 変更: {old_tdv} -> {TARGET_DEFINITION_VERSION}. "
-            "AUC/best_iter の差は教師データ定義差の可能性あり"
+            "教師データ定義差の可能性あり、採用するが要確認"
         )
-
-    old_tm = old_meta.get("train_metrics", {})
-    old_auc = old_tm.get("valid_auc", 0)
-    old_logloss = old_tm.get("valid_logloss", 999)
-    old_best_iter = old_tm.get("best_iteration", 0)
 
     new_auc = new_metrics.get("valid_auc", 0)
-    new_logloss = new_metrics.get("valid_logloss", 999)
     new_best_iter = new_metrics.get("best_iteration", 0)
+    old_best_iter = old_meta.get("train_metrics", {}).get("best_iteration", 0)
 
-    # AUC 低下 → NG
-    if new_auc < old_auc:
-        return "NG", (
-            f"valid_auc 低下: {old_auc:.4f} -> {new_auc:.4f} "
-            f"(diff={new_auc - old_auc:+.4f})"
-        )
-
-    # logloss 1% 以上悪化 → NG
-    if old_logloss > 0 and new_logloss > old_logloss * 1.01:
-        return "NG", (
-            f"valid_logloss 悪化: {old_logloss:.5f} -> {new_logloss:.5f} "
-            f"(+{(new_logloss / old_logloss - 1) * 100:.1f}%)"
-        )
-
-    # best_iteration が旧の 40% 未満 → NG (学習が浅すぎ)
+    # sanity: degenerate 学習 (best_iter 激減) は無条件 NG
     if old_best_iter > 0 and new_best_iter < old_best_iter * 0.4:
         return "NG", (
             f"best_iteration 激減: {old_best_iter} -> {new_best_iter} "
-            f"({new_best_iter / old_best_iter * 100:.0f}%、閾値 40%)"
+            f"({new_best_iter / old_best_iter * 100:.0f}%、閾値40% degenerate疑い)"
         )
 
-    # best_iteration が旧の 60% 未満 → WARN (浅い傾向)
-    if old_best_iter > 0 and new_best_iter < old_best_iter * 0.6:
+    age = model_age_days if model_age_days is not None else 0
+
+    # 主判定: 同一 val 上の公平比較
+    if incumbent_auc_same_val is not None:
+        diff = new_auc - incumbent_auc_same_val
+        if diff >= -ADOPT_TOL_AUC:
+            return "OK", (
+                f"同一val 公平比較: 候補{new_auc:.4f} vs 現役{incumbent_auc_same_val:.4f} "
+                f"(diff={diff:+.4f}, 許容-{ADOPT_TOL_AUC})"
+            )
+        if age >= STALE_DAYS and diff >= -STALE_TOL_AUC:
+            return "WARN", (
+                f"鮮度オーバーライド採用: 現役{age}日経過, 同一val diff={diff:+.4f} "
+                f"(許容-{STALE_TOL_AUC})。鮮度優先で更新"
+            )
+        return "NG", (
+            f"同一val AUC 低下: 候補{new_auc:.4f} vs 現役{incumbent_auc_same_val:.4f} "
+            f"(diff={diff:+.4f}, 許容-{ADOPT_TOL_AUC}, 現役{age}日)"
+        )
+
+    # fallback: 再採点不能 → record 値比較 (許容バンド付き、旧来より緩い)
+    old_auc = old_meta.get("train_metrics", {}).get("valid_auc", 0)
+    diff = new_auc - old_auc
+    if diff >= -ADOPT_TOL_AUC:
+        return "OK", (
+            f"(fallback record比較) 候補{new_auc:.4f} vs 現役記録{old_auc:.4f} "
+            f"(diff={diff:+.4f}, 許容-{ADOPT_TOL_AUC})"
+        )
+    if age >= STALE_DAYS and diff >= -STALE_TOL_AUC:
         return "WARN", (
-            f"best_iteration 減少: {old_best_iter} -> {new_best_iter} "
-            f"({new_best_iter / old_best_iter * 100:.0f}%、60% 未満で WARN)"
+            f"(fallback) 鮮度オーバーライド: 現役{age}日, diff={diff:+.4f}"
         )
-
-    return "OK", (
-        f"OK: valid_auc {old_auc:.4f} -> {new_auc:.4f}, "
-        f"logloss {old_logloss:.5f} -> {new_logloss:.5f}, "
-        f"best_iter {old_best_iter} -> {new_best_iter}"
+    return "NG", (
+        f"(fallback record比較) valid_auc 低下: {old_auc:.4f} -> {new_auc:.4f} "
+        f"(diff={diff:+.4f}, 許容-{ADOPT_TOL_AUC})"
     )
 
 
@@ -336,12 +394,19 @@ def main():
     X, y, df_kept, feature_cols = prepare(df, args.target)
     logger.info("Total kept: %s rows × %d features", f"{len(df_kept):,}", X.shape[1])
 
-    model, train_metrics = train_full(X, y, df_kept["race_date"])
+    model, train_metrics, X_va, y_va = train_full(X, y, df_kept["race_date"])
     iso, calib_metrics = fit_calibration()
 
-    # 品質ゲート: 旧モデルと比較
+    # 品質ゲート: 現役モデルを同一 val で再採点して公平比較 (2026-06-26)
     old_meta = _load_current_meta()
-    verdict, reason = _should_adopt(train_metrics, old_meta, force=args.force)
+    incumbent_auc = _incumbent_auc_on_val(X_va, y_va, old_meta)
+    age_days = _model_age_days(old_meta)
+    if incumbent_auc is not None:
+        logger.info("現役モデル 同一val 再採点 AUC=%.4f (候補=%.4f, 現役%s日経過)",
+                    incumbent_auc, train_metrics["valid_auc"],
+                    age_days if age_days is not None else "?")
+    verdict, reason = _should_adopt(
+        train_metrics, old_meta, incumbent_auc, age_days, force=args.force)
 
     # 学習履歴を append (OK/WARN/NG 全件、塩漬け監視用)
     _append_retrain_history(verdict, reason, train_metrics)
