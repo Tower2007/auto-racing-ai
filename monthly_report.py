@@ -419,6 +419,24 @@ def render_html(month_label: str, data: dict, v_trend: list, a_trend: list,
            css, '</head><body>']
     out.append(f'<h2>🗓 月次収支レポート ({month_label})</h2>')
 
+    _append_summary_html(out, v, a)
+    _append_trend_html(out, v_trend, a_trend)
+    _append_bet_types_html(out, data)
+    _append_venues_html(out, data)
+    _append_race_rows_html(out, data, v, a)
+    _append_cumulative_html(out, cum_virtual, cum_actual)
+
+    out.append('<div class="note">')
+    out.append(f'※ 推奨(仮想) は複勝 top-1 推奨を <b>1本 {BET}円</b> で買った仮想収支 '
+               '(picks_audit と共通、結果取込済みのみ集計)。<br>')
+    out.append('※ 実購入は vote.autorace.jp 投票履歴ベースの実額 (複勝/三連単/三連複 含む)。<br>')
+    out.append('※ 控除率 25-30% のため長期 ROI は理論上 70-75%。エンタメ用途。')
+    out.append('</div></body></html>')
+    return "\n".join(out)
+
+
+def _append_summary_html(out: list[str], v: dict, a: dict) -> None:
+    """A. 当月サマリ (render_html の下請け)。"""
     # A. 当月サマリ
     out.append('<div class="box"><h3 style="margin:0 0 8px 0;">当月サマリ</h3>')
     out.append('<table><thead><tr><th>区分</th><th>投資</th><th>回収</th>'
@@ -433,6 +451,9 @@ def render_html(month_label: str, data: dict, v_trend: list, a_trend: list,
                f'<td>{a["n"]}件</td></tr>')
     out.append('</tbody></table></div>')
 
+
+def _append_trend_html(out: list[str], v_trend: list, a_trend: list) -> None:
+    """B. 月次 ROI 推移 (render_html の下請け)。"""
     # B. 月次 ROI 推移
     out.append('<h3>月次 ROI 推移</h3>')
     out.append('<div style="font-size:0.85em;color:#666;margin-bottom:4px;">'
@@ -447,6 +468,9 @@ def render_html(month_label: str, data: dict, v_trend: list, a_trend: list,
         out.append(_roi_bar_html("実購入", aa["roi"] if aa else None,
                                  sub=(f'{aa["profit"]:+,}円' if aa else "")))
 
+
+def _append_bet_types_html(out: list[str], data: dict) -> None:
+    """C. 実購入 券種別収支 (render_html の下請け)。"""
     # C. 実購入 券種別
     if data["bet_types"]:
         out.append('<h3>実購入 券種別収支 (当月)</h3>')
@@ -459,6 +483,9 @@ def render_html(month_label: str, data: dict, v_trend: list, a_trend: list,
                        f'<td>{_roi(b["roi"] if b["bet"] else None)}</td></tr>')
         out.append('</tbody></table>')
 
+
+def _append_venues_html(out: list[str], data: dict) -> None:
+    """D. 場別収支 (render_html の下請け)。"""
     # D. 場別収支
     if data["a_venues"] or data["v_venues"]:
         out.append('<h3>場別収支 (当月)</h3>')
@@ -478,6 +505,9 @@ def render_html(month_label: str, data: dict, v_trend: list, a_trend: list,
                 f'<td>{_color_profit_html(y["profit"]) if y else "—"}</td></tr>')
         out.append('</tbody></table>')
 
+
+def _append_race_rows_html(out: list[str], data: dict, v: dict, a: dict) -> None:
+    """E. レース別 推奨と結果 (render_html の下請け)。"""
     # E. レース別 推奨と結果 + 実購入
     out.append('<h3>レース別 推奨と結果 (当月)</h3>')
     if not data["race_rows"]:
@@ -510,6 +540,9 @@ def render_html(month_label: str, data: dict, v_trend: list, a_trend: list,
                    f'<br><small style="color:#555;">実ROI {_roi(a["roi"] if a["bet"] else None)}</small></td></tr>')
         out.append('</tbody></table>')
 
+
+def _append_cumulative_html(out: list[str], cum_virtual: dict, cum_actual: dict) -> None:
+    """F. 通算収支 (render_html の下請け)。"""
     # F. 通算
     out.append('<h3>通算収支 (全期間)</h3>')
     out.append('<div class="box" style="background:#fffbeb;border-left-color:#a16207;">')
@@ -526,14 +559,6 @@ def render_html(month_label: str, data: dict, v_trend: list, a_trend: list,
                    f'収支 <b>{_color_profit_html(cum_actual["profit"])}円</b> / '
                    f'ROI <b>{_roi(cum_actual["roi"] if cum_actual["bet"] else None)}</b></div>')
     out.append('</div>')
-
-    out.append('<div class="note">')
-    out.append(f'※ 推奨(仮想) は複勝 top-1 推奨を <b>1本 {BET}円</b> で買った仮想収支 '
-               '(picks_audit と共通、結果取込済みのみ集計)。<br>')
-    out.append('※ 実購入は vote.autorace.jp 投票履歴ベースの実額 (複勝/三連単/三連複 含む)。<br>')
-    out.append('※ 控除率 25-30% のため長期 ROI は理論上 70-75%。エンタメ用途。')
-    out.append('</div></body></html>')
-    return "\n".join(out)
 
 
 # ─────────────────────────────────────────────────────────────
