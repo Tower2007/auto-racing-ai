@@ -147,27 +147,8 @@ def extract_errors(log_lines: list[str]) -> list[str]:
     return out
 
 
-def check_bet_history_health(days: int = 7) -> dict:
-    """bet_history 死活監視(Codex R6 + R7 提案)。
-
-    R7 で WARN/NG 分類を追加:
-      - bet_history.csv 不在            → WARN
-      - 最終取得日 > today-2            → WARN
-      - 推奨あり/購入 0                 → INFO(NG ではない、ユーザー不在の可能性)
-      - log 最終成功 > 48h              → WARN
-      - log に error / 認証失敗 / cookie → NG
-    """
-    out: dict = {
-        "last_date": None,
-        "recent_r_count": 0,
-        "log_last_success": None,
-        "missing_picks": 0,
-        "missing_picks_details": [],
-        "alerts": [],   # [(level, msg)] level ∈ {INFO, WARN, NG}
-    }
-    today = pd.Timestamp.now().normalize()
-
-    bh_p = DATA / "bet_history.csv"
+def _check_bh_csv_freshness(out: dict, bh_p: Path, today: pd.Timestamp, days: int) -> None:
+    """bet_history.csv の存在・最終取得日を検査 (check_bet_history_health の下請け)。"""
     if not (bh_p.exists() and bh_p.stat().st_size > 0):
         out["alerts"].append(("WARN", "bet_history.csv が存在しない"))
     else:
@@ -186,6 +167,9 @@ def check_bet_history_health(days: int = 7) -> dict:
                         "WARN", f"bet_history 最終日が古い ({out['last_date']}, today-2 超え)"
                     ))
 
+
+def _check_fetch_order_log(out: dict) -> None:
+    """fetch_order_history.log の最終成功・NG パターンを検査 (check_bet_history_health の下請け)。"""
     log_p = DATA / "fetch_order_history.log"
     if not log_p.exists():
         out["alerts"].append(("WARN", "fetch_order_history.log が存在しない"))
@@ -243,6 +227,9 @@ def check_bet_history_health(days: int = 7) -> dict:
         except Exception as e:
             out["alerts"].append(("WARN", f"fetch_order_history.log 読込失敗: {e}"))
 
+
+def _check_missing_picks(out: dict, bh_p: Path, today: pd.Timestamp, days: int) -> None:
+    """推奨 (picks) にあって bet_history に無い R を集計 (check_bet_history_health の下請け)。"""
     # 推奨 vs 購入: picks にあって bet_history に無い件数(R7: NG にせず INFO)
     picks_p = DATA / "daily_predict_picks.csv"
     if picks_p.exists() and picks_p.stat().st_size > 0 and bh_p.exists():
@@ -318,6 +305,32 @@ def check_bet_history_health(days: int = 7) -> dict:
                         ))
         except Exception as e:
             out["alerts"].append(("WARN", f"missing picks 計算失敗: {e}"))
+
+
+def check_bet_history_health(days: int = 7) -> dict:
+    """bet_history 死活監視(Codex R6 + R7 提案)。
+
+    R7 で WARN/NG 分類を追加:
+      - bet_history.csv 不在            → WARN
+      - 最終取得日 > today-2            → WARN
+      - 推奨あり/購入 0                 → INFO(NG ではない、ユーザー不在の可能性)
+      - log 最終成功 > 48h              → WARN
+      - log に error / 認証失敗 / cookie → NG
+    """
+    out: dict = {
+        "last_date": None,
+        "recent_r_count": 0,
+        "log_last_success": None,
+        "missing_picks": 0,
+        "missing_picks_details": [],
+        "alerts": [],   # [(level, msg)] level ∈ {INFO, WARN, NG}
+    }
+    today = pd.Timestamp.now().normalize()
+    bh_p = DATA / "bet_history.csv"
+
+    _check_bh_csv_freshness(out, bh_p, today, days)
+    _check_fetch_order_log(out)
+    _check_missing_picks(out, bh_p, today, days)
 
     # 全体ステータス決定: NG > WARN > OK
     levels = [a[0] for a in out["alerts"]]
@@ -1108,6 +1121,13 @@ def render_health_html(bh: dict, st: dict, ehi: dict | None = None,
             f'raw snapshot: {st["snapshot_path"]}</p>'
         )
 
+    _append_ngrok_html(parts, ng)
+    _append_model_freshness_html(parts, mf)
+    return "\n".join(parts)
+
+
+def _append_ngrok_html(parts: list[str], ng: dict | None) -> None:
+    """ngrok 死活監視セクションを parts に追記 (render_health_html の下請け)。"""
     # ngrok 死活監視 (Antigravity 2026-05-23 提案)
     if ng is not None:
         parts.append(
@@ -1144,6 +1164,9 @@ def render_health_html(bh: dict, st: dict, ehi: dict | None = None,
                 parts.append(f'<li>{ts}  {reason}</li>')
             parts.append("</ul>")
 
+
+def _append_model_freshness_html(parts: list[str], mf: dict | None) -> None:
+    """モデル塩漬け監視セクションを parts に追記 (render_health_html の下請け)。"""
     # モデル塩漬けリスク (Antigravity 2026-05-23 提案 #2)
     if mf is not None:
         age = mf.get("model_age_days")
@@ -1196,8 +1219,6 @@ def render_health_html(bh: dict, st: dict, ehi: dict | None = None,
                 color = {"NG": "#c62828", "WARN": "#e65100", "INFO": "#666"}.get(level, "#444")
                 parts.append(f'<li style="color:{color}"><b>{level}</b>: {msg}</li>')
             parts.append("</ul>")
-
-    return "\n".join(parts)
 
 
 def render_text(summary: dict, days: list[dict], errors: list[str]) -> str:
@@ -1336,6 +1357,15 @@ def _html_escape(s: str) -> str:
     return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;") + "<br>")
 
 
+def _insert_before_footer(html: str, section_html: str) -> str:
+    """フッター <hr> の直前にセクション HTML を 1 回だけ挿入する。"""
+    return html.replace(
+        '<hr style="border:none;',
+        section_html + '\n<hr style="border:none;',
+        1,
+    )
+
+
 def main() -> None:
     # Windows console (cp932) で絵文字が落ちないようにする
     import sys
@@ -1379,11 +1409,7 @@ def main() -> None:
         health_html = render_health_html(
             bh_health, st_health, ehi_health, ng_health, mf_health
         )
-        html = html.replace(
-            '<hr style="border:none;',
-            health_html + '\n<hr style="border:none;',
-            1,
-        )
+        html = _insert_before_footer(html, health_html)
     except Exception as e:
         text += f"\n\n(死活監視スキップ: {e})"
 
@@ -1398,11 +1424,7 @@ def main() -> None:
         if perf and perf["n_total"] > 0:
             text += "\n\n" + render_cumulative_text(perf)
             cum_html = render_cumulative_html(perf)
-            html = html.replace(
-                '<hr style="border:none;',
-                cum_html + '\n<hr style="border:none;',
-                1,
-            )
+            html = _insert_before_footer(html, cum_html)
     except Exception as e:
         text += f"\n\n(累積成績スキップ: {e})"
 
@@ -1415,11 +1437,7 @@ def main() -> None:
             text += "\n\n" + _audit_render_text(audit, args.days)
             # HTML: footer hr の前に挿入
             audit_html = _audit_render_html(audit, args.days)
-            html = html.replace(
-                '<hr style="border:none;',
-                audit_html + '\n<hr style="border:none;',
-                1,
-            )
+            html = _insert_before_footer(html, audit_html)
         except Exception as e:
             text += f"\n\n(picks 監査スキップ: {e})"
 
@@ -1434,11 +1452,7 @@ def main() -> None:
         rec = _rec_build(args.days)
         text += "\n\n" + _rec_text(rec)
         rec_html = _rec_html(rec)
-        html = html.replace(
-            '<hr style="border:none;',
-            rec_html + '\n<hr style="border:none;',
-            1,
-        )
+        html = _insert_before_footer(html, rec_html)
     except Exception as e:
         text += f"\n\n(推奨 vs 購入 監査スキップ: {e})"
 
@@ -1449,11 +1463,7 @@ def main() -> None:
         if bh is not None:
             bh_text, bh_html = bh
             text += "\n\n" + bh_text
-            html = html.replace(
-                '<hr style="border:none;',
-                bh_html + '\n<hr style="border:none;',
-                1,
-            )
+            html = _insert_before_footer(html, bh_html)
     except Exception as e:
         text += f"\n\n(実購入損益スキップ: {e})"
 
@@ -1463,11 +1473,7 @@ def main() -> None:
         tp_health = check_3point_health()
         text += "\n\n" + render_3point_text(tp_health)
         tp_html = render_3point_html(tp_health)
-        html = html.replace(
-            '<hr style="border:none;',
-            tp_html + '\n<hr style="border:none;',
-            1,
-        )
+        html = _insert_before_footer(html, tp_html)
         if tp_health.get("triggered") and not tp_health.get("flag_exists"):
             write_rt3_stop_flag(tp_health.get("stop_reason", "stop"))
             text += "\n  → data/rt3_stop.flag を書き出しました (三連系購入を停止)。"
