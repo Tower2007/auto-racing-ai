@@ -1546,13 +1546,13 @@ tick();
                 st.link_button(
                     f"📊 {venue} R{r} オッズを見る",
                     f"https://autorace.jp/race_info/Odds/{venue}/{target_date}/{r}",
-                    use_container_width=True,
+                    width="stretch",
                 )
             with bcol2:
                 st.link_button(
                     f"🎯 投票へ (autorace.jp 公式)",
                     "https://vote.autorace.jp/",
-                    use_container_width=True,
+                    width="stretch",
                 )
 
         with st.expander(
@@ -1574,16 +1574,16 @@ tick();
                         top3["ev_avg_calib"] = top3["ev_avg_calib"].round(2)
                         rename_map["ev_avg_calib"] = "EV"
                     top3 = top3.rename(columns=rename_map)
-                    st.dataframe(top3, hide_index=True, use_container_width=True)
+                    st.dataframe(top3, hide_index=True, width="stretch")
                 else:
                     st.dataframe(
                         pd.DataFrame({"車": top_cars, "順位": ["◎ 本命", "○ 対抗", "▲ 単穴"][:len(top_cars)]}),
-                        hide_index=True, use_container_width=True,
+                        hide_index=True, width="stretch",
                     )
             with c2:
                 n_bets = len(selected_bets)
                 st.markdown(f"**買い目** ({fmt_yen(bet_amount)} × {n_bets} = {fmt_yen(bet_amount*n_bets)})")
-                st.dataframe(pd.DataFrame(result_rows), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(result_rows), hide_index=True, width="stretch")
 
     # ── ヒーローカードを最上段に充填 ──
     n_settled = sum(1 for info in live_data.values() if info["has_result"])
@@ -1778,11 +1778,11 @@ for r in races:
             top3_df["car_no"] = top3_df["car_no"].astype(int)
             top3_df["pred_calib"] = top3_df["pred_calib"].round(3)
             top3_df.columns = ["車", "pred"]
-            st.dataframe(top3_df, hide_index=True, use_container_width=True)
+            st.dataframe(top3_df, hide_index=True, width="stretch")
         with c2:
             n_bets = len(selected_bets)
             st.markdown(f"**買い目** ({fmt_yen(bet_amount)} × {n_bets} = {fmt_yen(bet_amount*n_bets)})")
-            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
 # 1日サマリ
 st.markdown("---")

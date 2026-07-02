@@ -371,7 +371,7 @@ if expected_pin:
 
 st.write("")
 
-if st.button("✅ 購入する", type="primary", use_container_width=True):
+if st.button("✅ 購入する", type="primary", width="stretch"):
     # PIN 認証チェック (設定時のみ)
     if expected_pin and pin_input != expected_pin:
         st.error("🚫 PIN が一致しません")
