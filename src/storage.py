@@ -65,6 +65,15 @@ CSV_SCHEMAS: dict[str, list[str]] = {
         "car_no_1", "car_no_2", "car_no_3",
         "odds", "odds_min", "odds_max", "captured_at",
     ],
+    # 直前オッズ 2 時点スナップショット (odds_prerace_daemon.py が T-5/T-1 分前に記録)。
+    # スキーマ = odds_combo_snapshots.csv + target_offset_min (5 or 1)。
+    # bet_type は combo 5 券種 (rtw/rfw/wid/rt3/rf3) に加えて
+    # tns (単勝: car_no_1 + odds) / fns (複勝: car_no_1 + odds_min/odds_max) も縦持ち。
+    "odds_combo_prerace.csv": [
+        "race_date", "place_code", "race_no", "bet_type",
+        "car_no_1", "car_no_2", "car_no_3",
+        "odds", "odds_min", "odds_max", "captured_at", "target_offset_min",
+    ],
     # 発火時の気象 (Hold/Today はリアルタイムのみで遡及不能)。
     # roadtemp=走路温度 (タイヤグリップに直結するオート固有の重要特徴量候補)
     "weather_snapshots.csv": [
