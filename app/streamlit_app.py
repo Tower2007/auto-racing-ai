@@ -458,6 +458,85 @@ def fmt_yen(v: float) -> str:
     return f"{sign}¥{abs(int(v)):,}"
 
 
+# ── 遊び心層 (実況コメント・ムード・日替わりフレーズ) ──────────────
+
+def _pick_line(key: str, lines: list[str]) -> str:
+    """key に対して決定論的に 1 行選ぶ (rerun で変わらない)。"""
+    import hashlib
+    h = int(hashlib.md5(key.encode("utf-8")).hexdigest(), 16)
+    return lines[h % len(lines)]
+
+
+DAILY_PHRASES = [
+    "🏁 グッドスタートを制する者がレースを制す",
+    "🔧 整備は嘘をつかない、データも嘘をつかない…はず",
+    "🌀 オートレースは風を読むスポーツ。今日の風はどっちだ",
+    "💺 スタンド最前列気分でお楽しみください",
+    "🎌 大穴は忘れた頃にやってくる",
+    "☕ 熱くなりすぎたら一杯のコーヒーを",
+    "📐 セン一の距離感、それがオートの醍醐味",
+    "🛞 タイヤは温まってからが本番。予想もね",
+    "🎯 当てにいくな、獲りにいけ",
+    "🌙 ミッドナイトは魔物が棲む時間帯",
+    "📊 期待値の神様は細部に宿る",
+    "🍀 今日がその日かもしれない",
+]
+
+
+def race_commentary(key: str, race_profit: float, race_refund: float,
+                    actual_top3: list | None, top1_car: int) -> str:
+    """確定レース用の一言実況。結果に応じたトーンで決定論的に選ぶ。"""
+    if race_profit >= 1000:
+        lines = [
+            "🎊 特大の一撃！今夜は焼肉で祝勝会だ！",
+            "💥 ドッカーン！これがあるからやめられない！",
+            "🏆 会心の的中！実況席も総立ちです！",
+            "🎆 花火級の払戻！お見事すぎる！",
+        ]
+    elif race_profit > 0:
+        lines = [
+            "😎 きっちり回収、プロの仕事です",
+            "✨ 読み通りの展開！お見事！",
+            "🎯 予想がズバリ！この調子でいきましょう",
+            "👏 手堅く的中、チャリンと音がしました",
+        ]
+    elif race_refund > 0:
+        lines = [
+            "😤 当たったのに回収しきれず…オッズの壁は厚い",
+            "🤏 かすった！収支はマイナス、なんとも悔しい！",
+            "😅 的中はしたが焼け石に水…次だ次！",
+        ]
+    elif actual_top3 and top1_car in actual_top3:
+        lines = [
+            f"😭 本命{top1_car}号は好走！買い目が一歩届かなかった…",
+            f"🫠 {top1_car}号は仕事をした。噛み合わなかっただけ…",
+            f"📉 {top1_car}号3着内も配当に届かず。紙一重！",
+        ]
+    else:
+        lines = [
+            "🌪 大荒れ！こんな日もある、切り替えていこう",
+            f"👻 本命{top1_car}号どこ行った！？オートは難しい…",
+            "💨 完敗！レースは水物、次のチャンスを待て",
+            "🙈 見なかったことにしよう。次のレースに集中！",
+        ]
+    return _pick_line(key, lines)
+
+
+def today_mood(profit: float, n_settled: int) -> tuple[str, str]:
+    """当日収支から (絵文字, 一言) のムードを返す。"""
+    if n_settled == 0:
+        return "🌅", "これから開戦！今日はどんなドラマが待っているか"
+    if profit >= 1000:
+        return "🔥", "絶好調！走路の風が味方している"
+    if profit > 0:
+        return "😊", "好調キープ、この波に乗っていこう"
+    if profit == 0:
+        return "😐", "五分五分の攻防、ここからが勝負どころ"
+    if profit > -1000:
+        return "☁️", "我慢の展開…嵐の前の静けさと信じたい"
+    return "🌧", "今日は向かい風…無理せず楽しむが吉"
+
+
 # ── UI 層 ──
 
 st.set_page_config(
@@ -947,6 +1026,13 @@ _fx_html = (
 st.markdown(f'<div class="bike-track">{_fx_html}{_dusts_html}{_bikes_html}</div>', unsafe_allow_html=True)
 
 st.caption("中間モデル(直前) + 公式 AI 予想(前売) を時間で自動切替。5〜7 券種を提示します。")
+# 今日のひとこと (日替わり、決定論的)
+st.markdown(
+    f'<div style="text-align:center; opacity:0.65; font-size:13px; '
+    f'font-style:italic; margin-top:-4px;">'
+    f'— {_pick_line(str(jst_today()), DAILY_PHRASES)} —</div>',
+    unsafe_allow_html=True,
+)
 
 # cloud モードはリプレイ機能を使わないので大型 CSV/parquet を読まない
 # (data/walkforward_predictions_morning_top3.parquet, odds_summary.csv 等は git 管理外)
@@ -1234,6 +1320,7 @@ if is_live_mode:
     n_recommended_pending = 0   # 推奨判定された未走レース数
     recommended_settled_races: list[int] = []  # R 番号の昇順
     recommended_pending_races: list[int] = []
+    settled_seq: list[tuple[int, bool]] = []  # (race_no, 的中=払戻あり) ストリーク用
     for r in races:
         info = live_data[r]
         if not info["top_cars"]:
@@ -1447,6 +1534,7 @@ if is_live_mode:
             if win_amount > biggest_win_amount:
                 biggest_win_amount = win_amount
                 biggest_win_race = r
+            settled_seq.append((r, race_refund > 0))  # ストリーク用 (的中=払戻あり)
         else:
             pending_cost += race_cost
 
@@ -1559,6 +1647,20 @@ tick();
             f"{next_prefix}R{r}{time_label}  {badge}  ({detail}){header_extra}{race_summary_label}",
             expanded=(is_next or is_recommended or badge.startswith("⏳")),
         ):
+            # 🎙 一言実況 (確定レースのみ、結果トーン連動・決定論的)
+            if info["has_result"]:
+                _comm = race_commentary(
+                    f"{target_date}_{venue}_{r}",
+                    race_refund - race_cost, race_refund,
+                    actual_top3, top_cars[0],
+                )
+                st.markdown(
+                    f'<div style="background:rgba(255,255,255,0.05); '
+                    f'border-left:3px solid #f39c12; padding:6px 12px; '
+                    f'border-radius:4px; margin-bottom:8px; font-size:14px;">'
+                    f'<b>🎙 実況:</b> {_comm}</div>',
+                    unsafe_allow_html=True,
+                )
             c1, c2 = st.columns([1, 2])
             with c1:
                 st.markdown(f"**予想 top 3** ({source_label})")
@@ -1598,6 +1700,33 @@ tick();
                 n_settled / len(races),
                 text=f"進捗: {n_settled} / {len(races)} レース確定 ／ 投票残 {len(races) - n_settled} R",
             )
+        # 🌡 今日のムード + 連続的中/連敗ストリーク
+        mood_emoji, mood_text = today_mood(profit, n_settled)
+        streak_part = ""
+        if len(settled_seq) >= 2:
+            seq = [w for _, w in sorted(settled_seq)]
+            streak, streak_win = 1, seq[-1]
+            for w in reversed(seq[:-1]):
+                if w == streak_win:
+                    streak += 1
+                else:
+                    break
+            if streak >= 2:
+                if streak_win:
+                    streak_part = (
+                        f'&nbsp;&nbsp;<span style="background:linear-gradient(90deg,#e65100,#f57f17); '
+                        f'color:#fff; padding:2px 10px; border-radius:12px; font-weight:700;">'
+                        f'🔥 {streak}R連続的中中！</span>')
+                else:
+                    streak_part = (
+                        f'&nbsp;&nbsp;<span style="background:#37474f; color:#b0bec5; '
+                        f'padding:2px 10px; border-radius:12px;">'
+                        f'⛈ {streak}連敗中…反撃の狼煙はまだか</span>')
+        st.markdown(
+            f'<div style="font-size:15px; margin:2px 0 8px 0;">'
+            f'{mood_emoji} <b>今日の調子:</b> {mood_text}{streak_part}</div>',
+            unsafe_allow_html=True,
+        )
         # 推奨ティッカー (未走推奨があれば点滅バー)
         if n_recommended_pending > 0:
             st.markdown(
