@@ -170,3 +170,6 @@ date,place_code,place_name,race_no,bet_amount,refund_amount,profit
 2026-07-03,3,isesaki,6,100,0,-100
 2026-07-03,3,isesaki,7,100,0,-100
 2026-07-03,6,sanyou,10,200,0,-200
+2026-07-04,6,sanyou,1,200,150,-50
+2026-07-04,6,sanyou,5,200,0,-200
+2026-07-04,6,sanyou,7,200,0,-200
