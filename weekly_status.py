@@ -1467,6 +1467,18 @@ def main() -> None:
     except Exception as e:
         text += f"\n\n(実購入損益スキップ: {e})"
 
+    # 三連系実弾 判定指標 (2026-07-26 Go/No-Go: 100R / ROI>120% を維持できるか)
+    # bet_history.csv には券種列が無いため、券種付き detail から三連系のみ分離集計。
+    try:
+        from bet_history_summary import build_sanren_section as _sanren_build
+        sanren = _sanren_build(args.days)
+        if sanren is not None:
+            sanren_text, sanren_html = sanren
+            text += "\n\n" + sanren_text
+            html = _insert_before_footer(html, sanren_html)
+    except Exception as e:
+        text += f"\n\n(三連系判定指標スキップ: {e})"
+
     # 三連系まとめ買い 停止基準監視 + 発動時 kill-switch
     tp_health: dict = {}
     try:

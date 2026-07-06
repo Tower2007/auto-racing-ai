@@ -29,6 +29,14 @@ DETAIL_CSV = ROOT / "data" / "bet_history_detail.csv"
 
 VENUE_NAMES = {2: "川口", 3: "伊勢崎", 4: "浜松", 5: "飯塚", 6: "山陽"}
 
+# ─── 三連系 (3連単 rt3 + 3連複 rf3) 実弾 分離集計 ─────────────────────────
+# 2026-07-26 の Go/No-Go 判定は「三連系実弾が 100R / ROI>120% を維持するか」。
+# bet_history.csv には券種列が無い (複勝混在) ため、券種付きの detail から
+# 三連系のみを抽出して常設集計する。閾値は事前固定 (勝手に変えない)。
+SANREN_BET_TYPES = ("rt3", "rf3")   # 3連単・3連複
+SANREN_DECISION_MIN_N = 100         # 判定に必要な最小 R 数 (事前固定)
+SANREN_DECISION_ROI = 120.0         # 維持すべき ROI 下限 % (事前固定)
+
 
 def load_summary() -> pd.DataFrame | None:
     """bet_history.csv (R 単位) を読み、無ければ None。"""
@@ -103,6 +111,210 @@ def by_bet_type(detail_period: pd.DataFrame) -> list[dict]:
         rows.append(a)
     rows.sort(key=lambda r: -r["bet"])
     return rows
+
+
+def _sanren_agg(detail: pd.DataFrame) -> dict:
+    """三連系 (rt3+rf3) を R 単位に畳んで n / 的中 / 投資 / 払戻 / ROI を返す。
+
+    pack (券種) 単位の detail を、同一 R (date, place_code, race_no) 内の
+    三連系 pack をまとめて 1 R とカウントする。的中は R 単位で払戻>0 の R 数。
+    払戻 = hit_amount + henkan_amount(返還) + tokubarai_amount(特払)。
+    """
+    empty = {"n": 0, "hits": 0, "hit_rate": 0.0, "bet": 0, "refund": 0,
+             "profit": 0, "roi": 0.0}
+    if detail is None or detail.empty:
+        return empty
+    sub = detail[detail["bet_type_code"].isin(SANREN_BET_TYPES)].copy()
+    if sub.empty:
+        return empty
+    sub["_refund"] = (
+        sub["hit_amount"].fillna(0)
+        + sub["henkan_amount"].fillna(0)
+        + sub["tokubarai_amount"].fillna(0)
+    )
+    grp = sub.groupby(["date", "place_code", "race_no"]).agg(
+        bet=("vote_amount", "sum"), refund=("_refund", "sum")
+    )
+    n = int(len(grp))
+    hits = int((grp["refund"] > 0).sum())
+    bet = int(grp["bet"].sum())
+    refund = int(grp["refund"].sum())
+    profit = refund - bet
+    roi = (refund / bet * 100) if bet else 0.0
+    hit_rate = (hits / n * 100) if n else 0.0
+    return {"n": n, "hits": hits, "hit_rate": hit_rate, "bet": bet,
+            "refund": refund, "profit": profit, "roi": roi}
+
+
+def _sanren_cumulative(detail: pd.DataFrame, tail: int = 8) -> list[dict]:
+    """三連系 R を日付順に累積し、日別の累積推移 (末尾 tail 日) を返す。"""
+    if detail is None or detail.empty:
+        return []
+    sub = detail[detail["bet_type_code"].isin(SANREN_BET_TYPES)].copy()
+    if sub.empty:
+        return []
+    sub["_refund"] = (
+        sub["hit_amount"].fillna(0)
+        + sub["henkan_amount"].fillna(0)
+        + sub["tokubarai_amount"].fillna(0)
+    )
+    perR = sub.groupby(["date", "place_code", "race_no"]).agg(
+        bet=("vote_amount", "sum"), refund=("_refund", "sum")
+    ).reset_index()
+    perR["hit"] = (perR["refund"] > 0).astype(int)
+    daily = perR.groupby("date").agg(
+        n=("hit", "size"), hits=("hit", "sum"),
+        bet=("bet", "sum"), refund=("refund", "sum")
+    ).sort_index()
+    daily["cum_n"] = daily["n"].cumsum()
+    daily["cum_bet"] = daily["bet"].cumsum()
+    daily["cum_refund"] = daily["refund"].cumsum()
+    rows = []
+    for d, r in daily.iterrows():
+        cum_roi = (r["cum_refund"] / r["cum_bet"] * 100) if r["cum_bet"] else 0.0
+        rows.append({
+            "date": d.isoformat() if hasattr(d, "isoformat") else str(d),
+            "n": int(r["n"]), "hits": int(r["hits"]),
+            "cum_n": int(r["cum_n"]),
+            "cum_roi": cum_roi,
+            "cum_profit": int(r["cum_refund"] - r["cum_bet"]),
+        })
+    return rows[-tail:]
+
+
+def _sanren_verdict(agg: dict) -> tuple[str, str]:
+    """判定基準 (100R / ROI>120%) に対する現状を (mark, text) で返す。閾値は固定。"""
+    n, roi = agg["n"], agg["roi"]
+    if n < SANREN_DECISION_MIN_N:
+        return ("ℹ️", f"n={n} < {SANREN_DECISION_MIN_N}R → 判定サンプル未達 "
+                       f"(あと {SANREN_DECISION_MIN_N - n}R)")
+    if roi >= SANREN_DECISION_ROI:
+        return ("🟢", f"n={n} 到達 / ROI {roi:.1f}% ≥ {SANREN_DECISION_ROI:.0f}% "
+                       f"→ 基準クリア")
+    return ("🔴", f"n={n} 到達 / ROI {roi:.1f}% < {SANREN_DECISION_ROI:.0f}% "
+                   f"→ 基準未達")
+
+
+def render_sanren_text(alltime: dict, recent: dict, days: int,
+                       cum: list[dict]) -> str:
+    """三連系実弾の判定用セクション (text)。全期間を主指標、直近を補助表示。"""
+    mark, verdict = _sanren_verdict(alltime)
+    lines = ["", "【🎯 三連系実弾 判定指標 (3連単+3連複 / 全場)】",
+             "-" * 60,
+             f"  判定基準 (2026-07-26): 100R / ROI>120% を維持できるか"]
+    lines.append(
+        f"  全期間: {alltime['n']:>3d} R / 的中 {alltime['hits']:>3d} "
+        f"({alltime['hit_rate']:>4.1f}%) / 投資 ¥{alltime['bet']:>7,} / "
+        f"払戻 ¥{alltime['refund']:>7,} / 損益 {alltime['profit']:>+8,} 円 / "
+        f"ROI {alltime['roi']:>5.1f}%"
+    )
+    lines.append(
+        f"  直近{days}日: {recent['n']:>3d} R / 的中 {recent['hits']:>3d} "
+        f"({recent['hit_rate']:>4.1f}%) / 投資 ¥{recent['bet']:>7,} / "
+        f"払戻 ¥{recent['refund']:>7,} / 損益 {recent['profit']:>+8,} 円 / "
+        f"ROI {recent['roi']:>5.1f}%"
+    )
+    lines.append(f"  判定: {mark} {verdict}")
+    if cum:
+        lines.append("  -- 累積推移 (直近日) --")
+        lines.append(f"    {'date':12s} {'日R':>3s} {'累計R':>5s} {'累計ROI':>7s} {'累計損益':>9s}")
+        for r in cum:
+            lines.append(
+                f"    {r['date']:12s} {r['n']:>3d} {r['cum_n']:>5d} "
+                f"{r['cum_roi']:>6.1f}% {r['cum_profit']:>+8,}円"
+            )
+    return "\n".join(lines)
+
+
+def render_sanren_html(alltime: dict, recent: dict, days: int,
+                       cum: list[dict]) -> str:
+    """三連系実弾の判定用セクション (html, inline style)。"""
+    TBL = ('border="1" cellpadding="6" cellspacing="0" '
+           'style="border-collapse:collapse; border-color:#bbb; '
+           'font-family:Arial,sans-serif; font-size:13px;"')
+    TH = ('style="background:#e8e8e8; text-align:left; padding:6px 10px; '
+          'font-weight:bold; border:1px solid #bbb;"')
+    TH_R = ('style="background:#e8e8e8; text-align:right; padding:6px 10px; '
+            'font-weight:bold; border:1px solid #bbb;"')
+    TD_L = 'style="text-align:left; padding:6px 10px; border:1px solid #ddd;"'
+    TD_R = 'style="text-align:right; padding:6px 10px; border:1px solid #ddd;"'
+    ROW_ALT = 'style="background:#fafafa;"'
+
+    def _profit(p: int) -> str:
+        c = "#2e7d32" if p > 0 else ("#c62828" if p < 0 else "#444")
+        return (f'<td style="text-align:right; padding:6px 10px; '
+                f'border:1px solid #ddd; color:{c}; font-weight:bold;">{p:+,} 円</td>')
+
+    def _roi(roi: float) -> str:
+        c = "#2e7d32" if roi >= SANREN_DECISION_ROI else "#c62828"
+        return (f'<td style="text-align:right; padding:6px 10px; '
+                f'border:1px solid #ddd; color:{c}; font-weight:bold;">{roi:.1f}%</td>')
+
+    mark, verdict = _sanren_verdict(alltime)
+    v_color = {"🟢": "#2e7d32", "🔴": "#c62828", "ℹ️": "#e65100"}.get(mark, "#444")
+    parts = [
+        '<h3 style="color:#444; margin:18px 0 8px 0;">'
+        '🎯 三連系実弾 判定指標 '
+        '<span style="font-weight:normal; color:#666; font-size:13px;">'
+        '(3連単+3連複 / 全場)</span></h3>',
+        '<p style="margin:0 0 6px 0; color:#555; font-size:12px;">'
+        f'判定基準 (2026-07-26): <b>100R / ROI&gt;120%</b> を維持できるか</p>',
+        f'<table {TBL}>',
+        f'<tr><th {TH}>区分</th><th {TH_R}>R 数</th><th {TH_R}>的中</th>'
+        f'<th {TH_R}>投資</th><th {TH_R}>払戻</th><th {TH_R}>損益</th>'
+        f'<th {TH_R}>ROI</th></tr>',
+        f'<tr><td {TD_L}><b>全期間</b></td>'
+        f'<td {TD_R}>{alltime["n"]:,}</td>'
+        f'<td {TD_R}>{alltime["hits"]:,} ({alltime["hit_rate"]:.1f}%)</td>'
+        f'<td {TD_R}>¥{alltime["bet"]:,}</td>'
+        f'<td {TD_R}>¥{alltime["refund"]:,}</td>'
+        f'{_profit(alltime["profit"])}{_roi(alltime["roi"])}</tr>',
+        f'<tr {ROW_ALT}><td {TD_L}><b>直近{days}日</b></td>'
+        f'<td {TD_R}>{recent["n"]:,}</td>'
+        f'<td {TD_R}>{recent["hits"]:,} ({recent["hit_rate"]:.1f}%)</td>'
+        f'<td {TD_R}>¥{recent["bet"]:,}</td>'
+        f'<td {TD_R}>¥{recent["refund"]:,}</td>'
+        f'{_profit(recent["profit"])}{_roi(recent["roi"])}</tr>',
+        '</table>',
+        f'<p style="margin:6px 0; font-weight:bold; color:{v_color};">'
+        f'判定: {mark} {verdict}</p>',
+    ]
+    if cum:
+        parts.append(
+            '<h4 style="color:#555; margin:12px 0 6px 0;">累積推移 (直近日)</h4>'
+        )
+        parts.append(f'<table {TBL}>')
+        parts.append(
+            f'<tr><th {TH}>date</th><th {TH_R}>日R</th><th {TH_R}>累計R</th>'
+            f'<th {TH_R}>累計ROI</th><th {TH_R}>累計損益</th></tr>'
+        )
+        for i, r in enumerate(cum):
+            alt = ROW_ALT if i % 2 == 1 else ""
+            parts.append(
+                f'<tr {alt}><td {TD_L}>{r["date"]}</td>'
+                f'<td {TD_R}>{r["n"]}</td><td {TD_R}>{r["cum_n"]}</td>'
+                f'{_roi(r["cum_roi"])}{_profit(r["cum_profit"])}</tr>'
+            )
+        parts.append('</table>')
+    return "\n".join(parts)
+
+
+def build_sanren_section(days: int) -> tuple[str, str] | None:
+    """weekly_status から呼ぶ用。三連系実弾の判定セクション (text, html)。
+
+    detail が無い / 三連系実績ゼロなら None (セクション非表示)。
+    """
+    detail = load_detail()
+    if detail is None:
+        return None
+    alltime = _sanren_agg(detail)
+    if alltime["n"] == 0:
+        return None
+    recent = _sanren_agg(filter_recent_n_days(detail, days))
+    cum = _sanren_cumulative(detail)
+    text = render_sanren_text(alltime, recent, days, cum)
+    html = render_sanren_html(alltime, recent, days, cum)
+    return text, html
 
 
 def render_text(days: int, recent: dict, venues: list[dict],
