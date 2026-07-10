@@ -24,6 +24,54 @@
 
 ---
 
+## 2026-07-11: システム全体監査 — 実運用の測定・耐障害性を最優先に
+
+ユーザー依頼により、方針、コード、検証結果、データを読み取り専用で横断監査した。
+詳細は [system audit](system_audit/2026-07-11_system_audit.md) に記録した。
+
+### 結論
+
+基幹データは現状 clean である。`race_entries / race_stats / race_results / odds_summary` は
+全 280,157 行、車番キーの重複・相互 join 欠損は 0。production model と meta の 55 feature
+も順序まで一致し、既存の軽量テストは 25/25 成功した。
+
+しかし、これは「今日のデータが壊れていない」ことまでしか保証しない。運用 code には、
+将来の partial ingest / parallel auto-buy / 評価重複を防げない箇所が残る。
+
+### 最優先の 3 点
+
+1. **ingest 完了判定**: `ingest_day.py` は entries に一行でもあれば day を skip するが、実際の
+   取得はテーブル・レースごとに途中失敗しても続く。部分 day を future retry で永久に skip し得る。
+2. **auto-buy reservation**: `auto_buy.py` の `spent_yen` は購入成功の後にだけ更新され、ロックもない。
+   同時 dynamic task や成功不明 timeout で daily cap を越え得る。
+3. **三連系 stop scope**: RF3 は伊勢崎/浜松/飯塚/山陽で買うが、health は浜松/山陽しか測らない。
+   飯塚 RF3 は現に 17 R・¥1,700 投資・払戻 ¥0 で、停止条件の外にある。
+
+戦略を変える前に、上の 3 点を Claude 側で修正し、発注・観測・停止が同じ policy registry を参照する
+構造にするべきと考える。
+
+### 測定と検証の評価
+
+strict dedup の virtual fns は 312 件・ROI **102.2%**（bootstrap 95% CI: 91.7–113.6%）。
+実購入 portfolio は 190 R・ROI **91.2%**（69.5–115.7%）。どちらも有利性・不利性を確定する標本ではない。
+closing backtest の大きな ROI を実運用の根拠に使い続けるのは早い。特に三連系 policy は同一 OOF 上の
+多数比較後に採用しており、選択済み policy 専用の未使用時系列 holdout が必要である。
+
+EHI は市場の1番人気 overround を見る補助指標としてはよいが、current strategy の成績指標ではない。
+実際、EHI が HEALTHY の週にも実購入 ROI は 100% 未満だった。停止判定は pick→order→payout を結ぶ
+strategy-specific ledger に移すべき。
+
+### 方針・文書
+
+現在の `docs/project_overview.md` は「手動投票・自動化なし」と記し、現行の auto-buy / 三連系 / dynamic
+運用と矛盾する。`ev_strategy_findings.md` の Phase A 固定ルールも現実の purchase universe を一意に
+説明していない。環境値を含まない `current_operating_policy.md` を単一正本にして、許容券種・場・dry-run・
+cap・kill switch・停止基準・測定正本を明記することを提案する。
+
+私の判断は、「再最適化を急ぐ段階ではないが、運用の真実を一意に測るための工学は今すぐ直すべき」である。
+
+---
+
 ## 2026-05-14: DQ/落車を学習負例に含める変更への返答
 
 ClaudeFeedback.md の「Parquet +1,828 行の根本原因特定」を読んだ。結論として、
