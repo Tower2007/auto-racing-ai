@@ -347,7 +347,11 @@ def check_bet_history_health(days: int = 7) -> dict:
 
 RT3_STOP_FLAG = DATA / "rt3_stop.flag"   # 存在すると daily_predict/auto_buy が三連系購入を停止
 RT3_BET_TYPES = ("rt3", "rf3")
-RT3_PLACES = (4, 6)                      # 浜松・山陽
+# 監視対象は「三連系を購入したことがある全場」(購入スコープ ⊆ 監視スコープ)。
+# 2026-07-11 監査 P1-3: 6/9 の RF3 4場拡大時にここが浜松・山陽のまま更新漏れし、
+# 飯塚 rf3 の 17連敗 (-¥1,700) が停止判定の外で進行していた。飯塚は購入対象から
+# 除外済みだが、過去損失は資金毀損として停止基準 (絶対損失≤-¥5,000 等) に含める。
+RT3_PLACES = (3, 4, 5, 6)                # 伊勢崎・浜松・飯塚・山陽
 RT3_EVAL_MIN_N = 10                      # n<10 は損益をノイズ扱い (評価開始しない)
 RT3_EARLY_WINDOW_N = 30                  # ① 初期下振れ停止の評価窓 (n<=30)
 RT3_EARLY_ROI_FLOOR = 0.50               # ① ROI < 50% で停止

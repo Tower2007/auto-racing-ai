@@ -26,6 +26,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 logger = logging.getLogger("auto_buy")
@@ -367,6 +368,51 @@ def _maybe_low_balance_alert(state: dict, balance: dict | None) -> None:
         f"(この警告は本日分は1回のみ。明日また低ければ再通知)")
 
 
+LOCK_FILE = DATA / "auto_buy.lock"
+LOCK_STALE_SEC = 600          # 10 分超の残置ロックはクラッシュ残骸とみなし破棄
+LOCK_WAIT_SEC = 90            # 取得待ちの上限 (先行プロセスの発注は最長 ~60s)
+LOCK_POLL_SEC = 2.0
+
+
+def _acquire_lock() -> bool:
+    """プロセス間ロックを取得 (O_CREAT|O_EXCL の原子作成)。
+
+    2026-07-11 監査 P1-2: state にロックがなく、複数の AutoraceDyn_* が同時発火
+    すると日次 cap (spent_yen) を二重に通過し得る。全履歴で同時発火は 0 回だが、
+    安価に最悪ケースを塞ぐ。LOCK_WAIT_SEC 待っても取れなければ False
+    (呼び出し側は発注せずスキップ = cap 破りより機会損失を選ぶ)。
+    """
+    deadline = time.monotonic() + LOCK_WAIT_SEC
+    while True:
+        try:
+            fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w") as f:
+                f.write(f"{os.getpid()} {dt.datetime.now().isoformat()}")
+            return True
+        except FileExistsError:
+            try:
+                age = time.time() - LOCK_FILE.stat().st_mtime
+                if age > LOCK_STALE_SEC:
+                    logger.warning("[auto_buy] stale lock (%ds) を破棄", int(age))
+                    LOCK_FILE.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(LOCK_POLL_SEC)
+        except OSError as e:
+            logger.warning("[auto_buy] lock 作成失敗 (継続不能): %s", e)
+            return False
+
+
+def _release_lock() -> None:
+    try:
+        LOCK_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def run_auto_buy(candidates: list[dict],
                  now: dt.datetime | None = None,
                  dry_run: bool | None = None) -> list[dict]:
@@ -378,6 +424,24 @@ def run_auto_buy(candidates: list[dict],
     """
     if not AUTO_BUY_ENABLED:
         return []
+    if not any(c.get("bets") for c in candidates):
+        return []
+    if not _acquire_lock():
+        logger.warning("[auto_buy] lock 取得不能 (先行プロセス実行中?) — "
+                       "cap 二重通過防止のため今回の発注をスキップ")
+        return [{"race": f"{c.get('venue','?')}_R{c.get('race_no')}",
+                 "verdict": "skip_lock", "amount": int(c.get("amount", 0)),
+                 "timestamp": (now or now_jst()).isoformat()}
+                for c in candidates if c.get("bets")]
+    try:
+        return _run_auto_buy_locked(candidates, now, dry_run)
+    finally:
+        _release_lock()
+
+
+def _run_auto_buy_locked(candidates: list[dict],
+                         now: dt.datetime | None = None,
+                         dry_run: bool | None = None) -> list[dict]:
     now = now or now_jst()
     dry = AUTO_BUY_DRY_RUN if dry_run is None else dry_run
     state = load_state(now)

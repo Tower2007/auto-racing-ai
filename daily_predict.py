@@ -116,8 +116,12 @@ EXPECTED_VOTES_CSV = DATA / "expected_votes.csv"  # 場×R別 typical 票数 →
 #   RT3(三連単): 浜松 ROI 530% / 山陽 ROI 141%
 #   RF3(三連複): 伊勢崎 ROI 377% / 浜松 ROI 330% / 飯塚 ROI 114% / 山陽 ROI 185%
 #   → RT3=2場・RF3=4場 policy が ROI 202% と最高効率
-RT3_ELIGIBLE_PLACES = {4, 6}       # 三連単 購入対象: 浜松, 山陽
-RF3_ELIGIBLE_PLACES = {3, 4, 5, 6}  # 三連複 購入対象: 伊勢崎, 浜松, 飯塚, 山陽
+#   ※ 上記 sim ROI は odds_summary 過大オッズ由来の楽観バイアスあり (2026-06-28 確認)
+# 2026-07-11: 飯塚(5) を RF3 から除外。実弾 17 連敗 (0/17, 的中率25%想定で
+#   p≈0.8%) + sim でも 4 場中最弱 (114%)。監査 P1-3 で停止監視の対象外だったことも
+#   発覚 (weekly_status RT3_PLACES が浜松・山陽のまま) → 監視は全場に拡大済み。
+RT3_ELIGIBLE_PLACES = {4, 6}     # 三連単 購入対象: 浜松, 山陽
+RF3_ELIGIBLE_PLACES = {3, 4, 6}  # 三連複 購入対象: 伊勢崎, 浜松, 山陽 (飯塚は 2026-07-11 除外)
 RT3_THR = 1.80
 RT3_PAPER_LOG = DATA / "rt3_paper.csv"
 # weekly_status の停止基準が発動すると書かれる kill-switch。
@@ -554,9 +558,8 @@ def _render_rt3_text(refs: list[dict]) -> list[str]:
     lines = [
         "",
         "=" * 40,
-        "🎯 三連系 推奨 発注 (浜松・山陽 限定, EV>=1.80)",
-        "  rt3: 浜松 ROI 530% / 山陽 ROI 141%",
-        "  rf3: 浜松 ROI 330% / 山陽 ROI 185% / 伊勢崎 ROI 377% / 飯塚 ROI 114%",
+        "🎯 三連系 推奨 発注 (EV>=1.80)",
+        "  rt3: 浜松・山陽 / rf3: 伊勢崎・浜松・山陽 (飯塚は 0/17 で 2026-07-11 除外)",
     ]
     for ref in refs:
         has_rt3 = ref.get("has_rt3", True)
@@ -695,8 +698,8 @@ def _render_rt3_html(refs: list[dict], today: str) -> str:
         'font-size:13px; color:#222;">'
         '<b style="color:#2e7d32;">🎯 三連系 推奨 発注 (EV≥1.80)</b>'
         '<p style="margin:4px 0; font-size:12px; color:#555;">'
-        'rt3(三連単): 浜松 ROI 530% / 山陽 ROI 141% &nbsp;|&nbsp; '
-        'rf3(三連複): 伊勢崎 ROI 377% / 浜松 ROI 330% / 飯塚 ROI 114% / 山陽 ROI 185%</p>'
+        'rt3(三連単): 浜松・山陽 &nbsp;|&nbsp; '
+        'rf3(三連複): 伊勢崎・浜松・山陽 (飯塚は 0/17 で 2026-07-11 除外)</p>'
         '<table style="margin:4px 0; border-collapse:collapse;">'
         '<tr style="background:#c8e6c9; font-size:12px;">'
         '<th style="padding:4px 8px;">場</th>'
