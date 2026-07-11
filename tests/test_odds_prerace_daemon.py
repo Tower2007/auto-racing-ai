@@ -7,12 +7,14 @@ pytest があれば `pytest tests/test_odds_prerace_daemon.py`、
   1. 新 CSV スキーマ (= odds_combo_snapshots + target_offset_min)
   2. build_snapshot_rows: 全券種の行構築 (tns/fns 縦持ち + offset 付与)
   3. build_events: T-5/T-1 の時刻計算と昇順ソート
-  4. acquire_singleton: 単一インスタンスガード (2重 bind 失敗)
+  4. acquire_singleton: 単一インスタンスガード (named mutex 排他 +
+     ガード故障時の fail-open が「二重起動」と区別されること)
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import os
 import sys
 from pathlib import Path
 
@@ -121,40 +123,74 @@ def test_build_events_midnight_crossover():
 
 
 # ─── 4. 単一インスタンスガード ─────────────────────────────────
+# 2026-07-12: 固定ポート bind 方式 (58620) は Windows の動的除外ポート帯
+# (WinNAT/Hyper-V の excludedportrange。誰も LISTEN していなくても bind が
+# WinError 10013 で拒否される) に入ると「二重起動」と誤認して起動を拒否した
+# ため、named mutex 方式 (auto_buy._acquire_lock と同型) に置換。
+# テストもポート非依存になり除外帯 flake が消える。
 
-def _find_bindable_port(start: int = 58998, tries: int = 200) -> int:
-    """bind 可能なテスト用ポートを探す。
+IS_WINDOWS = os.name == "nt"
 
-    2026-07-12: 固定 58998 が Windows の動的除外ポート帯
-    (WinNAT/Hyper-V の excludedportrange。誰も LISTEN していなくても
-    bind が WinError 10013 で拒否される) に入り flake したため、
-    実際に bind できるポートを探してから本題 (2重 bind 失敗) を検証する。"""
-    import socket
-    for port in range(start, start + tries):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            s.bind(("127.0.0.1", port))
-            return port
-        except OSError:
-            continue
-        finally:
-            s.close()
-    raise RuntimeError(f"bind 可能なテストポートが見つからない ({start}〜)")
+
+def _test_mutex_name() -> str:
+    """テスト専用 mutex 名 (本番名 _mutex_name() と干渉しない)。"""
+    import uuid
+    return f"Global\\AutoRacingAIOddsPreraceTest_{uuid.uuid4().hex[:8]}"
+
+
+def test_mutex_name_contains_project_hash():
+    name = opd._mutex_name()
+    assert name.startswith("Global\\AutoRacingAI_odds_prerace_")
+    assert not name.endswith("_odds_prerace_")   # ハッシュが空でない
+    # auto_buy の mutex 名前空間と衝突しない (収集と発注は独立に動いてよい)
+    assert "_auto_buy_" not in name
 
 
 def test_singleton_guard():
-    port = _find_bindable_port()  # 本番 58620 とは別のテスト専用ポート
-    lock1 = opd.acquire_singleton(port)
-    assert lock1 is not None
+    """保持中は取得不可 (None)、解放後は再取得できる。
+
+    named mutex は同一スレッドからは再帰取得できてしまうため、
+    2 回目の取得は別スレッドから試す (test_auto_buy_lock.py と同じ手法。
+    実運用の二重起動は別プロセス = 別スレッドなのでこれで等価)。"""
+    if not IS_WINDOWS:
+        print("  (skip: Windows 専用)")
+        return
+    import threading
+    name = _test_mutex_name()
+    results: dict[str, bool] = {}
+
+    def _try(key: str) -> None:
+        lk = opd.acquire_singleton(name)
+        results[key] = lk is not None and lk._handle is not None
+        if lk is not None:
+            lk.close()
+
+    lock1 = opd.acquire_singleton(name)
+    assert lock1 is not None and lock1._handle is not None, "初回取得が成功する"
     try:
-        lock2 = opd.acquire_singleton(port)
-        assert lock2 is None, "2重 bind が成功してしまった"
+        t = threading.Thread(target=_try, args=("held",))
+        t.start(); t.join(timeout=15)
+        assert results.get("held") is False, "保持中の取得は None (二重起動検知)"
     finally:
         lock1.close()
     # 解放後は再取得できる (プロセス終了で OS が解放する挙動の等価確認)
-    lock3 = opd.acquire_singleton(port)
-    assert lock3 is not None
-    lock3.close()
+    t2 = threading.Thread(target=_try, args=("after",))
+    t2.start(); t2.join(timeout=15)
+    assert results.get("after") is True, "解放後は再取得できる"
+
+
+def test_singleton_guard_fail_open_on_mutex_error():
+    """ガード自体の故障 (mutex 生成不可) は「二重起動」(None) と区別され、
+    fail-open の no-op lock で収集を続行する — 旧実装が WinError 10013
+    (除外帯) を二重起動と誤認して黙って止まった問題の回帰ガード。"""
+    if not IS_WINDOWS:
+        print("  (skip: Windows 専用)")
+        return
+    # オブジェクト名に許されない '\' 入りの名前で CreateMutexW を確実に失敗させる
+    lock = opd.acquire_singleton("Global\\bad\\name\\odds_prerace_test")
+    assert lock is not None, "ガード故障は起動拒否 (None) にしない"
+    assert lock._handle is None, "fail-open は no-op lock (保証なしの明示)"
+    lock.close()  # no-op でも安全に呼べる
 
 
 def _run_all():

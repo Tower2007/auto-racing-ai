@@ -4,7 +4,9 @@
 #   1. 毎朝 07:05 (AutoraceDynamicScheduler 07:00 の直後、Program/Print 公開済み)
 #   2. ログオン時 (日中の再起動からの復帰用。過去 event はスキップして残りを収集)
 # に pythonw.exe 直接で起動する (vbs は使わない — banei の cmd /c 二重クォート事故の教訓)。
-# 二重起動はデーモン側の localhost:58620 bind ガード + IgnoreNew の 2 段で防止。
+# 二重起動はデーモン側の named mutex ガード + IgnoreNew の 2 段で防止
+# (旧 localhost:58620 bind 方式は WinNAT/Hyper-V の動的除外ポート帯で
+#  WinError 10013 誤検知 → 収集停止のため 2026-07-12 に mutex 化)。
 #
 # 使い方 (再実行可・冪等):
 #   powershell -ExecutionPolicy Bypass -File scripts\register_odds_prerace_task.ps1
@@ -26,7 +28,7 @@ $trigLogon = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 
 # ExecutionTimeLimit 20h: 07:05 起動 → ミッドナイト最終レース (〜翌0時台) まで許容。
 # MultipleInstances IgnoreNew: 常駐中に ONLOGON/翌朝 Daily が来ても新規起動しない
-# (デーモン側の port 58620 ガードとの 2 段防御)。
+# (デーモン側の named mutex ガードとの 2 段防御)。
 $settingsParams = @{
     AllowStartIfOnBatteries    = $true
     DontStopIfGoingOnBatteries = $true

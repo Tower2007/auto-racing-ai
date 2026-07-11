@@ -17,9 +17,13 @@
   を data/odds_combo_prerace.csv へ追記。**既存ファイルには一切書かない**。
   ※ T-1 は投票締切 (発走 -2:30) 後 = 確定直前の板。T-5 との差分がモメンタム。
 - 最終レースの T-1 処理後に自然終了。1 レース/1 時点の失敗はデーモンを殺さない。
-- 単一インスタンスガード: localhost ポート bind 方式
-  (hokkaido snapshot_scheduler の先例。2026-06-10 の二重起動・窓クローズ全滅の教訓。
+- 単一インスタンスガード: Windows named mutex 方式 (auto_buy._acquire_lock の
+  実証済みパターン。2026-06-10 の二重起動・窓クローズ全滅の教訓。
   Daily トリガー常駐中に ONLOGON トリガーが再起動しても二重 append しない)
+  ※ 旧 localhost:58620 bind 方式は 2026-07-12 に廃止: Windows の動的除外
+  ポート帯 (WinNAT/Hyper-V の excludedportrange) に 58620 が入ると、誰も
+  LISTEN していなくても bind が WinError 10013 で拒否され「二重起動」と誤認
+  → 開催日の収集が黙って止まるため。
 - pythonw 前提: ログは data/odds_prerace_daemon.log にファイル直書き。
   sys.stdout が None でも動く (StreamHandler は stdout がある時のみ追加)。
 
@@ -41,7 +45,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import logging
-import socket
+import os
 import sys
 import time
 from pathlib import Path
@@ -73,10 +77,8 @@ LOG_FILE = DATA / "odds_prerace_daemon.log"
 OFFSETS_MIN = (5, 1)   # 発走 T-5 分 (投票可能圏) / T-1 分 (締切後・確定直前)
 GRACE_MIN = 2          # 目標時刻をこの分数まで過ぎた event は「直近」として即実行
 
-# 単一インスタンスガード用ポート (bind 中 = 稼働中)。プロセス終了で OS が解放。
-# 本システム 8521 / Boat 8511 / Auto streamlit 8501/8502 / boat daemon 58610 /
-# hokkaido 49317 と非衝突の値を選定。
-SINGLETON_PORT = 58620
+# WaitForSingleObject の戻り値 (auto_buy.py と同値)
+WAIT_OBJECT_0, WAIT_ABANDONED, WAIT_TIMEOUT = 0x0, 0x80, 0x102
 
 
 def setup_logging() -> None:
@@ -99,20 +101,94 @@ def setup_logging() -> None:
     )
 
 
-def acquire_singleton(port: int = SINGLETON_PORT) -> socket.socket | None:
-    """localhost ポート bind による単一インスタンスガード。
+def _mutex_name() -> str:
+    """auto_buy._mutex_name と同型: プロジェクトパスのハッシュで名前空間を分離
+    (固定名だと別チェックアウト・別ユーザー・テストと干渉するため)。"""
+    import hashlib
+    h = hashlib.sha1(str(ROOT).encode("utf-8")).hexdigest()[:8]
+    return f"Global\\AutoRacingAI_odds_prerace_{h}"
 
-    戻り値の socket をプロセス生存中保持すること (GC で閉じると解放される)。
-    None = 既に別インスタンスが稼働中。
+
+class SingletonLock:
+    """acquire_singleton の戻り値。プロセス生存中保持し、終了時に close()。
+
+    handle=None は「ガード初期化に失敗したが fail-open で続行」の no-op。
+    プロセスが異常終了してもハンドルは OS が閉じ、mutex は自動解放される
+    (旧ポート bind 方式の「プロセス終了で OS が解放」と等価)。
     """
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    def __init__(self, k32, handle) -> None:
+        self._k32, self._handle = k32, handle
+
+    def close(self) -> None:
+        if self._handle is None:
+            return
+        try:
+            self._k32.ReleaseMutex(self._handle)
+        finally:
+            self._k32.CloseHandle(self._handle)
+            self._handle = None
+
+
+def acquire_singleton(name: str | None = None) -> SingletonLock | None:
+    """Windows named mutex による単一インスタンスガード
+    (auto_buy._acquire_lock の実証済みパターン。name はテスト専用の注入口)。
+
+    None = 既に別インスタンスが稼働中 (mutex を他プロセスが所有) の時だけ。
+
+    旧実装 (localhost:58620 bind、OSError 一括捕捉) は WinError 10048
+    (使用中 = 二重起動) と 10013 (アクセス拒否 = WinNAT/Hyper-V の動的除外
+    ポート帯に入っただけ) を区別できず、除外帯に入ると誰も動いていないのに
+    「二重起動」と誤認して起動を拒否 → 開催日の直前オッズ収集が黙って
+    止まった (2026-07-12 検出。当時 58529-58628 が除外帯)。
+
+    ガード自体の故障 (mutex 生成不可など) は二重起動とは別問題なので
+    fail-open: 警告ログの上で no-op lock を返し収集は続行する。発注系の
+    auto_buy (fail-closed) と逆だが、こちらの最悪は CSV の重複 append で、
+    黙って収集が止まる (開催日データ欠測) より二重稼働のリスクを取る。
+    """
+    if os.name != "nt":
+        logging.warning("named mutex は Windows 専用 — 単一インスタンス保証なしで続行")
+        return SingletonLock(None, None)
+    import ctypes
+    from ctypes import wintypes
     try:
-        s.bind(("127.0.0.1", port))
-        s.listen(1)
-        return s
-    except OSError:
-        s.close()
-        return None
+        # argtypes/restype 明示は auto_buy._kernel32 と同じ理由
+        # (restype 未指定だと 64bit で HANDLE が切り詰められる)
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        k32.CreateMutexW.restype = wintypes.HANDLE
+        k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        k32.WaitForSingleObject.restype = wintypes.DWORD
+        k32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+        k32.ReleaseMutex.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+        handle = k32.CreateMutexW(None, False, name or _mutex_name())
+        if not handle:
+            logging.warning("CreateMutexW 失敗 (WinError=%d) — "
+                            "単一インスタンス保証なしで続行 (fail-open)",
+                            ctypes.get_last_error())
+            return SingletonLock(None, None)
+    except Exception as e:  # noqa: BLE001
+        logging.warning("mutex 初期化失敗 (%s) — 単一インスタンス保証なしで続行 "
+                        "(fail-open)", e)
+        return SingletonLock(None, None)
+    rc = k32.WaitForSingleObject(handle, 0)
+    if rc in (WAIT_OBJECT_0, WAIT_ABANDONED):
+        if rc == WAIT_ABANDONED:
+            # 先行デーモンが解放せず異常終了していた。収集専用なので
+            # 台帳不整合の懸念はなく、所有を引き継いでそのまま続行する。
+            logging.warning("先行インスタンスの異常終了を検知 (abandoned mutex) — "
+                            "所有を引き継いで続行")
+        return SingletonLock(k32, handle)
+    k32.CloseHandle(handle)
+    if rc == WAIT_TIMEOUT:
+        return None  # 他プロセスが所有中 = 真の二重起動
+    logging.warning("WaitForSingleObject 失敗 (rc=0x%X, WinError=%d) — "
+                    "単一インスタンス保証なしで続行 (fail-open)",
+                    rc, ctypes.get_last_error())
+    return SingletonLock(None, None)
 
 
 def build_snapshot_rows(
@@ -335,8 +411,8 @@ def main() -> int:
 
     lock = acquire_singleton()
     if lock is None:
-        logging.info("既に別インスタンスが稼働中 (port %d) — 二重起動を回避して終了",
-                     SINGLETON_PORT)
+        logging.info("既に別インスタンスが稼働中 (named mutex 所有検知) — "
+                     "二重起動を回避して終了")
         return 0
     try:
         return run_daemon(race_date, args.dry_run, args.max_events)

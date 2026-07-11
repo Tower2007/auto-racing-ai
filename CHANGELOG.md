@@ -1,5 +1,32 @@
 # CHANGELOG
 
+## 2026-07-12 (3) — 直前オッズデーモンの単一インスタンスガードを named mutex 化
+
+固定 TCP ポート 58620 bind 方式のガードが Windows の動的除外ポート帯
+(WinNAT/Hyper-V の excludedportrange。本日時点で 58529-58628 を包含) に入り、
+誰も LISTEN していないのに bind が WinError 10013 で拒否される状態を確認。
+旧 `acquire_singleton` は OSError を一括捕捉して None (=「別インスタンス稼働中」)
+を返すため、10013 (除外帯) と 10048 (真の使用中) を区別できず、
+**開催日の直前オッズ収集が「二重起動回避」として黙って止まる**。
+
+- `odds_prerace_daemon.py`: ポート bind を廃止し、`auto_buy._acquire_lock` で
+  実証済みの named mutex パターンに置換 (`Global\AutoRacingAI_odds_prerace_{パスhash}`)。
+  - 他プロセスが mutex 所有中 (WAIT_TIMEOUT) の時**だけ** None = 二重起動回避。
+  - ガード自体の故障 (CreateMutexW 失敗等) は **fail-open**: 警告ログの上で
+    no-op lock を返し収集続行 (発注系 auto_buy の fail-closed とは逆。最悪は
+    CSV 重複 append であり、開催日データ欠測より二重稼働のリスクを取る)。
+  - WAIT_ABANDONED (先行の異常終了) は警告ログの上で所有を引き継いで続行
+    (収集専用で台帳不整合の懸念がないため sticky 停止は不要)。
+  - プロセス異常終了時はハンドルを OS が閉じ mutex は自動解放
+    (旧方式の「プロセス終了で OS がポート解放」と等価の回復性)。
+- `tests/test_odds_prerace_daemon.py`: ポート探索 (`_find_bindable_port`、
+  それ自体も除外帯で flake) を廃し、mutex 名 / スレッド排他・解放後再取得 /
+  ガード故障時 fail-open (10013 誤検知の回帰ガード) の 3 本に更新。
+  加えて本番名でのプロセス間排他 (保持中 None → 解放後取得可) を実機確認。
+- `scripts/register_odds_prerace_task.ps1` / `CLAUDE.md`: 58620 記述を更新
+  (タスク定義自体は変更不要 — IgnoreNew との 2 段防御は従来どおり)。
+- 回帰テスト 53 本全緑。`data/rt3_backstop_stop.flag` には触れていない。
+
 ## 2026-07-12 (2) — Codex 再々検証対応: WAIT_ABANDONED を sticky 停止に変更
 
 再々検証で ①backstop厳格化・②最終ゲート再検査 は承認、③ が唯一の×判定:
