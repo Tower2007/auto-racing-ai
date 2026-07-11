@@ -9,8 +9,11 @@ Codex 指定の再開条件4 に対応する 3 シナリオ:
      (evaluate_backstop が部分集計を返さず profit=None、
       backstop_blocks_purchase()=True。sticky フラグ書き出し・通知はしない)
   ③ 「投票後クラッシュ (WAIT_ABANDONED 受領)」 → 発注続行せず
-     全候補 skip_abandoned_lock + 警告通知。ロックは正常解放され
-     以後の run はブロックされない。
+     全候補 skip_abandoned_lock + sticky な「発注結果不明」フラグ
+     (abandoned_lock_stop.flag、検知時刻・mutex名・照合手順を記載) 書き出し
+     + 警告通知。以後の run はフラグを人間が明示削除するまで
+     skip_abandoned_pending で全券種停止し、削除後だけ通常復帰する
+     (2026-07-12 Codex再々検証で sticky 化)。ロック自体は正常解放。
 
 発注経路 (execute_purchase 実体) には一切到達しない
 (呼ばれたら AssertionError を出す禁止スタブを仕込む)。
@@ -61,8 +64,8 @@ class _AutoBuySandbox:
     def __enter__(self):
         self._orig = {k: getattr(auto_buy, k) for k in (
             "AUTO_BUY_ENABLED", "LOCK_WAIT_SEC", "STATE_FILE", "DATA",
-            "BET_HISTORY_CSV", "_notify", "_run_execute_purchase",
-            "_mutex_name", "check_guards")}
+            "BET_HISTORY_CSV", "ABANDONED_STOP_FLAG", "_notify",
+            "_run_execute_purchase", "_mutex_name", "check_guards")}
         auto_buy.AUTO_BUY_ENABLED = True
         auto_buy.LOCK_WAIT_SEC = 5
         # 一般ガードは常に通す (.env の時間帯/上限設定に依存させず、
@@ -71,6 +74,7 @@ class _AutoBuySandbox:
         auto_buy.DATA = self.tmp
         auto_buy.STATE_FILE = self.tmp / "auto_buy_state.json"
         auto_buy.BET_HISTORY_CSV = self.tmp / "bet_history.csv"
+        auto_buy.ABANDONED_STOP_FLAG = self.tmp / "abandoned_lock_stop.flag"
         auto_buy._notify = lambda subject, body: self.sent.append((subject, body))
         auto_buy._run_execute_purchase = _forbidden_execute
         auto_buy._mutex_name = lambda: self.mutex_name
@@ -257,7 +261,10 @@ def _child_code(name: str, wait_ms: int) -> str:
     )
 
 
-def test_abandoned_mutex_skips_all_and_notifies():
+def test_abandoned_mutex_sticky_stop_until_human_clears():
+    """WAIT_ABANDONED 受領 → sticky フラグ書き出し + 全候補 skip + 警告通知。
+    次回 run **も** skip_abandoned_pending で停止し、人間のフラグ明示削除後
+    だけ通常復帰する (2026-07-12 Codex再々検証の要求仕様)。"""
     if not IS_WINDOWS:
         print("  (skip: Windows 専用)")
         return
@@ -278,7 +285,7 @@ def test_abandoned_mutex_skips_all_and_notifies():
             assert proc.returncode == 0 and "ACQ:0" in proc.stdout, \
                 f"子プロセスが mutex を実取得した (stdout={proc.stdout.strip()!r})"
 
-            # abandoned を受領 → 発注続行せず全候補 skip + 警告通知
+            # ── run 1: abandoned 受領 → skip + sticky フラグ + 警告通知 ──
             cands = [_sanren_candidate(),
                      {"race_date": "2099-01-01", "place_code": 6,
                       "venue": "sanyou", "venue_jp": "山陽", "race_no": 8,
@@ -292,8 +299,16 @@ def test_abandoned_mutex_skips_all_and_notifies():
             assert len(ab.sent) == 1
             assert "先行プロセス異常終了" in ab.sent[0][0]
             assert "重複投票" in ab.sent[0][1]
+            assert "全券種" in ab.sent[0][1]
+            # sticky フラグが書かれ、検知時刻・mutex名・照合手順を含む
+            flag = ab.tmp / "abandoned_lock_stop.flag"
+            assert flag.exists(), "発注結果不明フラグが書き出されている"
+            ftext = flag.read_text(encoding="utf-8")
+            assert "detected_at=" in ftext and f"mutex={name}" in ftext
+            assert "投票履歴" in ftext and "削除" in ftext
+            assert auto_buy.abandoned_stop_active() is True
 
-            # ロックは正常解放済み → 以後の run はブロックされない
+            # ロック自体は正常解放済み (mutex ではなくフラグが発注を止める)
             got: dict[str, bool] = {}
 
             def _try_after() -> None:
@@ -309,12 +324,68 @@ def test_abandoned_mutex_skips_all_and_notifies():
             assert got.get("abandoned") is False, \
                 "正常解放後の取得は abandoned 扱いにならない"
 
-            # 次の run は通常どおり発注本体へ進む (stub が呼ばれる)
+            # ── run 2: フラグ残存中は次回 run も停止 (発注本体に入らない) ──
             out2 = auto_buy.run_auto_buy(cands, dry_run=False)
-            assert out2 == [] and locked_calls == [2]
+            assert [r["verdict"] for r in out2] == \
+                ["skip_abandoned_pending", "skip_abandoned_pending"], out2
+            assert locked_calls == [], "フラグ残存中は発注本体に入らない"
+            # 通知は日次1回: 検知時に通知済みマークが立つため再送しない
+            assert len(ab.sent) == 1, ab.sent
+
+            # ── run 3: 人間がフラグを明示削除 → 通常復帰 (発注本体へ) ──
+            flag.unlink()
+            assert auto_buy.abandoned_stop_active() is False
+            out3 = auto_buy.run_auto_buy(cands, dry_run=False)
+            assert out3 == [] and locked_calls == [2], \
+                "フラグ削除後だけ通常の発注経路 (stub) に復帰する"
         finally:
             auto_buy._run_auto_buy_locked = orig_locked
             k32.CloseHandle(keepalive)
+
+
+def test_abandoned_pending_flag_blocks_and_notifies_daily_once():
+    """フラグが既に存在する状態 (別プロセスの検知や再起動後) でも入口で停止。
+    残存リマインドは日次1回のみ。buy_app 用ゲート abandoned_stop_active() も
+    同じフラグを見る (全券種ブロック)。"""
+    if not IS_WINDOWS:
+        print("  (skip: Windows 専用)")
+        return
+    with _AutoBuySandbox() as ab:
+        locked_calls: list = []
+        orig_locked = auto_buy._run_auto_buy_locked
+        try:
+            auto_buy._run_auto_buy_locked = (
+                lambda c, n, d: locked_calls.append(len(c)) or [])
+            # 人間未照合のフラグが残っている状況を直接作る
+            (ab.tmp / "abandoned_lock_stop.flag").write_text(
+                "detected_at=2099-01-01T00:00:00\n", encoding="utf-8")
+            assert auto_buy.abandoned_stop_active() is True  # buy_app ゲート
+
+            # 複勝のみの候補 (三連系なし) でも全券種停止
+            fns_only = [{"race_date": "2099-01-01", "place_code": 2,
+                         "venue": "kawaguchi", "venue_jp": "川口", "race_no": 3,
+                         "car_no": 2, "ev": 1.5,
+                         "bets": [{"type": "fns", "cars": [2], "amount": 300}],
+                         "amount": 300}]
+            out = auto_buy.run_auto_buy(fns_only, dry_run=False)
+            assert [r["verdict"] for r in out] == ["skip_abandoned_pending"], out
+            assert locked_calls == []
+            assert len(ab.sent) == 1
+            assert "発注結果不明フラグ残存" in ab.sent[0][0]
+            assert "skip_abandoned_pending" in ab.sent[0][1]
+
+            # 同日 2 回目の run はリマインドを再送しない (日次1回)
+            out2 = auto_buy.run_auto_buy(fns_only, dry_run=False)
+            assert [r["verdict"] for r in out2] == ["skip_abandoned_pending"]
+            assert len(ab.sent) == 1, "残存リマインドは日次1回のみ"
+
+            # 人間の明示削除で復帰
+            (ab.tmp / "abandoned_lock_stop.flag").unlink()
+            assert auto_buy.abandoned_stop_active() is False
+            out3 = auto_buy.run_auto_buy(fns_only, dry_run=False)
+            assert out3 == [] and locked_calls == [1]
+        finally:
+            auto_buy._run_auto_buy_locked = orig_locked
 
 
 def test_acquire_lock_returns_abandoned_flag():

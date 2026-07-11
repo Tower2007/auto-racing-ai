@@ -372,6 +372,28 @@ if expected_pin:
 st.write("")
 
 if st.button("✅ 購入する", type="primary", width="stretch"):
+    # 2026-07-12 Codex再々検証 ③: 「発注結果不明」sticky フラグ
+    # (data/abandoned_lock_stop.flag、abandoned mutex 検知時に auto_buy が
+    # 書き出す) の検査。三連系に限らず **全券種** の実行を拒否する。
+    # 判定不能も fail-closed。解除は人間の照合 + フラグ削除のみ。
+    try:
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        import auto_buy as _ab_flag
+        _abandoned_blocked = _ab_flag.abandoned_stop_active()
+    except Exception:
+        _abandoned_blocked = True  # 判定不能も fail-closed
+    if _abandoned_blocked:
+        st.error(
+            "🚫 発注は現在停止中です (data/abandoned_lock_stop.flag)。"
+            "過去の自動発注プロセスが異常終了し発注結果が未照合のため、"
+            "全券種の実行を拒否しました。投票履歴・auto_buy_state.json・"
+            "bet_history.csv を照合し、問題なければフラグを削除してください。"
+        )
+        bt.log_token(payload, sig=sig, status="failed",
+                     note="abandoned_lock_stop.flag active at token execution")
+        st.stop()
+
     # 2026-07-12 Codex再検証 ②: 発行済みトークンの実行直前にも三連系停止
     # フラグを再検査する (トークン発行〜クリックの間にフラグが立った場合、
     # および停止判定自体が確認できない場合は fail-closed で実行拒否)。
