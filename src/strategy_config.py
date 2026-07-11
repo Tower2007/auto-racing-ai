@@ -38,3 +38,17 @@ RT3_ELIGIBLE_PLACES: frozenset[int] = places_for("rt3")   # {4, 6}
 RF3_ELIGIBLE_PLACES: frozenset[int] = places_for("rf3")   # {3, 4, 6}
 # 三連系を購入する全場 = kill-switch の監視スコープ (購入 ⊆ 監視 を保証)
 THREE_POINT_BUY_PLACES: frozenset[int] = frozenset(THREE_POINT_POLICY.keys())
+
+# 現役ポリシーの正確な (place_code, bet_type_code) ペア集合 (2026-07-11 Codex 追加指摘)。
+# kill-switch の現役集計はこのペアで厳密に絞る。「現役場にある rt3/rf3 全て」を
+# 数えると、廃止済みの組 (例: 伊勢崎 rt3) の過去損益が現役損益に混入するため。
+THREE_POINT_POLICY_PAIRS: frozenset[tuple[int, str]] = frozenset(
+    (pc, bt) for pc, bts in THREE_POINT_POLICY.items() for bt in bts)
+
+# ── 三連系 全場・全期間 絶対損失バックストップ (2026-07-11 監査 P2 + Codex 承認) ──
+# kill-switch (選択肢 B) は現役ポリシーのみを監視するため、負けた場を廃止するたびに
+# 損失基盤がリセットされる (ラチェット構造)。その抜け穴を塞ぐ常設の安全弁として、
+# 場の廃止/追加に関係なく「全場・全期間」の三連系 (rt3+rf3) 累積損益がこの値を
+# 下回ったら三連系購入を停止する (実装: src/backstop.py、sticky フラグ方式)。
+# ポリシー変更 (THREE_POINT_POLICY の場の廃止/追加) ではリセットされない。
+THREE_POINT_BACKSTOP_LOSS_YEN: int = -10_000

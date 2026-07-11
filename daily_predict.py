@@ -121,6 +121,8 @@ EXPECTED_VOTES_CSV = DATA / "expected_votes.csv"  # 場×R別 typical 票数 →
 from src.strategy_config import (  # noqa: E402
     RT3_ELIGIBLE_PLACES, RF3_ELIGIBLE_PLACES,
 )
+# 全場・全期間 絶対損失バックストップ (-¥10,000, sticky)。2026-07-11 監査 P2。
+from src.backstop import backstop_active, enforce_backstop  # noqa: E402
 RT3_THR = 1.80
 RT3_PAPER_LOG = DATA / "rt3_paper.csv"
 # weekly_status の停止基準が発動すると書かれる kill-switch。
@@ -129,8 +131,14 @@ RT3_STOP_FLAG = DATA / "rt3_stop.flag"
 
 
 def rt3_buy_active() -> bool:
-    """三連系まとめ買い(購入)が現在有効か。フラグ ON なら停止。"""
-    return RT3_BUY_ENABLED and not RT3_STOP_FLAG.exists()
+    """三連系まとめ買い(購入)が現在有効か。いずれかのフラグ ON なら停止。
+
+    - data/rt3_stop.flag         : kill-switch (現役ポリシー健全性、選択肢 B)
+    - data/rt3_backstop_stop.flag: 全場・全期間 絶対損失バックストップ (sticky)
+    """
+    return (RT3_BUY_ENABLED
+            and not RT3_STOP_FLAG.exists()
+            and not backstop_active())
 # 三連系まとめ買い (複勝+三連単+三連複 を 1 ボタンで購入) の click-to-buy 有効化フラグ。
 # 2026-05-30: 浜松 R7 で本番テスト成功 (複勝5¥300 + 三連単5-6-7¥100 +
 # 三連複5=6=7¥100 = ¥500 投票受付完了) を確認し True に。
@@ -1201,6 +1209,22 @@ def main():
 
     logger.info("=== daily_predict start: date=%s venues=%s time=%s thr=%.2f ===",
                 target_date, args.venues, time_label, args.thr)
+
+    # 三連系 全場・全期間 絶対損失バックストップ (2026-07-11 監査 P2、sticky)。
+    # 新規発動時はフラグ書き出し + メール通知。以後 rt3_buy_active() が False になり
+    # 三連系 (メールの 3 点購入ボタン / auto_buy) が止まる。評価失敗では止めない
+    # (現役スコープの kill-switch ②(-5,000) が別途効いている)。
+    try:
+        _bs = enforce_backstop()
+        if _bs.get("newly_triggered"):
+            logger.warning("[backstop] 発動: 全場三連系累積 %s 円 <= %s 円 — "
+                           "rt3_backstop_stop.flag 書き出し (sticky)",
+                           _bs.get("profit"), _bs.get("threshold"))
+        elif _bs.get("active"):
+            logger.warning("[backstop] 有効中 (sticky) — 三連系購入は停止 "
+                           "(解除は data/rt3_backstop_stop.flag を人間が削除)")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[backstop] 評価失敗 (継続): %s", e)
 
     try:
         model, iso, meta = load_production()

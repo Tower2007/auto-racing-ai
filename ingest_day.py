@@ -122,6 +122,14 @@ def ingest_one_day(client: AutoraceClient, place_code: int, race_date: str) -> d
                        race_date, place_code)
         return {"skipped": True}
 
+    # 取込開始マーカ (2026-07-11 監査 P2-2): データ取得より先に partial 行を書き、
+    # 完了時に ok/no_race/partial の行で上書きする (追記・最終行優先)。
+    # プロセス kill 等で完了行が書けなかった場合も manifest=partial が残り、
+    # 次回 catchup で purge+再取得される。旧方式では kill された日が
+    # 「pre-manifest 旧データ扱い → ok skip」となり永久欠損の穴があった。
+    # errors=-1 は「取込中 (未完了)」の意。
+    write_manifest(place_code, race_date, "partial", -1)
+
     venue = VENUE_CODES.get(place_code, f"code{place_code}")
     logger.info("=== Ingest: %s %s (%d) ===", race_date, venue, place_code)
 
