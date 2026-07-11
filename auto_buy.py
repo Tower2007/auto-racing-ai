@@ -26,7 +26,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 
 logger = logging.getLogger("auto_buy")
@@ -368,49 +367,117 @@ def _maybe_low_balance_alert(state: dict, balance: dict | None) -> None:
         f"(この警告は本日分は1回のみ。明日また低ければ再通知)")
 
 
-LOCK_FILE = DATA / "auto_buy.lock"
-LOCK_STALE_SEC = 600          # 10 分超の残置ロックはクラッシュ残骸とみなし破棄
+# ── プロセス間排他 (Windows named mutex) ──────────────────────────────
+# 2026-07-11 監査 P1-2 → 2026-07-12 Codex艦隊監査 P1-1 で置換:
+# 旧実装 (O_CREAT|O_EXCL ロックファイル + 600s stale 破棄) は「生存中プロセスの
+# ロックでも 10 分経過で他者が unlink できる」削除経路が残り、重複投票・
+# 日次 cap 二重通過が起こり得た。stale 判定→unlink は原子的にできず TOCTOU が
+# 原理的に残るため、ファイル削除ロジックは全廃し、統合マネジメントシステム
+# (Public-Race-ManagementｰSystem/monitor/snapshot.py, Codexレビュー5往復通過) の
+# named mutex パターンを移植:
+#   - 排他は OS が管理 (削除・横取りという操作自体が存在しない)
+#   - 保持者がクラッシュしても abandoned mutex として次の待機者へ所有が移る
+#   - WinDLL(use_last_error) + argtypes/restype 明示 (64bit HANDLE 切り詰め防止)
 LOCK_WAIT_SEC = 90            # 取得待ちの上限 (先行プロセスの発注は最長 ~60s)
-LOCK_POLL_SEC = 2.0
+
+WAIT_OBJECT_0, WAIT_ABANDONED, WAIT_TIMEOUT = 0x0, 0x80, 0x102
 
 
-def _acquire_lock() -> bool:
-    """プロセス間ロックを取得 (O_CREAT|O_EXCL の原子作成)。
-
-    2026-07-11 監査 P1-2: state にロックがなく、複数の AutoraceDyn_* が同時発火
-    すると日次 cap (spent_yen) を二重に通過し得る。全履歴で同時発火は 0 回だが、
-    安価に最悪ケースを塞ぐ。LOCK_WAIT_SEC 待っても取れなければ False
-    (呼び出し側は発注せずスキップ = cap 破りより機会損失を選ぶ)。
-    """
-    deadline = time.monotonic() + LOCK_WAIT_SEC
-    while True:
-        try:
-            fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            with os.fdopen(fd, "w") as f:
-                f.write(f"{os.getpid()} {dt.datetime.now().isoformat()}")
-            return True
-        except FileExistsError:
-            try:
-                age = time.time() - LOCK_FILE.stat().st_mtime
-                if age > LOCK_STALE_SEC:
-                    logger.warning("[auto_buy] stale lock (%ds) を破棄", int(age))
-                    LOCK_FILE.unlink(missing_ok=True)
-                    continue
-            except OSError:
-                pass
-            if time.monotonic() >= deadline:
-                return False
-            time.sleep(LOCK_POLL_SEC)
-        except OSError as e:
-            logger.warning("[auto_buy] lock 作成失敗 (継続不能): %s", e)
-            return False
+def _mutex_name() -> str:
+    """プロジェクトパスのハッシュ入り mutex 名
+    (固定名だと別チェックアウト・別ユーザー・テストと干渉するため名前空間を分離)。"""
+    import hashlib
+    h = hashlib.sha1(str(ROOT).encode("utf-8")).hexdigest()[:8]
+    return f"Global\\AutoRacingAI_auto_buy_{h}"
 
 
-def _release_lock() -> None:
+def _kernel32():
+    """kernel32 を HANDLE/DWORD/BOOL/LPCWSTR の argtypes/restype 明示で返す
+    (restype 未指定は c_int 扱いで、64bit Windows ではポインタサイズの HANDLE が
+    切り詰められ WaitForSingleObject が失敗し得る)。"""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    k32.CreateMutexW.restype = wintypes.HANDLE
+    k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    k32.WaitForSingleObject.restype = wintypes.DWORD
+    k32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+    k32.ReleaseMutex.restype = wintypes.BOOL
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.CloseHandle.restype = wintypes.BOOL
+    return k32
+
+
+def _acquire_lock(wait_sec: float | None = None, name: str | None = None):
+    """named mutex を取得。成功なら (k32, handle)、取得不能なら None。
+
+    発注ゲートなので例外は外に出さない: None → 呼び出し側は skip_lock verdict
+    (発注せずスキップ = cap 破りより機会損失を選ぶ)。
+    name はテスト専用の注入口 (既定はプロジェクトパスハッシュ入り)。"""
+    if wait_sec is None:
+        wait_sec = LOCK_WAIT_SEC
+    if os.name != "nt":
+        # 非Windows に named mutex の排他保証はない —
+        # 黙って無ロックで発注するより fail-closed
+        logger.warning("[auto_buy] named mutex は Windows 専用 — "
+                       "排他保証がないため発注をスキップ (fail-closed)")
+        return None
+    import ctypes
     try:
-        LOCK_FILE.unlink(missing_ok=True)
-    except OSError:
-        pass
+        k32 = _kernel32()
+        handle = k32.CreateMutexW(None, False, name or _mutex_name())
+        if not handle:
+            logger.warning("[auto_buy] CreateMutexW 失敗 (WinError=%d) — skip",
+                           ctypes.get_last_error())
+            return None
+    except Exception as e:
+        logger.warning("[auto_buy] mutex 初期化失敗 (%s) — skip", e)
+        return None
+    try:
+        rc = k32.WaitForSingleObject(handle, 0)
+        if rc == WAIT_TIMEOUT:
+            logger.info("[auto_buy] 先行プロセスが発注中 — 最長 %ds 待機",
+                        int(wait_sec))
+            rc = k32.WaitForSingleObject(handle, int(wait_sec * 1000))
+        if rc == WAIT_TIMEOUT:
+            k32.CloseHandle(handle)
+            return None
+        if rc not in (WAIT_OBJECT_0, WAIT_ABANDONED):
+            logger.warning("[auto_buy] WaitForSingleObject 失敗 "
+                           "(rc=0x%X, WinError=%d) — skip",
+                           rc, ctypes.get_last_error())
+            k32.CloseHandle(handle)
+            return None
+        if rc == WAIT_ABANDONED:
+            # 先行プロセスが ReleaseMutex せず死んだ。所有は OS が本プロセスへ
+            # 移譲済み。state は _run_auto_buy_locked が load_state で読み直す。
+            logger.warning("[auto_buy] 先行プロセスの異常終了を検知 "
+                           "(abandoned mutex) — 所有を引き継いで続行")
+        return (k32, handle)
+    except Exception as e:
+        logger.warning("[auto_buy] mutex 取得失敗 (%s) — skip", e)
+        try:
+            k32.CloseHandle(handle)
+        except Exception:
+            pass
+        return None
+
+
+def _release_lock(lock) -> None:
+    """ReleaseMutex の戻り値を必ず検査する (失敗の握りつぶし禁止)。
+    ただし例外にはしない: 発注結果 (verdict list) を失うわけにいかず、本プロセスは
+    per-race one-shot で間もなく終了 → 所有スレッド終了時に abandoned 化して
+    待機者が自動回復するため、ここは大声のログで足りる。"""
+    import ctypes
+    k32, handle = lock
+    try:
+        if not k32.ReleaseMutex(handle):
+            logger.error("[auto_buy] ReleaseMutex 失敗 (WinError=%d) — "
+                         "所有スレッド終了時に abandoned 化し待機者は回復します",
+                         ctypes.get_last_error())
+    finally:
+        k32.CloseHandle(handle)
 
 
 def run_auto_buy(candidates: list[dict],
@@ -426,7 +493,8 @@ def run_auto_buy(candidates: list[dict],
         return []
     if not any(c.get("bets") for c in candidates):
         return []
-    if not _acquire_lock():
+    lock = _acquire_lock()
+    if lock is None:
         logger.warning("[auto_buy] lock 取得不能 (先行プロセス実行中?) — "
                        "cap 二重通過防止のため今回の発注をスキップ")
         return [{"race": f"{c.get('venue','?')}_R{c.get('race_no')}",
@@ -436,7 +504,7 @@ def run_auto_buy(candidates: list[dict],
     try:
         return _run_auto_buy_locked(candidates, now, dry_run)
     finally:
-        _release_lock()
+        _release_lock(lock)
 
 
 def _run_auto_buy_locked(candidates: list[dict],
