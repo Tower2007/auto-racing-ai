@@ -759,6 +759,18 @@ async def execute_buy(
                     ),
                 }
 
+            # === 実投票クリック直前の停止フラグ再検査 (2026-07-12 Codex第4R) ===
+            # 入口ゲート (_stop_flags_block @ main) はブラウザ処理の数百行手前で
+            # 1 回見るだけ。buy_app/直CLI 経路は auto_buy の named mutex を保持
+            # しないため、入口検査通過〜ここ (実クリック) の間に別 run が abandoned
+            # フラグを作成し得る。実際に金銭が確定するのは下の「投票する」click の
+            # みなので、その最小スコープ直前で再検査し、停止中はクリックせず abort
+            # する (判定不能も fail-closed)。発注ロジック本体には他に触れない。
+            _blk, _why = _stop_flags_block(bets)
+            if _blk:
+                raise RuntimeError(
+                    f"実投票クリック直前の停止フラグ再検査で中止 (発注せず): {_why}")
+
             print(f"[execute_purchase] step 8: 投票する (実投票)",
                   file=sys.stderr)
 
@@ -1034,12 +1046,18 @@ def _stop_flags_block(bets: list[dict]) -> tuple[bool, str | None]:
             return True, "abandoned_lock_stop.flag (発注結果不明・全券種停止)"
     except Exception as e:  # noqa: BLE001
         return True, f"abandoned フラグ判定不能 (fail-closed): {e}"
-    # 三連系のみ: 全場・全期間 絶対損失バックストップ sticky フラグ
+    # 三連系のみ: 全場・全期間 絶対損失バックストップ。
+    # backstop_active() (フラグ存在のみ) ではなく backstop_blocks_purchase()
+    # を使う (2026-07-12 Codex第4R): フラグ存在 OR 台帳異常 OR 閾値超過の
+    # いずれでも停止する fail-closed ゲート。直CLI経路で台帳判定を迂回できる
+    # 穴 (台帳ゲート=True なのに execute_purchase ゲート=False) を塞ぐ。
+    # rt3_backstop_stop.flag のファイル存在停止も当然包含される。
     if any(str(b.get("type")) in ("rt3", "rf3") for b in (bets or [])):
         try:
-            from src.backstop import backstop_active
-            if backstop_active():
-                return True, "rt3_backstop_stop.flag (三連系バックストップ発動)"
+            from src.backstop import backstop_blocks_purchase
+            if backstop_blocks_purchase():
+                return True, ("三連系バックストップ "
+                              "(rt3_backstop_stop.flag 存在 / 台帳異常 / 閾値超過)")
         except Exception as e:  # noqa: BLE001
             return True, f"三連系バックストップ判定不能 (fail-closed): {e}"
     return False, None

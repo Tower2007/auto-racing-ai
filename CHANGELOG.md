@@ -1,5 +1,32 @@
 # CHANGELOG
 
+## 2026-07-12 (5) — execute_purchase: クリック直前再検査 + 三連系ゲートを backstop_blocks_purchase 化
+
+(4) の入口ゲートに対する Codex 第4R判定で残った 2 点を修正。
+
+- **① 実投票クリック直前の停止フラグ再検査** (`scripts/execute_purchase.py`):
+  入口ゲート `_stop_flags_block` はブラウザ処理の数百行手前で 1 回見るだけだった。
+  buy_app/直CLI 経路は auto_buy の named mutex を保持しないため、入口検査通過〜
+  実クリックの間に別 run が abandoned フラグを作成し得る。実際に金銭が確定する
+  「投票する」click の直前 (Step 8、`vote_btn.click` の最小スコープ直前) に
+  `_stop_flags_block(bets)` を再挿入。停止中/判定不能 (fail-closed) なら
+  クリックせず `RuntimeError` で abort (main が success:false + exit 1 に変換)。
+  発注ロジック本体・カート構築には触れていない。
+- **② 三連系入口ゲートを `backstop_blocks_purchase()` に** (`_stop_flags_block`):
+  旧実装は `backstop_active()` (フラグのファイル存在のみ) を見ており、直CLI 経路で
+  台帳異常・閾値超過を迂回できた (台帳ゲート=True なのに execute_purchase ゲート
+  =False)。`backstop_blocks_purchase()` (フラグ存在 OR 台帳読取不能 OR 閾値超過で
+  停止、いずれも fail-closed) に置換。rt3_backstop_stop.flag のファイル存在停止も
+  当然包含。abandoned (全券種) は従来どおり `auto_buy.abandoned_stop_active()` 共有。
+- `tests/test_final_gate_recheck.py`: ⑥ クリック直前再検査の回帰を追加 —
+  ブラウザを全 fake (playwright/`_launch_context`/券種ヘルパをスタブ、ROOT を
+  一時 dir に差替えて実 data/ を汚さない) にし、Step 8 直前で abandoned フラグを
+  立てると「投票する」click 関数が一度も呼ばれず abort することをアサート。
+  入口ゲートテストは backstop_blocks_purchase 化に合わせ、台帳異常 (フラグ無し) →
+  三連系停止 (② の直CLI迂回穴) のケースを追加。
+- 回帰テスト 57 本全緑 (実発注は禁止スタブ/fake、通知スタブ、フラグは一時 dir のみ)。
+  `data/rt3_backstop_stop.flag` は不変 (SHA256 一致)。
+
 ## 2026-07-12 (4) — abandoned 停止の並行 run 競合窓を閉塞 + execute_purchase 入口ゲート
 
 Codex 再検証で、WAIT_ABANDONED sticky 停止に**並行実行の競合窓**が残ると指摘:

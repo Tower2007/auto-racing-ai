@@ -481,54 +481,213 @@ def test_no_flag_after_acquire_proceeds_normally():
 
 def test_execute_purchase_entry_gate_fail_closed():
     """execute_purchase 入口ゲート: 全券種は abandoned フラグ、三連系は
-    rt3_backstop フラグで発注を止める。判定不能も fail-closed。
-    auto_buy 経由・手動UI 経由の全経路がここに集約される最終防御点。"""
+    backstop_blocks_purchase() (フラグ存在 OR 台帳異常 OR 閾値超過) で発注を
+    止める。判定不能も fail-closed。auto_buy 経由・手動UI 経由・直CLI の全経路が
+    ここに集約される最終防御点。② 直CLI経路で台帳異常 → 停止 も検証する。"""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
     import execute_purchase as ep
-    import src.backstop as _bs
 
-    tmp = Path(tempfile.mkdtemp(prefix="ep_gate_"))
-    ab_flag = tmp / "abandoned_lock_stop.flag"
-    bs_flag = tmp / "rt3_backstop_stop.flag"
     fns = [{"type": "fns", "cars": [5], "amount": 300}]
     sanren = [{"type": "rt3", "cars": [5, 6, 7], "amount": 100}]
 
+    ab_tmp = Path(tempfile.mkdtemp(prefix="ep_gate_"))
+    ab_flag = ab_tmp / "abandoned_lock_stop.flag"
     orig_ab = auto_buy.ABANDONED_STOP_FLAG
-    orig_bs = _bs.BACKSTOP_FLAG
-    try:
-        auto_buy.ABANDONED_STOP_FLAG = ab_flag
-        _bs.BACKSTOP_FLAG = bs_flag
-
-        # フラグ無し → 全券種通す (誤停止しない)
-        assert ep._stop_flags_block(fns) == (False, None)
-        assert ep._stop_flags_block(sanren) == (False, None)
-
-        # abandoned フラグ → 複勝でも三連系でも停止 (全券種)
-        ab_flag.write_text("x", encoding="utf-8")
-        assert ep._stop_flags_block(fns)[0] is True
-        assert ep._stop_flags_block(sanren)[0] is True
-        ab_flag.unlink()
-
-        # rt3_backstop フラグ → 三連系のみ停止、複勝は通す
-        bs_flag.write_text("x", encoding="utf-8")
-        blk_s, why_s = ep._stop_flags_block(sanren)
-        assert blk_s is True and "backstop" in (why_s or ""), (blk_s, why_s)
-        assert ep._stop_flags_block(fns) == (False, None)
-        bs_flag.unlink()
-
-        # abandoned 判定が例外 → fail-closed
-        orig_fn = auto_buy.abandoned_stop_active
+    with _BackstopSandbox() as bs:
         try:
-            def _boom():
-                raise RuntimeError("boom")
-            auto_buy.abandoned_stop_active = _boom
-            blk, why = ep._stop_flags_block(fns)
-            assert blk is True and "fail-closed" in (why or ""), (blk, why)
+            auto_buy.ABANDONED_STOP_FLAG = ab_flag
+            # 健全な台帳 (閾値内) → backstop ゲート通過
+            _write_detail(bs.detail, [_detail_row(4, "rt3", vote=100, hit=200)])
+
+            # フラグ無し・健全台帳 → 全券種通す (誤停止しない)
+            assert ep._stop_flags_block(fns) == (False, None)
+            assert ep._stop_flags_block(sanren) == (False, None)
+
+            # abandoned フラグ → 複勝でも三連系でも停止 (全券種)
+            ab_flag.write_text("x", encoding="utf-8")
+            assert ep._stop_flags_block(fns)[0] is True
+            assert ep._stop_flags_block(sanren)[0] is True
+            ab_flag.unlink()
+
+            # rt3_backstop_stop.flag 存在 → 三連系のみ停止、複勝は通す
+            bs.flag.write_text("x", encoding="utf-8")
+            blk_s, why_s = ep._stop_flags_block(sanren)
+            assert blk_s is True and "バックストップ" in (why_s or ""), \
+                (blk_s, why_s)
+            assert ep._stop_flags_block(fns) == (False, None)
+            bs.flag.unlink()
+
+            # ② 直CLI経路で台帳異常 (金額セル不正・フラグ無し) →
+            #    backstop_blocks_purchase() 経由で三連系停止 (旧 backstop_active
+            #    のフラグ存在だけ見る実装では迂回できた穴を塞ぐ)
+            _write_detail(bs.detail, [
+                {"date": "2026-07-01", "place_code": 4, "race_no": 1,
+                 "order_id": "broken", "bet_type_code": "rt3",
+                 "vote_amount": "壊れた", "hit_amount": 0,
+                 "henkan_amount": 0, "tokubarai_amount": 0}])
+            assert not bs.flag.exists()  # フラグは無い
+            assert backstop.backstop_blocks_purchase() is True  # 台帳ゲート=True
+            blk_c, _why_c = ep._stop_flags_block(sanren)
+            assert blk_c is True, "台帳異常で execute_purchase 入口も停止すべき"
+            # 台帳異常でも複勝 (三連系外) は止めない
+            assert ep._stop_flags_block(fns) == (False, None)
+            _write_detail(bs.detail, [_detail_row(4, "rt3", vote=100, hit=200)])
+
+            # abandoned 判定が例外 → fail-closed
+            orig_fn = auto_buy.abandoned_stop_active
+            try:
+                def _boom():
+                    raise RuntimeError("boom")
+                auto_buy.abandoned_stop_active = _boom
+                blk, why = ep._stop_flags_block(fns)
+                assert blk is True and "fail-closed" in (why or ""), (blk, why)
+            finally:
+                auto_buy.abandoned_stop_active = orig_fn
         finally:
-            auto_buy.abandoned_stop_active = orig_fn
+            auto_buy.ABANDONED_STOP_FLAG = orig_ab
+
+
+# ─── ⑥ 実投票クリック直前の停止フラグ再検査 (execute_purchase Step 8) ────────
+
+class _FakeLocator:
+    def __init__(self, page, selector):
+        self.page = page
+        self.selector = selector
+        self.first = self
+
+    async def count(self):
+        # 全削除ボタンは「無い」(カート空) 扱い、他は存在扱い
+        return 0 if "全削除" in self.selector else 1
+
+    async def is_disabled(self):
+        return False
+
+    async def click(self, timeout=None):
+        self.page.clicks.append(self.selector)
+        if "投票確認へ" in self.selector:
+            self.page.confirmed = True
+            self.page.url = self.page.confirm_url
+
+
+class _FakePage:
+    """execute_buy が Step 8 (実投票クリック) 直前まで進むだけの最小 fake。
+    実クリック関数 (locator('投票する').click) が呼ばれたか clicks で観測する。"""
+
+    def __init__(self, confirm_text: str, confirm_url: str):
+        self.url = ""
+        self.clicks: list[str] = []
+        self.confirmed = False
+        self._confirm_text = confirm_text
+        self.confirm_url = confirm_url
+
+    def locator(self, selector):
+        return _FakeLocator(self, selector)
+
+    async def goto(self, url, **kw):
+        self.url = url
+
+    async def evaluate(self, script):
+        # 確認遷移前 (カートクリア中) は空 → 「0組」扱い、遷移後は確認テキスト
+        return self._confirm_text if self.confirmed else ""
+
+    def on(self, event, cb):
+        pass
+
+    async def screenshot(self, **kw):
+        pass
+
+
+class _FakeContext:
+    async def close(self):
+        pass
+
+
+class _FakeAsyncPWCM:
+    async def __aenter__(self):
+        return object()  # pw (使わない: _launch_context を差し替える)
+
+    async def __aexit__(self, *a):
+        return False
+
+
+def test_click_precheck_blocks_when_flag_created_before_click():
+    """入口通過後・実クリック直前に abandoned フラグが立つと「投票する」click は
+    呼ばれず abort する (buy_app/直CLI は Auto mutex 非保持なので入口〜クリックの
+    間に別 run がフラグを作れる)。ブラウザは全て fake、クリック関数の未発火を観測。"""
+    import asyncio
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import execute_purchase as ep
+    import playwright.async_api as _pw_api
+
+    confirm_url = ("https://vote.autorace.jp/vote/confirm"
+                   "?vel_code=004&race_num=7")
+    confirm_text = (
+        "浜松 7R\n投票数 1組\n合計購入額 300円\n複勝 5 号\n"
+        "ポイント残高\n1,000pt\n払戻金残高\n500円\n")
+
+    tmp = Path(tempfile.mkdtemp(prefix="ep_click_"))
+    (tmp / "data").mkdir()  # screenshot/txt の書き出し先 (実 data/ を汚さない)
+    ab_flag = tmp / "abandoned_lock_stop.flag"
+
+    fake_page = _FakePage(confirm_text, confirm_url)
+    fake_ctx = _FakeContext()
+
+    orig = {
+        "ROOT": ep.ROOT,
+        "_launch_context": ep._launch_context,
+        "_normalize_bettype": ep._normalize_bettype,
+        "_select_cars": ep._select_cars,
+        "_set_amount_units": ep._set_amount_units,
+        "_add_to_sheet": ep._add_to_sheet,
+        "async_playwright": _pw_api.async_playwright,
+        "ABANDONED_STOP_FLAG": auto_buy.ABANDONED_STOP_FLAG,
+    }
+    try:
+        ep.ROOT = tmp
+        auto_buy.ABANDONED_STOP_FLAG = ab_flag
+
+        async def _fake_launch(pw):
+            return fake_ctx, fake_page
+        ep._launch_context = _fake_launch
+        ep._normalize_bettype = lambda page, tab: _acoro(True)
+        ep._select_cars = lambda page, bt, cars: _acoro(None)
+        ep._set_amount_units = lambda page, amt: _acoro(True)
+        ep._add_to_sheet = lambda page: _acoro(None)
+        _pw_api.async_playwright = lambda: _FakeAsyncPWCM()
+
+        # 入口検査は通過した体 (フラグはこの後・クリック直前の状態として作る)
+        assert not ab_flag.exists()
+        ab_flag.write_text("detected_at=2099-01-01T00:00:00\n",
+                           encoding="utf-8")
+
+        bets = [{"type": "fns", "cars": [5], "amount": 300}]
+        raised = None
+        try:
+            asyncio.run(ep.execute_buy(
+                "2099-01-01", 4, 7, dry_run=False, bets=bets))
+        except RuntimeError as e:
+            raised = e
+
+        assert raised is not None, "停止フラグ下でも例外なく発注に進んでしまった"
+        assert "実投票クリック直前" in str(raised), str(raised)
+        # 「投票する」click は一度も呼ばれていない (確認へ click は起きてよい)
+        assert not any("投票する" in s for s in fake_page.clicks), \
+            fake_page.clicks
+        assert any("投票確認へ" in s for s in fake_page.clicks), \
+            "テスト前提: 確認画面までは到達している"
     finally:
-        auto_buy.ABANDONED_STOP_FLAG = orig_ab
-        _bs.BACKSTOP_FLAG = orig_bs
+        ep.ROOT = orig["ROOT"]
+        ep._launch_context = orig["_launch_context"]
+        ep._normalize_bettype = orig["_normalize_bettype"]
+        ep._select_cars = orig["_select_cars"]
+        ep._set_amount_units = orig["_set_amount_units"]
+        ep._add_to_sheet = orig["_add_to_sheet"]
+        _pw_api.async_playwright = orig["async_playwright"]
+        auto_buy.ABANDONED_STOP_FLAG = orig["ABANDONED_STOP_FLAG"]
+
+
+async def _acoro(value):
+    return value
 
 
 def _run_all():
