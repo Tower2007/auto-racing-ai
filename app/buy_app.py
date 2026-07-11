@@ -372,6 +372,28 @@ if expected_pin:
 st.write("")
 
 if st.button("✅ 購入する", type="primary", width="stretch"):
+    # 2026-07-12 Codex再検証 ②: 発行済みトークンの実行直前にも三連系停止
+    # フラグを再検査する (トークン発行〜クリックの間にフラグが立った場合、
+    # および停止判定自体が確認できない場合は fail-closed で実行拒否)。
+    if any(str(b.get("type")) in ("rt3", "rf3") for b in bets):
+        try:
+            if str(ROOT) not in sys.path:
+                sys.path.insert(0, str(ROOT))
+            import auto_buy as _ab
+            _rt3_blocked = _ab.rt3_final_gate_blocks(bets)
+        except Exception:
+            _rt3_blocked = True  # 判定不能も fail-closed
+        if _rt3_blocked:
+            st.error(
+                "🚫 三連系購入は現在停止中です (data/rt3_stop.flag / "
+                "data/rt3_backstop_stop.flag が有効、または停止判定が確認"
+                "できません)。このトークンには三連系 (三連単/三連複) が"
+                "含まれるため、実行を拒否しました。"
+            )
+            bt.log_token(payload, sig=sig, status="failed",
+                         note="rt3 stop recheck blocked at token execution")
+            st.stop()
+
     # PIN 認証チェック (設定時のみ)
     if expected_pin and pin_input != expected_pin:
         st.error("🚫 PIN が一致しません")

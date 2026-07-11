@@ -217,6 +217,38 @@ def check_guards(
     return True, "ok"
 
 
+# ─── 三連系 停止フラグの最終発注点 再検査 (2026-07-12 Codex再検証 ②) ──────
+
+SANREN_BET_TYPES = ("rt3", "rf3")
+
+
+def bets_include_sanren(bets: list[dict] | None) -> bool:
+    """bets に三連系 (rt3/rf3) が含まれるか。"""
+    return any(str(b.get("type")) in SANREN_BET_TYPES for b in (bets or []))
+
+
+def rt3_final_gate_blocks(bets: list[dict] | None) -> bool:
+    """発注直前 (mutex 取得後) の三連系停止フラグ再検査。True = 発注しない。
+
+    daily_predict 側の候補判定 (rt3_buy_active) から mutex 待ち最大
+    LOCK_WAIT_SEC (90秒) を経て実発注に至るため、その間に停止フラグ
+    (rt3_stop.flag / rt3_backstop_stop.flag) が立った場合を最終発注点で拾う。
+
+    - 三連系を含まない bets → False (再検査不要、複勝は対象外)
+    - rt3_buy_active() が False → True (停止中)
+    - 判定自体が失敗 → True (fail-closed)
+    """
+    if not bets_include_sanren(bets):
+        return False
+    try:
+        import daily_predict  # 遅延 import (呼び出し元が daily_predict なら実質無償)
+        return not daily_predict.rt3_buy_active()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[auto_buy] 三連系停止フラグ再検査に失敗 (%s) — "
+                       "fail-closed で当該候補をスキップ", e)
+        return True
+
+
 # ─── bets 構築 ────────────────────────────────────────────────
 
 _BET_JP = {"fns": "複勝", "rt3": "三連単", "rf3": "三連複"}
@@ -410,7 +442,14 @@ def _kernel32():
 
 
 def _acquire_lock(wait_sec: float | None = None, name: str | None = None):
-    """named mutex を取得。成功なら (k32, handle)、取得不能なら None。
+    """named mutex を取得。成功なら (k32, handle, abandoned)、取得不能なら None。
+
+    abandoned (bool): WAIT_ABANDONED で所有を引き継いだ場合 True。
+    先行プロセスが「投票クリック後、state/台帳保存前」に死んだ可能性があり、
+    当日 cap の過少計上・重複投票の不確実性が残る。呼び出し側 (run_auto_buy)
+    は abandoned=True では発注を続行せず全候補 skip + 警告通知に倒す
+    (2026-07-12 Codex再検証 ③)。ロック自体は取得済みなので正常解放でき、
+    以後の run はブロックされない。
 
     発注ゲートなので例外は外に出さない: None → 呼び出し側は skip_lock verdict
     (発注せずスキップ = cap 破りより機会損失を選ぶ)。
@@ -449,12 +488,16 @@ def _acquire_lock(wait_sec: float | None = None, name: str | None = None):
                            rc, ctypes.get_last_error())
             k32.CloseHandle(handle)
             return None
-        if rc == WAIT_ABANDONED:
+        abandoned = (rc == WAIT_ABANDONED)
+        if abandoned:
             # 先行プロセスが ReleaseMutex せず死んだ。所有は OS が本プロセスへ
-            # 移譲済み。state は _run_auto_buy_locked が load_state で読み直す。
+            # 移譲済みだが、先行が「投票クリック後、state/台帳保存前」に死んだ
+            # 場合は当日 cap 過少計上・重複投票の不確実性が残る。
+            # → 発注は続行しない (run_auto_buy が全候補 skip + 警告通知)。
             logger.warning("[auto_buy] 先行プロセスの異常終了を検知 "
-                           "(abandoned mutex) — 所有を引き継いで続行")
-        return (k32, handle)
+                           "(abandoned mutex) — 結果不明のため本 run の発注は"
+                           "全候補スキップ (ロックは正常解放する)")
+        return (k32, handle, abandoned)
     except Exception as e:
         logger.warning("[auto_buy] mutex 取得失敗 (%s) — skip", e)
         try:
@@ -470,7 +513,7 @@ def _release_lock(lock) -> None:
     per-race one-shot で間もなく終了 → 所有スレッド終了時に abandoned 化して
     待機者が自動回復するため、ここは大声のログで足りる。"""
     import ctypes
-    k32, handle = lock
+    k32, handle = lock[0], lock[1]
     try:
         if not k32.ReleaseMutex(handle):
             logger.error("[auto_buy] ReleaseMutex 失敗 (WinError=%d) — "
@@ -502,6 +545,36 @@ def run_auto_buy(candidates: list[dict],
                  "timestamp": (now or now_jst()).isoformat()}
                 for c in candidates if c.get("bets")]
     try:
+        if lock[2]:
+            # WAIT_ABANDONED: 先行プロセス異常終了・結果不明 (2026-07-12 Codex③)。
+            # 先行が「投票クリック後、state/台帳保存前」に死んだ場合、当日 cap の
+            # 過少計上・重複投票の不確実性が残るため、本 run は発注せず全候補
+            # skip + 警告通知に倒す。ロックは finally で正常解放するので以後の
+            # run はブロックされない (状態確認・解消は人間の運用)。
+            verdicts = [
+                {"race": f"{c.get('venue','?')}_R{c.get('race_no')}",
+                 "verdict": "skip_abandoned_lock",
+                 "amount": int(c.get("amount", 0)),
+                 "timestamp": (now or now_jst()).isoformat()}
+                for c in candidates if c.get("bets")]
+            _notify(
+                "[AUTO-BUY] ⚠️ 先行プロセス異常終了検知 — 本 run の発注を全スキップ",
+                "【自動発注 警告: abandoned mutex 検知】\n\n"
+                "発注ロックの先行保持プロセスが ReleaseMutex せずに異常終了して"
+                "いました (WAIT_ABANDONED)。\n"
+                "先行プロセスが「投票クリック後、state/台帳保存前」に死んでいた"
+                "場合、当日 cap の過少計上や重複投票の可能性が残るため、\n"
+                f"安全側に倒して本 run の {len(verdicts)} 候補は発注せずスキップ"
+                "しました。\n\n"
+                "確認をお願いします:\n"
+                "  1. autorace.jp の投票履歴に意図しない/二重の投票がないか\n"
+                "  2. data/auto_buy_state.json の spent_yen が実投票と一致するか\n"
+                "  3. data/bet_history.csv / logs/ の直近エントリ\n\n"
+                "ロック自体は正常解放済みのため、以後の run は通常どおり動作"
+                "します (このスキップは本 run 限り)。")
+            logger.warning("[auto_buy] abandoned mutex — %d 候補を "
+                           "skip_abandoned_lock で処理 (発注なし)", len(verdicts))
+            return verdicts
         return _run_auto_buy_locked(candidates, now, dry_run)
     finally:
         _release_lock(lock)
@@ -523,6 +596,13 @@ def _run_auto_buy_locked(candidates: list[dict],
         ev = float(c.get("ev", 0.0))
         race_label = f"{c.get('venue','?')}_R{c['race_no']}"
         ok, reason = check_guards(state, now, amount, ev)
+        # 2026-07-12 Codex再検証 ②: 候補生成 → mutex 待ち (最大90秒) の間に
+        # 三連系停止フラグが立った/バックストップが読めなくなった場合を
+        # 発注直前 (ロック取得後) に再検査して拾う。fail-closed。
+        if ok and rt3_final_gate_blocks(c.get("bets")):
+            ok = False
+            reason = ("skip_rt3_stop_recheck (発注直前再検査: "
+                      "三連系停止フラグ ON または判定不能)")
         if not ok:
             logger.info("[auto_buy] %s skip: %s", race_label, reason)
             rec = {"race": race_label, "amount": amount,

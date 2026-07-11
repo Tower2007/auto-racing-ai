@@ -44,6 +44,29 @@ DETAIL_CSV = DATA / "bet_history_detail.csv"
 BACKSTOP_FLAG = DATA / "rt3_backstop_stop.flag"
 
 SANREN_BET_TYPES = ("rt3", "rf3")
+# 集計に必須のヘッダ (欠落 = 台帳フォーマット異常 → fail-closed)
+REQUIRED_DETAIL_COLUMNS = ("bet_type_code", "vote_amount", "hit_amount")
+
+
+def _strict_amount(v) -> float | None:
+    """金額セルの厳格パース。数値化できない/負値なら None (不正)。
+
+    2026-07-12 Codex再検証 ①: 旧実装は変換失敗を pass で握りつぶし
+    「CSVは開けるが金額セルが壊れている」場合に投資額0円として過小集計
+    → 購入を許可し得た。空セル・欠損 (短い行の None) も不正として扱う。
+    """
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        x = float(s)
+    except (TypeError, ValueError):
+        return None
+    if x < 0 or x != x:  # 負値・NaN は台帳として不正
+        return None
+    return x
 
 
 def backstop_active() -> bool:
@@ -85,6 +108,11 @@ def evaluate_backstop() -> dict:
     detail が読めない場合は profit=None, breached=False (「発動」とは扱わず
     sticky フラグも書かない)。ただし購入ゲート backstop_blocks_purchase() は
     profit=None を fail-closed (三連系購入スキップ) として扱う (P2-2)。
+
+    2026-07-12 Codex再検証 ①: 必須ヘッダ欠落、または三連系行の金額セルが
+    1つでも厳格パース不能 (空・非数値・負値) なら profit=None のまま error を
+    立てる = 完全 fail-closed。部分集計で「読めたセルだけの損益」を返すことは
+    しない (過小集計 → 閾値未達と誤判定 → 購入許可、を根絶)。
     """
     out: dict = {
         "n_rows": 0, "invest": 0, "payout": 0, "profit": None,
@@ -98,20 +126,36 @@ def evaluate_backstop() -> dict:
         invest = 0.0
         payout = 0.0
         n = 0
+        bad_cells: list[str] = []
         with open(DETAIL_CSV, "r", encoding="utf-8", newline="") as f:
-            for row in csv.DictReader(f):
+            reader = csv.DictReader(f)
+            fields = reader.fieldnames or []
+            missing = [c for c in REQUIRED_DETAIL_COLUMNS if c not in fields]
+            if missing:
+                out["error"] = (f"必須ヘッダ欠落 {missing} — "
+                                f"fail-closed (台帳フォーマット異常)")
+                logger.warning("[backstop] %s", out["error"])
+                return out
+            for lineno, row in enumerate(reader, start=2):
                 if row.get("bet_type_code") not in SANREN_BET_TYPES:
                     continue
                 n += 1
-                try:
-                    invest += float(row.get("vote_amount") or 0)
-                except (TypeError, ValueError):
-                    pass
-                try:
-                    payout += float(row.get("hit_amount") or 0)
-                except (TypeError, ValueError):
-                    pass
+                v = _strict_amount(row.get("vote_amount"))
+                h = _strict_amount(row.get("hit_amount"))
+                if v is None or h is None:
+                    bad_cells.append(
+                        f"L{lineno}(vote={row.get('vote_amount')!r},"
+                        f"hit={row.get('hit_amount')!r})")
+                    continue
+                invest += v
+                payout += h
         out["n_rows"] = n
+        if bad_cells:
+            # 1セルでも不正なら profit=None のまま (部分集計を返さない)
+            out["error"] = (f"三連系行の金額セル不正 {len(bad_cells)} 件 "
+                            f"(例: {', '.join(bad_cells[:3])}) — fail-closed")
+            logger.warning("[backstop] %s", out["error"])
+            return out
         out["invest"] = int(invest)
         out["payout"] = int(payout)
         out["profit"] = int(payout - invest)
