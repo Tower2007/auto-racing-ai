@@ -136,12 +136,40 @@ def test_backstop_triggers_at_threshold_and_is_sticky():
         assert out3["active"] is False
 
 
-def test_backstop_eval_failure_does_not_stop():
-    with _BackstopSandbox():
-        # detail が存在しない → 未評価 (購入は止めない)
+def test_backstop_eval_failure_fail_closed():
+    """2026-07-12 Codex艦隊監査 P2-2: 履歴読取失敗は fail-closed。
+
+    - enforce_backstop() は「発動」とは扱わない (sticky フラグ書き出し・通知なし)
+    - ただし購入ゲート backstop_blocks_purchase() は True (三連系購入スキップ)
+    """
+    with _BackstopSandbox() as sb:
+        # detail が存在しない → 未評価
         out = backstop.enforce_backstop()
         assert out["active"] is False and out["profit"] is None
         assert out["error"]
+        assert not sb.flag.exists() and sb.sent == []   # 真の発動と区別
+        # 購入ゲートは fail-closed で停止
+        assert backstop.backstop_blocks_purchase() is True
+        # 壊れた detail (集計不能) でも fail-closed
+        sb.detail.write_bytes(b"\xff\xfe\x00broken")
+        assert backstop.backstop_blocks_purchase() is True
+
+
+def test_backstop_blocks_purchase_states():
+    """購入ゲートの4状態: 健全 → False / 閾値割れ (フラグ未書出) → True /
+    フラグ存在 → True / 読取不能 → True (fail-closed)。"""
+    with _BackstopSandbox() as sb:
+        # 健全 (閾値内)
+        _write_detail(sb.detail, [_detail_row(4, "rt3", vote=100, hit=200)])
+        assert backstop.backstop_blocks_purchase() is False
+        # 閾値割れ: enforce (フラグ書き出し) 前でも購入は止まる
+        _write_detail(sb.detail, [_detail_row(4, "rt3", vote=20_000, hit=0)])
+        assert backstop.backstop_blocks_purchase() is True
+        assert not sb.flag.exists()   # ゲートはフラグを書かない (enforce の仕事)
+        # フラグ存在 (sticky): detail が健全でも停止
+        _write_detail(sb.detail, [_detail_row(4, "rt3", vote=100, hit=200)])
+        sb.flag.write_text("x", encoding="utf-8")
+        assert backstop.backstop_blocks_purchase() is True
 
 
 def test_rt3_buy_active_gated_by_backstop_flag():
@@ -150,10 +178,17 @@ def test_rt3_buy_active_gated_by_backstop_flag():
         orig_stop = daily_predict.RT3_STOP_FLAG
         try:
             daily_predict.RT3_STOP_FLAG = sb.tmp / "rt3_stop.flag"  # 無し
+            # P2-2: detail 不在は fail-closed → まず健全な detail を置く
+            _write_detail(sb.detail, [_detail_row(4, "rt3", vote=100, hit=200)])
             assert daily_predict.rt3_buy_active() is True
             sb.flag.write_text("test", encoding="utf-8")  # backstop flag ON
             assert daily_predict.rt3_buy_active() is False
             sb.flag.unlink()
+            assert daily_predict.rt3_buy_active() is True
+            # P2-2: detail が読めない → fail-closed で False
+            sb.detail.unlink()
+            assert daily_predict.rt3_buy_active() is False
+            _write_detail(sb.detail, [_detail_row(4, "rt3", vote=100, hit=200)])
             assert daily_predict.rt3_buy_active() is True
             # 既存 kill-switch フラグも従来通り効く
             daily_predict.RT3_STOP_FLAG.write_text("x", encoding="utf-8")
@@ -222,12 +257,16 @@ def test_ingest_manifest_partial_written_before_fetch():
 
 
 def test_ingest_manifest_final_status_overrides_start_marker():
-    """正常系: 開始マーカ partial の後に完了行 (no_race) が優先される。"""
+    """正常系: 開始マーカ partial の後に完了行 (no_race) が優先される。
+    2026-07-12 P2-1: no_race は RaceRefund の裏取り (0件) がある時のみ。"""
     import ingest_day
 
     class _NoRaceClient:
         def get_program(self, *a, **kw):
             return {"body": []}  # 開催なし
+
+        def get_race_refund(self, *a, **kw):
+            return {"body": []}  # 払戻も0件 = 開催なしの裏取り
 
     tmp = Path(tempfile.mkdtemp(prefix="ingest_manifest_test2_"))
     orig_manifest = ingest_day.MANIFEST_CSV
@@ -248,6 +287,85 @@ def test_ingest_manifest_final_status_overrides_start_marker():
     finally:
         ingest_day.MANIFEST_CSV = orig_manifest
         ingest_day.has_race_day = orig_has
+
+
+def test_ingest_empty_r1_without_corroboration_is_partial():
+    """2026-07-12 Codex艦隊監査 P2-1: Program R1 の空応答だけでは no_race に
+    しない。RaceRefund で裏取りできない (失敗 or 払戻あり) 場合は partial の
+    まま次回再取得に委ねる。"""
+    import ingest_day
+
+    class _RefundFailsClient:
+        def get_program(self, *a, **kw):
+            return {"body": []}   # 空応答 (一時障害かもしれない)
+
+        def get_race_refund(self, *a, **kw):
+            raise RuntimeError("API down")
+
+    class _RefundContradictsClient:
+        def get_program(self, *a, **kw):
+            return {"body": []}   # 空応答
+
+        def get_race_refund(self, *a, **kw):
+            return {"body": [{"raceNo": 1}]}   # 払戻あり = 実は開催日
+
+    tmp = Path(tempfile.mkdtemp(prefix="ingest_empty_r1_test_"))
+    orig_manifest = ingest_day.MANIFEST_CSV
+    orig_has = ingest_day.has_race_day
+    try:
+        ingest_day.MANIFEST_CSV = tmp / "ingest_manifest.csv"
+        ingest_day.has_race_day = lambda *a, **kw: False
+        counts = ingest_day.ingest_one_day(_RefundFailsClient(), 4, "2099-02-01")
+        assert counts == {}
+        assert ingest_day.manifest_status(4, "2099-02-01") == "partial"
+        counts = ingest_day.ingest_one_day(_RefundContradictsClient(), 4, "2099-02-02")
+        assert counts == {}
+        assert ingest_day.manifest_status(4, "2099-02-02") == "partial"
+    finally:
+        ingest_day.MANIFEST_CSV = orig_manifest
+        ingest_day.has_race_day = orig_has
+
+
+def test_ingest_midloop_empty_with_payout_marks_partial():
+    """2026-07-12 Codex艦隊監査 P2-1: ループ途中の空応答 (払戻実績のある R) を
+    「カード終わり」と誤認して ok と記録しない — partial に倒す。"""
+    import ingest_day
+
+    class _MidloopEmptyClient:
+        """R1 は正常、R2 は空応答 (だが払戻あり = 取りこぼし)、R3〜 は本当に無い。"""
+
+        def get_program(self, pc, date, race_no):
+            if race_no == 1:
+                return {"body": {"playerList": [{"carNo": 1}]}}
+            return {"body": []}
+
+        def get_race_refund(self, *a, **kw):
+            return {"body": [{"raceNo": 1}, {"raceNo": 2}]}
+
+        def get_odds(self, *a, **kw):
+            return {"body": []}       # list = オッズなし (行は書かない)
+
+        def get_race_result(self, *a, **kw):
+            return {"body": []}       # list = 結果なし (行は書かない)
+
+    tmp = Path(tempfile.mkdtemp(prefix="ingest_midloop_test_"))
+    orig = {k: getattr(ingest_day, k) for k in (
+        "MANIFEST_CSV", "has_race_day", "append_rows",
+        "parse_program_entries", "parse_program_stats", "parse_payouts")}
+    try:
+        ingest_day.MANIFEST_CSV = tmp / "ingest_manifest.csv"
+        ingest_day.has_race_day = lambda *a, **kw: False
+        ingest_day.append_rows = lambda name, rows: len(rows)  # 実CSVに書かない
+        ingest_day.parse_program_entries = lambda *a, **kw: [{"r": 1}]
+        ingest_day.parse_program_stats = lambda *a, **kw: []
+        ingest_day.parse_payouts = lambda *a, **kw: []
+        counts = ingest_day.ingest_one_day(_MidloopEmptyClient(), 4, "2099-03-01")
+        # R2 の取りこぼしが errors としてカウントされ、日は partial (ok にしない)
+        assert ingest_day.manifest_status(4, "2099-03-01") == "partial"
+        assert counts.get("entries") == 1   # R1 は取り込まれている
+    finally:
+        for k, v in orig.items():
+            setattr(ingest_day, k, v)
 
 
 def _run_all():

@@ -20,7 +20,8 @@ sticky 仕様 (Codex 条件):
 (返還 henkan は払戻に含めない = 保守側に倒す)。
 
 参照側:
-  - daily_predict.rt3_buy_active() が backstop_active() を参照 (購入ゲート)
+  - daily_predict.rt3_buy_active() が backstop_blocks_purchase() を参照 (購入ゲート、
+    履歴読取失敗時は fail-closed = 三連系購入スキップ。2026-07-12 Codex艦隊監査 P2-2)
   - daily_predict.main() 冒頭で enforce_backstop() を評価 (発動 + メール通知)
   - weekly_status.check_3point_health() が条件⑤として表示 + 発動
 """
@@ -50,14 +51,40 @@ def backstop_active() -> bool:
     return BACKSTOP_FLAG.exists()
 
 
+def backstop_blocks_purchase() -> bool:
+    """三連系購入ゲート: 購入を止めるべきなら True (2026-07-12 Codex艦隊監査 P2-2)。
+
+    - sticky フラグ存在                      → True (発動済み)
+    - bet_history_detail が読めない/集計不能 → True (fail-closed) + 警告。
+      履歴を確認できない状態では「バックストップ発動済みかどうか」を判定できない
+      ため、旧設計 (評価失敗では止めない) を改め購入をスキップする。
+      sticky フラグの書き出し・メール通知はしない (真の発動と区別する)。
+    - 集計できて閾値割れ                     → True (enforce 前でも購入は止める)
+    - 集計できて閾値内                       → False
+    """
+    if BACKSTOP_FLAG.exists():
+        return True
+    try:
+        ev = evaluate_backstop()
+    except Exception as e:  # noqa: BLE001 (evaluate 内で握るが二重防御)
+        logger.warning("[backstop] 評価失敗 (%s) — fail-closed で三連系購入をスキップ", e)
+        return True
+    if ev.get("profit") is None:
+        logger.warning("[backstop] bet_history_detail 読取不能 (%s) — "
+                       "fail-closed で三連系購入をスキップ", ev.get("error"))
+        return True
+    return bool(ev.get("breached"))
+
+
 def evaluate_backstop() -> dict:
     """全場・全期間の三連系累積損益を集計 (純関数、副作用なし)。
 
     戻り値:
       n_rows / invest / payout / profit(int|None) / breached(bool) /
       threshold / flag_exists / error(str|None)
-    detail が読めない場合は profit=None, breached=False (評価失敗で購入は
-    止めない — 現役スコープの kill-switch ②(-5,000) が別途効いている)。
+    detail が読めない場合は profit=None, breached=False (「発動」とは扱わず
+    sticky フラグも書かない)。ただし購入ゲート backstop_blocks_purchase() は
+    profit=None を fail-closed (三連系購入スキップ) として扱う (P2-2)。
     """
     out: dict = {
         "n_rows": 0, "invest": 0, "payout": 0, "profit": None,

@@ -100,6 +100,24 @@ logger = logging.getLogger(__name__)
 MAX_RACES = 12
 
 
+def _confirm_no_race(client: "AutoraceClient", place_code: int,
+                     race_date: str) -> bool:
+    """「開催が本当に無い」ことを Program とは独立な RaceRefund で裏取りする
+    (2026-07-12 Codex艦隊監査 P2-1: Program の一時的な空応答だけを根拠に
+    no_race を manifest に恒久記録すると、実開催日が永久欠損になる)。
+
+    払戻が 1 件でもあれば開催あり (=False)。取得失敗・想定外の応答形も False
+    (曖昧なまま no_race と断定しない → 呼び出し側が partial にして再取得に委ねる)。
+    """
+    try:
+        refund = client.get_race_refund(place_code, race_date)
+        body = refund.get("body", None)
+        return isinstance(body, list) and len(body) == 0
+    except Exception as e:
+        logger.warning("  RaceRefund corroboration failed: %s", e)
+        return False
+
+
 def ingest_one_day(client: AutoraceClient, place_code: int, race_date: str) -> dict:
     """1日分の全データを取得して CSV に保存。戻り値は投入行数サマリー。
 
@@ -140,11 +158,20 @@ def ingest_one_day(client: AutoraceClient, place_code: int, race_date: str) -> d
     try:
         prog1 = client.get_program(place_code, race_date, 1)
         body1 = prog1.get("body", {})
-        # 開催なしの日は body が list ([]) で返る
+        # 開催なしの日は body が list ([]) で返る。ただし空応答だけでは
+        # 「開催なし」と断定しない (2026-07-12 Codex艦隊監査 P2-1):
+        # RaceRefund でも 0 件を確認できた時のみ no_race、曖昧なら partial の
+        # ままにして次回 catchup の再取得に委ねる。
         if isinstance(body1, list) or not body1.get("playerList"):
-            logger.info("  No race on %s at %s", race_date, venue)
-            write_manifest(place_code, race_date, "no_race", 0)
-            return counts  # 空 dict = no_race
+            if _confirm_no_race(client, place_code, race_date):
+                logger.info("  No race on %s at %s (RaceRefund でも0件を確認)",
+                            race_date, venue)
+                write_manifest(place_code, race_date, "no_race", 0)
+            else:
+                logger.warning("  Program R1 空応答だが開催なしと断定できず — "
+                               "partial のまま (次回 catchup で再試行)")
+                write_manifest(place_code, race_date, "partial", 1)
+            return counts  # 空 dict = 当日データなし
     except Exception as e:
         # 取得失敗は「開催なし」と区別し partial 扱い (次回 catchup で再試行)
         logger.error("Program R1 check failed: %s", e)
@@ -152,12 +179,20 @@ def ingest_one_day(client: AutoraceClient, place_code: int, race_date: str) -> d
         return counts
 
     # --- RaceRefund (1日分まとめ) ---
+    # expected_race_nos: 払戻実績のある R 番号の集合。ループ途中の空応答が
+    # 「本当のカード終わり」か「取りこぼし」かの判定根拠に使う (P2-1)。
+    expected_race_nos: set[int] = set()
     try:
         refund = client.get_race_refund(place_code, race_date)
         refund_body = refund.get("body", [])
         if isinstance(refund_body, list):
             payout_rows = parse_payouts(place_code, race_date, refund_body)
             counts["payouts"] = append_rows("payouts.csv", payout_rows)
+            for race in refund_body:
+                try:
+                    expected_race_nos.add(int(race.get("raceNo")))
+                except (TypeError, ValueError):
+                    pass
     except Exception as e:
         logger.error("RaceRefund failed: %s", e)
         n_errors += 1
@@ -172,6 +207,14 @@ def ingest_one_day(client: AutoraceClient, place_code: int, race_date: str) -> d
                 prog = client.get_program(place_code, race_date, race_no)
                 body = prog.get("body", {})
                 if isinstance(body, list) or not body.get("playerList"):
+                    if race_no in expected_race_nos:
+                        # 払戻実績があるのに出走表が空 = 途中の空応答 (P2-1)。
+                        # ok と誤記して永久欠損にせず partial に倒し、
+                        # 次の R は継続して試す。
+                        logger.error("  R%d: 空応答だが払戻あり — "
+                                     "取りこぼしとして partial 扱い", race_no)
+                        n_errors += 1
+                        continue
                     logger.info("  R%d: no playerList, stopping", race_no)
                     break
 
