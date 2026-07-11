@@ -115,13 +115,12 @@ EXPECTED_VOTES_CSV = DATA / "expected_votes.csv"  # 場×R別 typical 票数 →
 # 過去検証 ev_3point_by_place / ev_3point_policy_sim (2026-06-09 rt2_rf4 policy):
 #   RT3(三連単): 浜松 ROI 530% / 山陽 ROI 141%
 #   RF3(三連複): 伊勢崎 ROI 377% / 浜松 ROI 330% / 飯塚 ROI 114% / 山陽 ROI 185%
-#   → RT3=2場・RF3=4場 policy が ROI 202% と最高効率
 #   ※ 上記 sim ROI は odds_summary 過大オッズ由来の楽観バイアスあり (2026-06-28 確認)
-# 2026-07-11: 飯塚(5) を RF3 から除外。実弾 17 連敗 (0/17, 的中率25%想定で
-#   p≈0.8%) + sim でも 4 場中最弱 (114%)。監査 P1-3 で停止監視の対象外だったことも
-#   発覚 (weekly_status RT3_PLACES が浜松・山陽のまま) → 監視は全場に拡大済み。
-RT3_ELIGIBLE_PLACES = {4, 6}     # 三連単 購入対象: 浜松, 山陽
-RF3_ELIGIBLE_PLACES = {3, 4, 6}  # 三連複 購入対象: 伊勢崎, 浜松, 山陽 (飯塚は 2026-07-11 除外)
+# 購入対象は src/strategy_config.py の THREE_POINT_POLICY が正本 (監査 P1-3 対策)。
+# 2026-07-11: 飯塚(5) を RF3 から除外 (実弾 0/17)。設定変更は strategy_config で。
+from src.strategy_config import (  # noqa: E402
+    RT3_ELIGIBLE_PLACES, RF3_ELIGIBLE_PLACES,
+)
 RT3_THR = 1.80
 RT3_PAPER_LOG = DATA / "rt3_paper.csv"
 # weekly_status の停止基準が発動すると書かれる kill-switch。
