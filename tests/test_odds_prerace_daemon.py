@@ -122,8 +122,28 @@ def test_build_events_midnight_crossover():
 
 # ─── 4. 単一インスタンスガード ─────────────────────────────────
 
+def _find_bindable_port(start: int = 58998, tries: int = 200) -> int:
+    """bind 可能なテスト用ポートを探す。
+
+    2026-07-12: 固定 58998 が Windows の動的除外ポート帯
+    (WinNAT/Hyper-V の excludedportrange。誰も LISTEN していなくても
+    bind が WinError 10013 で拒否される) に入り flake したため、
+    実際に bind できるポートを探してから本題 (2重 bind 失敗) を検証する。"""
+    import socket
+    for port in range(start, start + tries):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind(("127.0.0.1", port))
+            return port
+        except OSError:
+            continue
+        finally:
+            s.close()
+    raise RuntimeError(f"bind 可能なテストポートが見つからない ({start}〜)")
+
+
 def test_singleton_guard():
-    port = 58998  # テスト専用ポート (本番 58620 とは別)
+    port = _find_bindable_port()  # 本番 58620 とは別のテスト専用ポート
     lock1 = opd.acquire_singleton(port)
     assert lock1 is not None
     try:
