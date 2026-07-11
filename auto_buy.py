@@ -686,6 +686,35 @@ def run_auto_buy(candidates: list[dict],
                            "(発注なし、以後の run も人手解除まで停止)",
                            len(verdicts))
             return verdicts
+        # ── mutex 取得後の abandoned フラグ再検査 (2026-07-12 Codex再々々検証) ──
+        # 入口 (行 623) の検査は mutex 取得**前**の1回のみ。並行 run に競合窓が残る:
+        #   1. run B が入口でフラグ不存在を確認 → mutex 待ちに入る
+        #   2. run A が WAIT_ABANDONED を受領し sticky フラグを書き出す
+        #   3. run A が mutex を正常解放
+        #   4. run B が WAIT_OBJECT_0 で正常取得 → lock[2] 分岐に入らず、
+        #      作成済みフラグを見ずに発注してしまう
+        # これを塞ぐため、mutex 保持中 (発注ループ直前) にフラグを再検査する。
+        # 判定不能も fail-closed (abandoned_stop_active は exists() のみで
+        # 例外は事実上出ないが、防御的に True 扱いで全候補 skip)。
+        try:
+            _abandoned_now = abandoned_stop_active()
+        except Exception as e:  # noqa: BLE001
+            logger.error("[auto_buy] mutex 取得後の abandoned フラグ再検査に失敗 "
+                         "(%s) — fail-closed で全候補スキップ", e)
+            _abandoned_now = True
+        if _abandoned_now:
+            verdicts = [
+                {"race": f"{c.get('venue','?')}_R{c.get('race_no')}",
+                 "verdict": "skip_abandoned_pending",
+                 "amount": int(c.get("amount", 0)),
+                 "timestamp": (now or now_jst()).isoformat()}
+                for c in candidates if c.get("bets")]
+            logger.warning("[auto_buy] mutex 取得後の再検査で発注結果不明フラグ "
+                           "(%s) を検知 — %d 候補を skip_abandoned_pending で処理 "
+                           "(発注なし)。競合窓 (run B が mutex 待ち中に run A が"
+                           "フラグ作成) を捕捉", ABANDONED_STOP_FLAG, len(verdicts))
+            _alert_abandoned_pending_once(now, len(verdicts))
+            return verdicts
         return _run_auto_buy_locked(candidates, now, dry_run)
     finally:
         _release_lock(lock)

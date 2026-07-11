@@ -1008,6 +1008,43 @@ async def execute_buy(
                 pass
 
 
+def _stop_flags_block(bets: list[dict]) -> tuple[bool, str | None]:
+    """発注入口の停止フラグ fail-closed ゲート (2026-07-12 Codex再々々検証)。
+
+    auto_buy 経由 (subprocess) も手動UI (buy_app) 経由も、実発注は最終的に
+    この execute_purchase に集約される。両経路の停止フラグの取りこぼしを
+    ここで最終的に塞ぐ (多重防御。既存の停止経路は変更しない)。
+
+    停止すべきなら (True, 理由)。判定に必要な import / 参照自体が失敗した
+    場合も fail-closed (True) で発注を拒否する。
+
+    - abandoned_lock_stop.flag (**全券種**): auto_buy.abandoned_stop_active()
+      を共有。過去の run が WAIT_ABANDONED を検知して書いた sticky フラグで、
+      人手照合・削除まで全券種の発注を止める。
+    - rt3_backstop_stop.flag (**三連系のみ**): src.backstop.backstop_active()。
+      三連系 (rt3/rf3) を含む bets のときだけ参照する (複勝は止めない)。
+    """
+    root = str(ROOT)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    # 全券種: 発注結果不明 sticky フラグ (auto_buy と同一関数を共有)
+    try:
+        import auto_buy
+        if auto_buy.abandoned_stop_active():
+            return True, "abandoned_lock_stop.flag (発注結果不明・全券種停止)"
+    except Exception as e:  # noqa: BLE001
+        return True, f"abandoned フラグ判定不能 (fail-closed): {e}"
+    # 三連系のみ: 全場・全期間 絶対損失バックストップ sticky フラグ
+    if any(str(b.get("type")) in ("rt3", "rf3") for b in (bets or [])):
+        try:
+            from src.backstop import backstop_active
+            if backstop_active():
+                return True, "rt3_backstop_stop.flag (三連系バックストップ発動)"
+        except Exception as e:  # noqa: BLE001
+            return True, f"三連系バックストップ判定不能 (fail-closed): {e}"
+    return False, None
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--race-date", required=True, help="YYYY-MM-DD")
@@ -1112,6 +1149,16 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(2)
+
+    # === 発注入口の停止フラグ fail-closed ゲート (2026-07-12 Codex再々々検証) ===
+    # auto_buy 経由・手動UI (buy_app) 経由の全経路が最終的にここへ集約されるため、
+    # 停止フラグの取りこぼしをこの入口で最終的に塞ぐ。発注ロジック本体には触れず、
+    # 入口での早期 exit のみに留める (最小変更)。dry-run も停止フラグに従う。
+    _blocked, _why = _stop_flags_block(bets)
+    if _blocked:
+        print(f"[execute_purchase] 🛑 発注停止フラグにより中止: {_why}",
+              file=sys.stderr)
+        sys.exit(3)
 
     # 注意: 本番モード (`--dry-run` なし) は実投票を発生させる。
     # 三連系まとめ買い対応 (2026-05-30)。dry-run で確認画面検証後に本番。

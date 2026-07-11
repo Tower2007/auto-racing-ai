@@ -400,6 +400,137 @@ def test_acquire_lock_returns_abandoned_flag():
     auto_buy._release_lock(lock)
 
 
+# ─── ④ 並行 run 競合窓: mutex 取得後の abandoned フラグ再検査 ──────────────
+
+def test_flag_created_during_mutex_wait_rechecked_after_acquire():
+    """Codex再々々検証の主題: 入口 (mutex 取得前) 検査だけでは閉じない競合窓。
+
+    シーケンス:
+      1. run B が入口でフラグ不存在を確認 → mutex 待ちに入る
+      2. run A が WAIT_ABANDONED を受領し sticky フラグを作成
+      3. run A が mutex を正常解放
+      4. run B が WAIT_OBJECT_0 で正常取得 (abandoned=False)
+
+    旧実装では 4 の後に再検査がなく発注してしまう。本テストは _acquire_lock を
+    差し替えて「取得の瞬間にフラグが既に作られている (= A が待機中に作成済み)」
+    状況を作り、run B が mutex 取得後の再検査で skip_abandoned_pending となり
+    発注本体 (_run_auto_buy_locked) に一切入らないことを検証する。
+    実 mutex は使わず、フラグ作成タイミングだけを制御する (全 OS で実行可)。"""
+    with _AutoBuySandbox() as ab:
+        flag = auto_buy.ABANDONED_STOP_FLAG
+        assert not flag.exists(), "入口検査時点ではフラグ不存在"
+
+        released: list = []
+        orig_locked = auto_buy._run_auto_buy_locked
+        orig_acquire = auto_buy._acquire_lock
+        orig_release = auto_buy._release_lock
+        try:
+            def _fake_acquire(*a, **kw):
+                # run B が mutex を正常取得する「瞬間」に、run A が待機中に
+                # 作成済みだった sticky フラグが既に存在している状況を模擬
+                flag.write_text("detected_at=2099-01-01T00:00:00\n",
+                                encoding="utf-8")
+                return ("k32_stub", "handle_stub", False)  # abandoned=False
+
+            auto_buy._acquire_lock = _fake_acquire
+            auto_buy._release_lock = lambda lk: released.append(lk)
+            # 発注本体は禁止スタブ: 再検査が効かず入るとこのテストは失敗する
+            auto_buy._run_auto_buy_locked = _forbidden_execute
+
+            cands = [
+                _sanren_candidate(),
+                {"race_date": "2099-01-01", "place_code": 2,
+                 "venue": "kawaguchi", "venue_jp": "川口", "race_no": 3,
+                 "car_no": 2, "ev": 1.5,
+                 "bets": [{"type": "fns", "cars": [2], "amount": 300}],
+                 "amount": 300}]
+            out = auto_buy.run_auto_buy(cands, dry_run=False)
+            assert [r["verdict"] for r in out] == \
+                ["skip_abandoned_pending", "skip_abandoned_pending"], out
+            # finally でロックは正常解放されている (取得後再検査でも解放漏れなし)
+            assert released == [("k32_stub", "handle_stub", False)], released
+            assert len(ab.sent) == 1 and "残存" in ab.sent[0][0], ab.sent
+        finally:
+            auto_buy._run_auto_buy_locked = orig_locked
+            auto_buy._acquire_lock = orig_acquire
+            auto_buy._release_lock = orig_release
+
+
+def test_no_flag_after_acquire_proceeds_normally():
+    """回帰: 取得後もフラグが無ければ従来どおり発注本体へ進む (誤停止しない)。"""
+    with _AutoBuySandbox() as ab:
+        assert not auto_buy.ABANDONED_STOP_FLAG.exists()
+        locked_calls: list = []
+        orig_locked = auto_buy._run_auto_buy_locked
+        orig_acquire = auto_buy._acquire_lock
+        orig_release = auto_buy._release_lock
+        try:
+            auto_buy._acquire_lock = lambda *a, **kw: ("k32", "h", False)
+            auto_buy._release_lock = lambda lk: None
+            auto_buy._run_auto_buy_locked = (
+                lambda c, n, d: locked_calls.append(len(c)) or [])
+            out = auto_buy.run_auto_buy([_sanren_candidate()], dry_run=False)
+            assert out == [] and locked_calls == [1], (out, locked_calls)
+        finally:
+            auto_buy._run_auto_buy_locked = orig_locked
+            auto_buy._acquire_lock = orig_acquire
+            auto_buy._release_lock = orig_release
+
+
+# ─── ⑤ execute_purchase 入口ゲート (全経路の最終防御) ──────────────────────
+
+def test_execute_purchase_entry_gate_fail_closed():
+    """execute_purchase 入口ゲート: 全券種は abandoned フラグ、三連系は
+    rt3_backstop フラグで発注を止める。判定不能も fail-closed。
+    auto_buy 経由・手動UI 経由の全経路がここに集約される最終防御点。"""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    import execute_purchase as ep
+    import src.backstop as _bs
+
+    tmp = Path(tempfile.mkdtemp(prefix="ep_gate_"))
+    ab_flag = tmp / "abandoned_lock_stop.flag"
+    bs_flag = tmp / "rt3_backstop_stop.flag"
+    fns = [{"type": "fns", "cars": [5], "amount": 300}]
+    sanren = [{"type": "rt3", "cars": [5, 6, 7], "amount": 100}]
+
+    orig_ab = auto_buy.ABANDONED_STOP_FLAG
+    orig_bs = _bs.BACKSTOP_FLAG
+    try:
+        auto_buy.ABANDONED_STOP_FLAG = ab_flag
+        _bs.BACKSTOP_FLAG = bs_flag
+
+        # フラグ無し → 全券種通す (誤停止しない)
+        assert ep._stop_flags_block(fns) == (False, None)
+        assert ep._stop_flags_block(sanren) == (False, None)
+
+        # abandoned フラグ → 複勝でも三連系でも停止 (全券種)
+        ab_flag.write_text("x", encoding="utf-8")
+        assert ep._stop_flags_block(fns)[0] is True
+        assert ep._stop_flags_block(sanren)[0] is True
+        ab_flag.unlink()
+
+        # rt3_backstop フラグ → 三連系のみ停止、複勝は通す
+        bs_flag.write_text("x", encoding="utf-8")
+        blk_s, why_s = ep._stop_flags_block(sanren)
+        assert blk_s is True and "backstop" in (why_s or ""), (blk_s, why_s)
+        assert ep._stop_flags_block(fns) == (False, None)
+        bs_flag.unlink()
+
+        # abandoned 判定が例外 → fail-closed
+        orig_fn = auto_buy.abandoned_stop_active
+        try:
+            def _boom():
+                raise RuntimeError("boom")
+            auto_buy.abandoned_stop_active = _boom
+            blk, why = ep._stop_flags_block(fns)
+            assert blk is True and "fail-closed" in (why or ""), (blk, why)
+        finally:
+            auto_buy.abandoned_stop_active = orig_fn
+    finally:
+        auto_buy.ABANDONED_STOP_FLAG = orig_ab
+        _bs.BACKSTOP_FLAG = orig_bs
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]

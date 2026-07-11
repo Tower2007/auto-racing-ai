@@ -1,5 +1,32 @@
 # CHANGELOG
 
+## 2026-07-12 (4) — abandoned 停止の並行 run 競合窓を閉塞 + execute_purchase 入口ゲート
+
+Codex 再検証で、WAIT_ABANDONED sticky 停止に**並行実行の競合窓**が残ると指摘:
+入口の abandoned フラグ検査が mutex 取得**前**の 1 回だけのため、
+(1) run B が入口でフラグ不存在を確認 → mutex 待ちに入り、(2) その間に run A が
+WAIT_ABANDONED を受領して sticky フラグを作成・(3) mutex を正常解放すると、
+(4) run B は WAIT_OBJECT_0 で正常取得し `lock[2]` 分岐に入らず、作成済みフラグを
+再検査せず発注してしまう。
+
+- `auto_buy.py`: `run_auto_buy` の mutex 取得後・`_run_auto_buy_locked` 呼出前
+  (発注ループ直前) に `abandoned_stop_active()` を**再検査**。存在すれば全候補を
+  `skip_abandoned_pending` で return (発注なし、日次1回の残存通知)。判定不能も
+  fail-closed。ロックは finally で従来どおり正常解放する。
+- `scripts/execute_purchase.py`: 発注の全経路 (auto_buy subprocess 経由・手動UI
+  buy_app 経由) が最終的に集約される入口に fail-closed ゲート `_stop_flags_block`
+  を追加。abandoned_lock_stop.flag は**全券種**、rt3_backstop_stop.flag は
+  **三連系 (rt3/rf3) を含む bets のみ**参照し、停止フラグ ON / 判定不能なら
+  `sys.exit(3)` で実発注 (`execute_buy`) に到達させない。発注ロジック本体・既存の
+  停止経路 (daily_predict / buy_app 再検査) は不変 = 多重防御。
+- `tests/test_final_gate_recheck.py`: 並行 run 競合窓の回帰 3 本追加
+  — ④ mutex 待ち中のフラグ作成 → 取得後再検査で skip / 取得後フラグ無しは
+  通常発注へ復帰 (誤停止しない回帰) / ⑤ execute_purchase 入口ゲート
+  (全券種 abandoned・三連系のみ backstop・判定不能 fail-closed)。
+  実 mutex 不要 (フラグ作成タイミングのみ制御) で全 OS 実行可。
+- 回帰テスト 56 本全緑 (実発注は禁止スタブ=AssertionError、通知スタブ、
+  フラグは一時 dir のみ)。`data/rt3_backstop_stop.flag` には触れていない。
+
 ## 2026-07-12 (3) — 直前オッズデーモンの単一インスタンスガードを named mutex 化
 
 固定 TCP ポート 58620 bind 方式のガードが Windows の動的除外ポート帯
