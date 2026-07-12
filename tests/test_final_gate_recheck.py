@@ -871,9 +871,11 @@ def _patch_gate_ex(seq):
     return _fake_ex, calls
 
 
-def test_generator_broken_does_not_write_but_ok_writes():
-    """Codex第8R: 生成側は購入ゲート **GATE_OK のときだけ** フラグを書く。
-    - GATE_BROKEN(mutex 生成不可) → 排他外 write せず、フラグ未生成 (逃げ道廃止)
+def test_generator_broken_best_effort_writes_and_ok_writes():
+    """Codex第9R: broken は「非write でも安全」が時間方向に不成立 (一時障害を含み
+    恒久的な購入不能を保証しない) ため、broken でも **best-effort でフラグを書く**。
+    - GATE_BROKEN → best-effort write (フラグ生成・通知に best-effort 明示・
+      ゲート保持しないので release は呼ばない)
     - GATE_OK → ゲート保持下で write + 解放
     _acquire_purchase_gate_ex を差し替えて status を制御 (子プロセス不要・全 OS 可)。"""
     with _AutoBuySandbox() as ab:
@@ -891,15 +893,16 @@ def test_generator_broken_does_not_write_but_ok_writes():
             released: list = []
             auto_buy.release_purchase_gate = lambda g: released.append(g)
 
-            # (b) GATE_BROKEN → 非write・未生成・release 呼ばない
+            # (b) GATE_BROKEN → best-effort write (フラグ生成・release は呼ばない)
             fake_ex, _ = _patch_gate_ex([(auto_buy.GATE_BROKEN, None)])
             auto_buy._acquire_purchase_gate_ex = fake_ex
             assert not flag.exists()
             out = auto_buy.run_auto_buy(cands, dry_run=False)
             assert [r["verdict"] for r in out] == ["skip_abandoned_lock"], out
-            assert not flag.exists(), "broken 時に排他外 write してはいけない"
-            assert released == [], "broken 経路では release も呼ばない"
-            assert len(ab.sent) == 1 and "ゲート" in ab.sent[0][1], ab.sent
+            assert flag.exists(), "broken でも best-effort でフラグを書く (halt 永続化)"
+            assert released == [], "broken 経路ではゲート未保持のため release は呼ばない"
+            assert len(ab.sent) == 1 and "best-effort" in ab.sent[0][1], ab.sent
+            flag.unlink()  # 次ケースのため掃除
 
             # (a) GATE_OK → 保持下で write + 解放
             ab.sent.clear()

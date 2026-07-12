@@ -1,5 +1,30 @@
 # CHANGELOG
 
+## 2026-07-12 (10) — 購入ゲート: GATE_BROKEN も best-effort write に — 全ケースで halt を必ず永続化
+
+(9) への Codex 第9R判定で残った最後の 1 点。`GATE_BROKEN` の「非write でも安全」は**時間方向に
+成立しない**。broken には非Windows だけでなく「一時的な CreateMutexW 失敗・異常 rc・例外」も
+含まれ、「全プロセスで恒久的に購入不能」を保証しない。反例: WAIT_ABANDONED 検知 → 生成
+プロセスだけ一時的に broken → 非write で run mutex 解放 → 障害回復後や別 click プロセスでは
+正常 → 後続 click がゲート取得・検査通過し sticky halt 無しで購入再開。
+
+- **`auto_buy.py` の縮退経路を統一**: `GATE_BROKEN` を「非write」から、総上限超過時と
+  **同じ best-effort write** に変更。broken でも `_write_abandoned_flag()` を実行して
+  sticky halt を永続化する (実行中 click との完全原子性は broken/総上限では保証できないが、
+  後続購入停止=halt 永続化を優先する縮退方針)。log / flag_note に 'best-effort' を明示。
+- これで **全ケースで halt が必ず残る**:
+  - `GATE_OK` → ゲート保持下で原子的 write。
+  - `GATE_TIMEOUT`(競合) → 再試行して取得後にゲート下で原子的 write。
+  - `GATE_BROKEN` → best-effort write (縮退)。
+  - 総上限超過 → best-effort write (縮退・最後の砦)。
+- (9) までの「broken は非write が安全」という論法 (コメント/docstring/CHANGELOG) は撤回し、
+  「broken/総上限は best-effort で必ず halt を永続化する」に書き換えた。
+- `tests/test_final_gate_recheck.py`: `test_generator_broken_best_effort_writes_and_ok_writes`
+  に更新 — broken → フラグ生成される・通知に 'best-effort' 明示・ゲート未保持なので
+  release は呼ばない / GATE_OK は従来どおりゲート下 write。総上限超過テストは維持。
+- 回帰テスト 66 本全緑 (実発注は禁止スタブ/fake、通知スタブ、フラグ・mutex 名は
+  テスト用に一時分離)。`data/rt3_backstop_stop.flag` は不変 (SHA256 一致)。
+
 ## 2026-07-12 (9) — 購入ゲート: acquire を timeout/broken に3値化 — 競合は待ち続け、破損のみ非write
 
 (8) への Codex 第8R判定で残った 1 点。`acquire_purchase_gate()` は **30秒タイムアウト(競合)

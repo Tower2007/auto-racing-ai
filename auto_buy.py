@@ -672,11 +672,13 @@ def acquire_purchase_gate_blocking(name: str | None = None,
     第8R: timeout(競合) と broken(mutex 破損) を区別して扱う。
     - GATE_TIMEOUT(競合) は**諦めずに再試行し続ける**。click 側は必ず finally で
       ゲートを解放する (最終検査 + click timeout 5秒 + 解放の最短区間) ため、
-      現実には total_sec 内に必ず取得できる。取得後 GATE_OK を返す。
-    - GATE_BROKEN(CreateMutexW 失敗等) は即 (GATE_BROKEN, None)。この時のみ
-      「click 側も生成不可で fail-closed=購入不可だからフラグ非writeでも安全」が成立。
+      現実には total_sec 内に必ず取得できる。取得後 (GATE_OK, gate) を返す。
+    - GATE_BROKEN(CreateMutexW 失敗・非Windows・異常 rc 等) は即 (GATE_BROKEN, None)。
+      呼び出し側 (run_auto_buy) は broken を「非write」にせず best-effort で
+      フラグを書いて halt を永続化する (第9R: broken は一時障害も含み「恒久的に
+      購入不能」を保証しないため、非write では後続 click が halt 無しで購入再開し得る)。
     - total_sec を超えても競合が解消しない異常時のみ (GATE_TIMEOUT, None) を返す
-      (最後の砦: 呼び出し側が best-effort でフラグを書き sticky halt を残す)。
+      (最後の砦: 呼び出し側が同様に best-effort でフラグを書き sticky halt を残す)。
     """
     per_try = PURCHASE_GATE_WAIT_SEC if per_try_sec is None else per_try_sec
     total = PURCHASE_GATE_TOTAL_WAIT_SEC if total_sec is None else total_sec
@@ -832,40 +834,39 @@ def run_auto_buy(candidates: list[dict],
                                  "手動での状況確認を最優先してください。")
                 finally:
                     release_purchase_gate(_gate)
-            elif _gstatus == GATE_BROKEN:
-                # mutex サブシステム破損 (CreateMutexW 失敗・非Windows 等)。
-                # 排他外 write はしない。根拠: 同じ壊れたゲートを click 側も取得
-                # できず fail-closed で発注中止するため、破損中は購入が起き得ず、
-                # フラグを書けなくても安全 (この安全論法は broken 限定でのみ成立)。
-                # トレードオフ: 破損中は sticky halt の永続フラグが残らないが、
-                # その間は購入自体が不可能なので実害はない。
-                logger.error(
-                    "[auto_buy] 購入ゲート broken (mutex 生成不可) — 発注結果不明"
-                    "フラグの排他書込を断念 (排他外 write は原子性を壊すため行わ"
-                    "ない)。破損中は click 側も fail-closed で購入不可のため安全。"
-                    "手動確認を最優先")
-                flag_note = (
-                    "⚠️ 購入ゲート (named mutex) が生成不可のためフラグを書き出せ"
-                    "ませんでした。mutex サブシステムが壊れている可能性があり、その"
-                    "間は自動発注・buy_app とも fail-closed で購入不可です。"
-                    "手動での状況確認を最優先してください。")
             else:
-                # GATE_TIMEOUT: 総上限を超えても競合が解消しない異常事態
-                # (click 側が総上限を超えてゲートを保持=通常は起き得ない)。
-                # 最後の砦: この click 単体の原子性は既に達成不能 (click 側は
-                # 自分のゲート保持下で検査済み) だが、sticky halt で**後続**購入を
-                # 止めることが安全上最も重要なので、best-effort でフラグを書く。
+                # GATE_BROKEN または GATE_TIMEOUT(総上限超過)。いずれも縮退経路で、
+                # ゲート保持下の原子的 write は達成できない。だが**必ずフラグを書く**
+                # (best-effort) — sticky halt (後続購入の停止) の永続化を最優先する。
+                #
+                # ★第9R訂正: 旧実装は GATE_BROKEN を「非write でも安全」としていたが、
+                #  それは時間方向に成立しない。broken には非Windows だけでなく
+                #  「一時的な CreateMutexW 失敗 / 異常 rc / 例外」も含まれ、
+                #  「全プロセスで恒久的に購入不能」を保証しない。反例: 生成プロセス
+                #  だけ一時的に broken → 非write → 障害回復後や別 click プロセスでは
+                #  正常 → 後続 click がゲート取得・検査通過し sticky halt 無しで購入
+                #  再開。よって broken でも best-effort で write して halt を残す
+                #  (実行中 click との完全原子性は broken/総上限では保証できないが、
+                #   後続購入停止=halt 永続化を優先。総上限超過と同じ縮退方針)。
+                #  これで全ケースで halt が必ず残る:
+                #    GATE_OK       → ゲート下で原子的 write
+                #    GATE_TIMEOUT  → 再試行して原子的 write (この else には来ない)
+                #    GATE_BROKEN   → best-effort write (下記)
+                #    総上限超過     → best-effort write (下記)
+                _reason = ("mutex 生成不可 (broken)" if _gstatus == GATE_BROKEN
+                           else "購入ゲート競合が総上限を超え解消せず")
                 logger.error(
-                    "[auto_buy] 購入ゲート競合が総上限を超え解消せず — 最後の砦: "
-                    "best-effort でフラグを書き後続購入を停止する (要人手確認)")
+                    "[auto_buy] %s — 縮退経路: best-effort でフラグを書き後続購入を"
+                    "停止する (実行中 click との完全原子性は保証できないが halt の"
+                    "永続化を最優先。要人手確認)", _reason)
                 try:
                     _write_abandoned_flag(_mutex_name())
                     flag_note = (
-                        "⚠️ 購入ゲートの競合が異常に長く解消しなかったため、"
-                        "best-effort でフラグを書き出しました (後続購入の停止優先)。"
-                        "実行中の click が二重投票していないか最優先で確認ください。")
+                        f"⚠️ {_reason} のため、best-effort でフラグを書き出しました "
+                        "(後続購入の停止=halt 永続化を優先)。mutex 異常や実行中 click "
+                        "による二重投票がないか最優先で確認してください。")
                 except Exception as e:  # noqa: BLE001
-                    logger.error("[auto_buy] 最後の砦のフラグ書込も失敗: %s", e)
+                    logger.error("[auto_buy] 縮退経路のフラグ書込も失敗: %s", e)
                     flag_note = (f"⚠️ フラグ書き出しに失敗しました ({e})。"
                                  "手動での状況確認を最優先してください。")
             _mark_abandoned_alerted(now)
