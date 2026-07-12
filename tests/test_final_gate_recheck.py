@@ -826,6 +826,118 @@ def test_no_deadlock_run_mutex_then_purchase_gate():
         th.join(5)
 
 
+def test_generator_does_not_write_flag_when_gate_unavailable():
+    """Codex第7R: 生成側 (WAIT_ABANDONED 経路) は購入ゲート**所有下でのみ**書く。
+    - ゲート取得成功 → ゲート保持下で write (フラグ生成 + 解放)
+    - ゲート None (mutex 破損) → 排他外 write せず、フラグ未生成 (逃げ道廃止)
+    実 WAIT_ABANDONED は _acquire_lock 差替で模擬 (子プロセス不要・全 OS 可)。"""
+    with _AutoBuySandbox() as ab:
+        flag = auto_buy.ABANDONED_STOP_FLAG
+        cands = [_sanren_candidate()]
+        orig_acquire = auto_buy._acquire_lock
+        orig_release = auto_buy._release_lock
+        orig_gate = auto_buy.acquire_purchase_gate
+        orig_relgate = auto_buy.release_purchase_gate
+        orig_locked = auto_buy._run_auto_buy_locked
+        try:
+            # abandoned lock を返す (発注本体には入らない経路を強制)
+            auto_buy._acquire_lock = lambda *a, **kw: ("k32", "h", True)
+            auto_buy._release_lock = lambda lk: None
+            auto_buy._run_auto_buy_locked = _forbidden_execute
+
+            # (b) ゲート None → 排他外 write せず、フラグ未生成
+            released: list = []
+            auto_buy.acquire_purchase_gate = lambda *a, **kw: None
+            auto_buy.release_purchase_gate = lambda g: released.append(g)
+            assert not flag.exists()
+            out = auto_buy.run_auto_buy(cands, dry_run=False)
+            assert [r["verdict"] for r in out] == ["skip_abandoned_lock"], out
+            assert not flag.exists(), "ゲート None 時に排他外 write してはいけない"
+            assert released == [], "None 経路では release も呼ばない"
+            # 停止周知の通知は出て、本文はゲート取得不能を明示
+            assert len(ab.sent) == 1 and "ゲート" in ab.sent[0][1], ab.sent
+
+            # (a) ゲート取得成功 → 保持下で write + 解放
+            ab.sent.clear()
+            fake_gate = ("k32gate", "hgate")
+            acquired: list = []
+            released.clear()
+            auto_buy.acquire_purchase_gate = (
+                lambda *a, **kw: acquired.append(1) or fake_gate)
+            auto_buy.release_purchase_gate = lambda g: released.append(g)
+            out2 = auto_buy.run_auto_buy(cands, dry_run=False)
+            assert [r["verdict"] for r in out2] == ["skip_abandoned_lock"], out2
+            assert flag.exists(), "ゲート取得成功時はフラグを書く"
+            assert acquired == [1] and released == [fake_gate], \
+                (acquired, released)
+        finally:
+            auto_buy._acquire_lock = orig_acquire
+            auto_buy._release_lock = orig_release
+            auto_buy.acquire_purchase_gate = orig_gate
+            auto_buy.release_purchase_gate = orig_relgate
+            auto_buy._run_auto_buy_locked = orig_locked
+
+
+def test_generator_waits_for_gate_no_out_of_lock_write():
+    """Codex第7R 原子性: click 側 (別スレッド) がゲート保持中は生成側は待機し、
+    その間フラグを書かない (排他外 write が起きない)。解放後にゲート下で書く。
+    実ゲート mutex を使い、生成側は別スレッドでブロックさせて観測する。"""
+    if not IS_WINDOWS:
+        print("  (skip: Windows 専用)")
+        return
+    with _AutoBuySandbox() as ab:
+        flag = auto_buy.ABANDONED_STOP_FLAG
+        gate_name = ab.gate_name
+        orig_acquire = auto_buy._acquire_lock
+        orig_release = auto_buy._release_lock
+        orig_locked = auto_buy._run_auto_buy_locked
+
+        holder_ready = threading.Event()
+        release_holder = threading.Event()
+
+        def _holder():
+            g = auto_buy.acquire_purchase_gate(wait_sec=15, name=gate_name)
+            holder_ready.set()
+            release_holder.wait(15)
+            auto_buy.release_purchase_gate(g)
+
+        th = threading.Thread(target=_holder)
+        th.start()
+        assert holder_ready.wait(5), "holder がゲートを取得できていない"
+        try:
+            auto_buy._acquire_lock = lambda *a, **kw: ("k32", "h", True)
+            auto_buy._release_lock = lambda lk: None
+            auto_buy._run_auto_buy_locked = _forbidden_execute
+
+            gen_done = threading.Event()
+            gen_out: dict = {}
+
+            def _gen():
+                gen_out["out"] = auto_buy.run_auto_buy(
+                    [_sanren_candidate()], dry_run=False)
+                gen_done.set()
+
+            gt = threading.Thread(target=_gen)
+            gt.start()
+            # 生成側はゲート待ちでブロック → この間フラグは書かれない
+            assert not gen_done.wait(1.0), \
+                "ゲート保持中に生成側が完了してしまった (待機していない)"
+            assert not flag.exists(), \
+                "ゲート保持中に排他外 write してはいけない"
+            # 解放 → 生成側がゲート取得して write (デッドロックせず完了)
+            release_holder.set()
+            assert gen_done.wait(20), "解放後も生成側が完了しない (デッドロック?)"
+            assert flag.exists(), "解放後はゲート保持下でフラグを書く"
+            assert [r["verdict"] for r in gen_out["out"]] == \
+                ["skip_abandoned_lock"], gen_out["out"]
+        finally:
+            release_holder.set()
+            auto_buy._acquire_lock = orig_acquire
+            auto_buy._release_lock = orig_release
+            auto_buy._run_auto_buy_locked = orig_locked
+            th.join(5)
+
+
 def _run_all():
     fns = [v for k, v in sorted(globals().items())
            if k.startswith("test_") and callable(v)]

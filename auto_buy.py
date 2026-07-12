@@ -748,21 +748,42 @@ def run_auto_buy(candidates: list[dict],
                  "timestamp": (now or now_jst()).isoformat()}
                 for c in candidates if c.get("bets")]
             flag_note = f"data/{ABANDONED_STOP_FLAG.name} を書き出しました。"
-            # 購入ゲート保持下でフラグを書く (2026-07-12 Codex第6R)。
-            # click 側 (execute_purchase) は同じ購入ゲートを取得してから
-            # 「最終検査 → click」を行うため、フラグ書込と click の間の
-            # プロセス間 TOCTOU を原子化できる。ネスト順は run mutex (保持中) →
-            # 購入ゲート の一方向 (click 側は run mutex を取らない) で循環しない。
-            # ゲートが取れなくてもフラグ自体は必ず書く (停止が最優先・fail-closed)。
+            # 購入ゲート**所有下でのみ**フラグを書く (2026-07-12 Codex第6R→第7R)。
+            # click 側 (execute_purchase) は同じ購入ゲートを保持して「最終検査 →
+            # click」を行い、必ず finally で解放する (click timeout 5秒で必ず抜ける)。
+            # よって生成側はゲートを待てば必ず取得でき、その保持下で書けば、検査〜
+            # click の間にフラグ書込が割り込むことも、書込〜可視化の間に click が
+            # 抜けることもない (プロセス間で原子的)。取得待ちは click の最大保持
+            # 時間 (5秒) を十分上回る PURCHASE_GATE_WAIT_SEC(30秒) で行う。
+            #
+            # ★第7R訂正: None 時 (= mutex サブシステム自体が壊れている) の
+            #  「排他外 write」は**廃止**した。それが残ると「生成側がゲート取得を
+            #  タイムアウト → ゲート外で write → その隙に click が送出」という穴に
+            #  なる。根拠: 同じ壊れたゲートを click 側も取得できず fail-closed で
+            #  発注中止するため、ゲート破損中は購入が起き得ず、フラグを書けなくても
+            #  安全。トレードオフとして mutex 破損中は sticky halt の永続フラグが
+            #  残らないが、その間は購入自体が不可能なので実害はない。
             _gate = acquire_purchase_gate()
-            try:
-                _write_abandoned_flag(_mutex_name())
-            except Exception as e:  # noqa: BLE001
-                logger.error("[auto_buy] 発注結果不明フラグ書き込み失敗: %s", e)
-                flag_note = (f"⚠️ フラグ書き出しに失敗しました ({e})。"
-                             "手動での状況確認を最優先してください。")
-            finally:
-                release_purchase_gate(_gate)
+            if _gate is None:
+                # 待機しても取得できない = mutex 破損。排他外 write はしない。
+                logger.error(
+                    "[auto_buy] 購入ゲート取得不能 — 発注結果不明フラグの排他書込を"
+                    "断念 (排他外 write は原子性を壊すため行わない)。mutex 破損中は"
+                    "click 側も fail-closed で購入不可のため安全。手動確認を最優先")
+                flag_note = (
+                    "⚠️ 購入ゲート (named mutex) を取得できずフラグを書き出せません"
+                    "でした。mutex サブシステムが壊れている可能性があり、その間は"
+                    "自動発注・buy_app とも fail-closed で購入不可です。"
+                    "手動での状況確認を最優先してください。")
+            else:
+                try:
+                    _write_abandoned_flag(_mutex_name())
+                except Exception as e:  # noqa: BLE001
+                    logger.error("[auto_buy] 発注結果不明フラグ書き込み失敗: %s", e)
+                    flag_note = (f"⚠️ フラグ書き出しに失敗しました ({e})。"
+                                 "手動での状況確認を最優先してください。")
+                finally:
+                    release_purchase_gate(_gate)
             _mark_abandoned_alerted(now)
             _notify(
                 "[AUTO-BUY] 🛑 先行プロセス異常終了検知 — 全券種の発注を停止 (要人手照合)",

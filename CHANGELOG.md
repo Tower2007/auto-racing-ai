@@ -1,5 +1,35 @@
 # CHANGELOG
 
+## 2026-07-12 (8) — 購入ゲート: 生成側の排他外 write を廃止 (所有下のみ書込) — 最後の逃げ道閉塞
+
+(7) への Codex 第7R判定で残った**生成側の逃げ道**を訂正。(7) では「ゲートが取れなくても
+フラグは必ず書く」としていたが、これが穴になる: 生成側がゲート取得を 30 秒でタイムアウト
+→ ゲート外で write → その隙に (ゲート保持中だった) click 側が送出、という順序が
+「OS スケジューリング含む厳密性」で残っていた。
+
+- **生成側 (`auto_buy.py` run_auto_buy の WAIT_ABANDONED 経路)**: 購入ゲートを
+  **所有したときだけ** `_write_abandoned_flag()` を実行する。取得成功時のみ
+  「保持下で write → finally で解放」。`acquire_purchase_gate()` が None
+  (= 待機しても取れない = mutex サブシステム破損) のときは**排他外 write を行わない**
+  (逃げ道の削除)。生成側の取得待ち PURCHASE_GATE_WAIT_SEC(30秒) は click 側の最大
+  保持時間 (click timeout 5秒) を十分上回るため、通常/競合時は待てば必ずゲート下で書ける。
+- **None 時に write しない安全性の根拠 (設計に明記)**: 同じ壊れたゲートを **click 側も
+  取得できず fail-closed で発注中止する** (execute_purchase の購入ゲート取得が None →
+  abort)。したがって mutex 破損中は購入が起き得ず、生成側がフラグを書けなくても安全。
+  トレードオフとして破損中は sticky halt の永続フラグが残らないが、その間は購入自体が
+  不可能なので実害はない。逃げ道の排他外 write は原子性を壊すため許容しない。
+- **click 側 (`scripts/execute_purchase.py`)**: (6)/(7) のとおり購入ゲート取得後に
+  「最終検査 → click」を行い、**必ず finally で解放**する (click timeout 5秒で必ず抜ける)。
+  この回では変更なし (生成側の訂正のみ)。
+- `tests/test_final_gate_recheck.py`: 生成側の回帰 2 本を追加/更新 —
+  ゲート None → 排他外 write せずフラグ未生成 (release も呼ばない・通知本文はゲート
+  取得不能を明示) / ゲート取得成功 → 保持下で write + 解放。加えて原子性:
+  click 側 (別スレッド) がゲート保持中は生成側が**待機**しフラグ未生成、解放後に
+  ゲート下で write (実 mutex・別スレッドでブロックを観測)。None 時に click 側が
+  abort する側は既存 `test_click_aborts_when_purchase_gate_unavailable` が担保。
+- 回帰テスト 63 本全緑 (実発注は禁止スタブ/fake、通知スタブ、フラグ・mutex 名は
+  テスト用に一時分離)。`data/rt3_backstop_stop.flag` は不変 (SHA256 一致)。
+
 ## 2026-07-12 (7) — 共有購入ゲート mutex で「フラグ生成」と「検査→click」をプロセス間原子化
 
 (6) への Codex 第6R判定で残った厳密なプロセス間非原子性 (検査→click の間に別プロセスが
