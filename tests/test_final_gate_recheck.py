@@ -560,6 +560,10 @@ class _FakeLocator:
         return 0 if "全削除" in self.selector else 1
 
     async def is_disabled(self):
+        # 「投票する」ボタンの is_disabled await 中に副作用を発火できる
+        # (別プロセスが await 待ち中に abandoned フラグを作る TOCTOU の再現)
+        if "投票する" in self.selector and self.page.vote_is_disabled_hook:
+            self.page.vote_is_disabled_hook()
         return False
 
     async def click(self, timeout=None):
@@ -579,6 +583,7 @@ class _FakePage:
         self.confirmed = False
         self._confirm_text = confirm_text
         self.confirm_url = confirm_url
+        self.vote_is_disabled_hook = None  # click 前 await の副作用注入口
 
     def locator(self, selector):
         return _FakeLocator(self, selector)
@@ -610,28 +615,22 @@ class _FakeAsyncPWCM:
         return False
 
 
-def test_click_precheck_blocks_when_flag_created_before_click():
-    """入口通過後・実クリック直前に abandoned フラグが立つと「投票する」click は
-    呼ばれず abort する (buy_app/直CLI は Auto mutex 非保持なので入口〜クリックの
-    間に別 run がフラグを作れる)。ブラウザは全て fake、クリック関数の未発火を観測。"""
+async def _acoro(value):
+    return value
+
+
+def _drive_execute_buy(fake_page, ab_flag: Path, tmp: Path,
+                       bets: list[dict]):
+    """execute_buy を全 fake ブラウザ (playwright/_launch_context/券種ヘルパ) と
+    ROOT 一時 dir 差替で Step 8 まで駆動し、送出された RuntimeError を返す
+    (無ければ None)。auto_buy.ABANDONED_STOP_FLAG は ab_flag に差し替える。
+    実 data/ には一切書き込まない。"""
     import asyncio
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
     import execute_purchase as ep
     import playwright.async_api as _pw_api
 
-    confirm_url = ("https://vote.autorace.jp/vote/confirm"
-                   "?vel_code=004&race_num=7")
-    confirm_text = (
-        "浜松 7R\n投票数 1組\n合計購入額 300円\n複勝 5 号\n"
-        "ポイント残高\n1,000pt\n払戻金残高\n500円\n")
-
-    tmp = Path(tempfile.mkdtemp(prefix="ep_click_"))
-    (tmp / "data").mkdir()  # screenshot/txt の書き出し先 (実 data/ を汚さない)
-    ab_flag = tmp / "abandoned_lock_stop.flag"
-
-    fake_page = _FakePage(confirm_text, confirm_url)
     fake_ctx = _FakeContext()
-
     orig = {
         "ROOT": ep.ROOT,
         "_launch_context": ep._launch_context,
@@ -655,26 +654,12 @@ def test_click_precheck_blocks_when_flag_created_before_click():
         ep._add_to_sheet = lambda page: _acoro(None)
         _pw_api.async_playwright = lambda: _FakeAsyncPWCM()
 
-        # 入口検査は通過した体 (フラグはこの後・クリック直前の状態として作る)
-        assert not ab_flag.exists()
-        ab_flag.write_text("detected_at=2099-01-01T00:00:00\n",
-                           encoding="utf-8")
-
-        bets = [{"type": "fns", "cars": [5], "amount": 300}]
-        raised = None
         try:
             asyncio.run(ep.execute_buy(
                 "2099-01-01", 4, 7, dry_run=False, bets=bets))
+            return None
         except RuntimeError as e:
-            raised = e
-
-        assert raised is not None, "停止フラグ下でも例外なく発注に進んでしまった"
-        assert "実投票クリック直前" in str(raised), str(raised)
-        # 「投票する」click は一度も呼ばれていない (確認へ click は起きてよい)
-        assert not any("投票する" in s for s in fake_page.clicks), \
-            fake_page.clicks
-        assert any("投票確認へ" in s for s in fake_page.clicks), \
-            "テスト前提: 確認画面までは到達している"
+            return e
     finally:
         ep.ROOT = orig["ROOT"]
         ep._launch_context = orig["_launch_context"]
@@ -686,8 +671,63 @@ def test_click_precheck_blocks_when_flag_created_before_click():
         auto_buy.ABANDONED_STOP_FLAG = orig["ABANDONED_STOP_FLAG"]
 
 
-async def _acoro(value):
-    return value
+_CONFIRM_URL = ("https://vote.autorace.jp/vote/confirm"
+                "?vel_code=004&race_num=7")
+_CONFIRM_TEXT = (
+    "浜松 7R\n投票数 1組\n合計購入額 300円\n複勝 5 号\n"
+    "ポイント残高\n1,000pt\n払戻金残高\n500円\n")
+
+
+def _new_click_tmp():
+    tmp = Path(tempfile.mkdtemp(prefix="ep_click_"))
+    (tmp / "data").mkdir()  # screenshot/txt の書き出し先 (実 data/ を汚さない)
+    return tmp, tmp / "abandoned_lock_stop.flag"
+
+
+def test_click_precheck_blocks_when_flag_created_before_click():
+    """入口通過後・実クリック直前に abandoned フラグが立つと「投票する」click は
+    呼ばれず abort する (buy_app/直CLI は Auto mutex 非保持なので入口〜クリックの
+    間に別 run がフラグを作れる)。ブラウザは全て fake、クリック関数の未発火を観測。"""
+    tmp, ab_flag = _new_click_tmp()
+    fake_page = _FakePage(_CONFIRM_TEXT, _CONFIRM_URL)
+    # :769 検査時点から既にフラグがある状況 (最初の再検査で捕捉)
+    ab_flag.write_text("detected_at=2099-01-01T00:00:00\n", encoding="utf-8")
+
+    raised = _drive_execute_buy(
+        fake_page, ab_flag, tmp, [{"type": "fns", "cars": [5], "amount": 300}])
+
+    assert raised is not None, "停止フラグ下でも例外なく発注に進んでしまった"
+    assert "実投票クリック直前" in str(raised), str(raised)
+    # 「投票する」click は一度も呼ばれていない (確認へ click は起きてよい)
+    assert not any("投票する" in s for s in fake_page.clicks), fake_page.clicks
+    assert any("投票確認へ" in s for s in fake_page.clicks), \
+        "テスト前提: 確認画面までは到達している"
+
+
+def test_click_precheck_blocks_when_flag_created_during_awaits():
+    """Codex第5R: :769 の再検査は通過し、その後の await (count / is_disabled)
+    中に別プロセスが abandoned フラグを生成 → click **直前**の最終再検査で捕捉し
+    「投票する」click は呼ばれず abort する (await 待ち中の TOCTOU を原子化)。
+    is_disabled の await 副作用でフラグ生成タイミングを再現する。"""
+    tmp, ab_flag = _new_click_tmp()
+    fake_page = _FakePage(_CONFIRM_TEXT, _CONFIRM_URL)
+    # :769 検査時点ではフラグ無し (通過)。「投票する」is_disabled await の
+    # 副作用で「別プロセスが今フラグを作った」を再現する。
+    fake_page.vote_is_disabled_hook = lambda: ab_flag.write_text(
+        "detected_at=2099-01-01T00:00:00\n", encoding="utf-8")
+    assert not ab_flag.exists()
+
+    raised = _drive_execute_buy(
+        fake_page, ab_flag, tmp, [{"type": "fns", "cars": [5], "amount": 300}])
+
+    assert raised is not None, "await 中のフラグ生成を捕捉できず発注に進んだ"
+    # click 直前の最終再検査で捕捉 (inner try に包まれ "投票する click 失敗" で
+    # 再送出されるが、"click 直前" を含み、実 click は起きていない)
+    assert "click 直前" in str(raised), str(raised)
+    assert ab_flag.exists(), "await 副作用でフラグが生成されているはず"
+    assert not any("投票する" in s for s in fake_page.clicks), fake_page.clicks
+    assert any("投票確認へ" in s for s in fake_page.clicks), \
+        "テスト前提: 確認画面までは到達している"
 
 
 def _run_all():

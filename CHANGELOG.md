@@ -1,5 +1,27 @@
 # CHANGELOG
 
+## 2026-07-12 (6) — execute_purchase: click 直前の最終再検査で並行 TOCTOU を原子化
+
+(5) への Codex 第5R判定で残った並行 TOCTOU (窓は数百行→数十msに激減したが未閉塞) を閉じる。
+
+- **click 直前の最終再検査** (`scripts/execute_purchase.py` Step 8):
+  Step 8 冒頭 (:769 相当) の `_stop_flags_block` 検査から実 `vote_btn.click()` までに
+  時刻取得・locator 取得・`await vote_btn.count()`・`await vote_btn.is_disabled()` の
+  2 つの await があり、その待ち中に別プロセスが `abandoned_lock_stop.flag` を生成すると
+  再検査なしで click に進み得た。**全 await 完了後・`await vote_btn.click()` の直前行**に
+  `_stop_flags_block(bets)` をもう一度挿入。停止/判定不能なら click せず RuntimeError で
+  abort (fail-closed)。Step 8 冒頭の検査は残す (早期 abort でブラウザ操作を無駄にしない)
+  ため、実質「await の前後で 2 回」になり原子的に近づく。
+- **docstring 修正**: `_stop_flags_block` の docstring が三連系ゲートをまだ
+  `backstop_active()` と記載していた (実コードは (5) で `backstop_blocks_purchase()` に
+  修正済) のを実装に合わせて訂正。
+- `tests/test_final_gate_recheck.py`: 既存「開始前フラグ作成」テストに加え、
+  **「:769 検査通過後・await 中にフラグ生成 → click 未発火で abort」** を追加
+  (`is_disabled` の await 副作用で一時 dir にフラグ生成しタイミングを再現、
+  playwright 全 fake・ROOT 一時 dir)。全 fake 駆動を `_drive_execute_buy` に共通化。
+- 回帰テスト 58 本全緑 (実発注は禁止スタブ/fake、通知スタブ、フラグは一時 dir のみ)。
+  `data/rt3_backstop_stop.flag` は不変 (SHA256 一致)。
+
 ## 2026-07-12 (5) — execute_purchase: クリック直前再検査 + 三連系ゲートを backstop_blocks_purchase 化
 
 (4) の入口ゲートに対する Codex 第4R判定で残った 2 点を修正。

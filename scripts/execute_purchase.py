@@ -792,6 +792,16 @@ async def execute_buy(
                     raise RuntimeError("「投票する」 button が見つからない")
                 if await vote_btn.is_disabled():
                     raise RuntimeError("「投票する」が disabled (締切超過?)")
+                # === click 直前の最終再検査 (2026-07-12 Codex第5R) ===
+                # 上の :769 検査から実 click までに時刻取得・locator 取得・
+                # `await count()`・`await is_disabled()` の 2 つの await があり、
+                # その待ち中に別プロセスが abandoned フラグを生成し得る (TOCTOU)。
+                # 全 await 完了後・click の直前でもう一度検査し、原子的に近づける
+                # (停止/判定不能なら click せず abort、fail-closed)。
+                _blk2, _why2 = _stop_flags_block(bets)
+                if _blk2:
+                    raise RuntimeError(
+                        f"click 直前の最終再検査で中止 (発注せず): {_why2}")
                 await vote_btn.click(timeout=5000)
                 # 投票完了画面 / 結果メッセージを待つ
                 await asyncio.sleep(5)
@@ -1033,8 +1043,9 @@ def _stop_flags_block(bets: list[dict]) -> tuple[bool, str | None]:
     - abandoned_lock_stop.flag (**全券種**): auto_buy.abandoned_stop_active()
       を共有。過去の run が WAIT_ABANDONED を検知して書いた sticky フラグで、
       人手照合・削除まで全券種の発注を止める。
-    - rt3_backstop_stop.flag (**三連系のみ**): src.backstop.backstop_active()。
-      三連系 (rt3/rf3) を含む bets のときだけ参照する (複勝は止めない)。
+    - 三連系 (rt3/rf3 を含む bets) のみ: src.backstop.backstop_blocks_purchase()
+      (フラグ存在 OR 台帳読取不能 OR 閾値超過で停止、いずれも fail-closed)。
+      rt3_backstop_stop.flag のファイル存在停止も当然包含する。複勝は止めない。
     """
     root = str(ROOT)
     if root not in sys.path:
