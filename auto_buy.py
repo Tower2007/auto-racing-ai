@@ -563,6 +563,97 @@ def _release_lock(lock) -> None:
         k32.CloseHandle(handle)
 
 
+# ── 購入ゲート (短命クリティカルセクション用 named mutex) ─────────────────
+# 2026-07-12 Codex第6R: run mutex (_mutex_name / _acquire_lock) とは別物。
+# run 全体ではなく「abandoned フラグ生成 (書込)」と「execute_purchase の
+# 最終検査 → click 送出」を**同一排他区間**に入れ、プロセス間で原子化する
+# 短命ロック。フラグ生成側がゲート保持中は click 側の検査〜click が待たされ、
+# 逆も同様なので、検査と click の間に別プロセスがフラグを割り込ませられない。
+#
+# デッドロック回避 (必須): ネスト順は常に「run mutex → 購入ゲート」の一方向。
+#   - フラグ生成側 (run_auto_buy の WAIT_ABANDONED 経路) は run mutex を保持した
+#     まま購入ゲートを取得する (run mutex → gate)。
+#   - click 側 (execute_purchase) は run mutex を一切取得せず購入ゲートのみ取得する。
+# click 側が run mutex を待つ経路が存在しないため循環待ちが生じない。
+# 購入ゲートは最短区間だけ保持する (ブラウザ準備の await はゲート外)。
+PURCHASE_GATE_WAIT_SEC = 30
+
+
+def _purchase_gate_name() -> str:
+    """購入ゲート named mutex 名 (run mutex とは別名前空間、パスハッシュで分離)。"""
+    import hashlib
+    h = hashlib.sha1(str(ROOT).encode("utf-8")).hexdigest()[:8]
+    return f"Global\\AutoRacingAI_purchase_gate_{h}"
+
+
+def acquire_purchase_gate(wait_sec: float | None = None,
+                          name: str | None = None):
+    """購入ゲート named mutex を取得。成功なら (k32, handle)、取得不能なら None。
+
+    短命クリティカルセクション用。abandoned (先行がReleaseせず異常終了) でも
+    所有を引き継いで続行する (短区間のため sticky 停止は不要)。
+    非Windows は排他保証がないため fail-closed (None → 呼び出し側は発注中止)。
+    name はテスト専用の注入口 (既定はパスハッシュ入り購入ゲート名)。"""
+    if wait_sec is None:
+        wait_sec = PURCHASE_GATE_WAIT_SEC
+    if os.name != "nt":
+        logger.warning("[auto_buy] 購入ゲートは Windows 専用 — "
+                       "排他保証がないため fail-closed (None)")
+        return None
+    import ctypes
+    try:
+        k32 = _kernel32()
+        handle = k32.CreateMutexW(None, False, name or _purchase_gate_name())
+        if not handle:
+            logger.warning("[auto_buy] 購入ゲート CreateMutexW 失敗 "
+                           "(WinError=%d)", ctypes.get_last_error())
+            return None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[auto_buy] 購入ゲート初期化失敗 (%s)", e)
+        return None
+    try:
+        rc = k32.WaitForSingleObject(handle, 0)
+        if rc == WAIT_TIMEOUT:
+            rc = k32.WaitForSingleObject(handle, int(wait_sec * 1000))
+        if rc == WAIT_TIMEOUT:
+            k32.CloseHandle(handle)
+            logger.warning("[auto_buy] 購入ゲート取得タイムアウト (%ds) — "
+                           "fail-closed", int(wait_sec))
+            return None
+        if rc not in (WAIT_OBJECT_0, WAIT_ABANDONED):
+            logger.warning("[auto_buy] 購入ゲート WaitForSingleObject 失敗 "
+                           "(rc=0x%X, WinError=%d)", rc, ctypes.get_last_error())
+            k32.CloseHandle(handle)
+            return None
+        if rc == WAIT_ABANDONED:
+            # 先行がゲート保持中に異常終了。所有は OS が本プロセスに移譲済み。
+            # 短区間ゲートなので所有を引き継いでそのまま続行する。
+            logger.warning("[auto_buy] 購入ゲート abandoned (先行の異常終了) — "
+                           "所有を引き継いで続行")
+        return (k32, handle)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[auto_buy] 購入ゲート取得失敗 (%s)", e)
+        try:
+            k32.CloseHandle(handle)
+        except Exception:
+            pass
+        return None
+
+
+def release_purchase_gate(gate) -> None:
+    """購入ゲートを解放 (ReleaseMutex 戻り値検査)。gate=None なら no-op。"""
+    if gate is None:
+        return
+    import ctypes
+    k32, handle = gate[0], gate[1]
+    try:
+        if not k32.ReleaseMutex(handle):
+            logger.error("[auto_buy] 購入ゲート ReleaseMutex 失敗 (WinError=%d)",
+                         ctypes.get_last_error())
+    finally:
+        k32.CloseHandle(handle)
+
+
 def _mark_abandoned_alerted(now: dt.datetime | None) -> None:
     """当日の abandoned 関連通知済みマークを state に記録 (日次 reset に乗る)。
     検知時のメールと残存フラグの日次リマインドの重複送信を防ぐ。"""
@@ -657,12 +748,21 @@ def run_auto_buy(candidates: list[dict],
                  "timestamp": (now or now_jst()).isoformat()}
                 for c in candidates if c.get("bets")]
             flag_note = f"data/{ABANDONED_STOP_FLAG.name} を書き出しました。"
+            # 購入ゲート保持下でフラグを書く (2026-07-12 Codex第6R)。
+            # click 側 (execute_purchase) は同じ購入ゲートを取得してから
+            # 「最終検査 → click」を行うため、フラグ書込と click の間の
+            # プロセス間 TOCTOU を原子化できる。ネスト順は run mutex (保持中) →
+            # 購入ゲート の一方向 (click 側は run mutex を取らない) で循環しない。
+            # ゲートが取れなくてもフラグ自体は必ず書く (停止が最優先・fail-closed)。
+            _gate = acquire_purchase_gate()
             try:
                 _write_abandoned_flag(_mutex_name())
             except Exception as e:  # noqa: BLE001
                 logger.error("[auto_buy] 発注結果不明フラグ書き込み失敗: %s", e)
                 flag_note = (f"⚠️ フラグ書き出しに失敗しました ({e})。"
                              "手動での状況確認を最優先してください。")
+            finally:
+                release_purchase_gate(_gate)
             _mark_abandoned_alerted(now)
             _notify(
                 "[AUTO-BUY] 🛑 先行プロセス異常終了検知 — 全券種の発注を停止 (要人手照合)",

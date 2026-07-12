@@ -1,5 +1,35 @@
 # CHANGELOG
 
+## 2026-07-12 (7) — 共有購入ゲート mutex で「フラグ生成」と「検査→click」をプロセス間原子化
+
+(6) への Codex 第6R判定で残った厳密なプロセス間非原子性 (検査→click の間に別プロセスが
+フラグ生成する余地) を、専用の共有 named mutex で完全閉塞。
+
+- **購入ゲート named mutex を新設** (`auto_buy.py`):
+  `Global\AutoRacingAI_purchase_gate_<sha1(ROOT)[:8]>` (run mutex とは別名前空間)。
+  `acquire_purchase_gate()` / `release_purchase_gate()` / `_purchase_gate_name()` /
+  `PURCHASE_GATE_WAIT_SEC=30` を追加。実装は既存 named mutex パターン (WinDLL
+  use_last_error、argtypes/restype 明示、WAIT_OBJECT_0/ABANDONED 判定、ReleaseMutex
+  戻り値検査) を流用。非Windows は排他保証がないため fail-closed (None)。短命
+  区間用なので abandoned は所有引き継ぎのみ (sticky 停止は run 側が担う)。
+- **フラグ生成側** (`auto_buy.py` run_auto_buy の WAIT_ABANDONED 経路):
+  `_write_abandoned_flag()` を購入ゲート保持下で実行 (取得→書込→解放)。ゲートが
+  取れなくてもフラグ自体は必ず書く (停止が最優先・fail-closed)。
+- **click 側** (`scripts/execute_purchase.py` Step 8): ブラウザ準備 (locator/count/
+  is_disabled) をゲート外で済ませ、購入ゲート取得後は「最終 `_stop_flags_block` 検査
+  → `vote_btn.click()`」だけを最短で実行し解放。ゲート取得不能は fail-closed で発注中止。
+  これで、click 側がゲート保持中はフラグ生成側がブロックされ、検査〜click に別
+  プロセスのフラグを割り込ませられない (逆順ならフラグは検査で必ず可視)。
+- **デッドロック回避**: ネスト順は常に「run mutex → 購入ゲート」の一方向。フラグ
+  生成側は run mutex 保持中にゲートを取り、click 側は run mutex を一切取得しない
+  (ゲートのみ) ため循環待ちが生じない。テストで担保。
+- `tests/test_final_gate_recheck.py`: ⑦ 購入ゲートの回帰 3 本追加 — ゲート取得不能
+  →click 未発火で fail-closed abort / 保持中は別スレッドが取得不能・解放後に取得可
+  (相互排他) / run mutex 保持中でもゲート取得がデッドロックしない。`_AutoBuySandbox`
+  に購入ゲート名の分離を追加。
+- 回帰テスト 61 本全緑 (実発注は禁止スタブ/fake、通知スタブ、フラグ・mutex 名は
+  テスト用に一時分離)。`data/rt3_backstop_stop.flag` は不変 (SHA256 一致)。
+
 ## 2026-07-12 (6) — execute_purchase: click 直前の最終再検査で並行 TOCTOU を原子化
 
 (5) への Codex 第5R判定で残った並行 TOCTOU (窓は数百行→数十msに激減したが未閉塞) を閉じる。

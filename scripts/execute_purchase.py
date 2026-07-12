@@ -792,17 +792,35 @@ async def execute_buy(
                     raise RuntimeError("「投票する」 button が見つからない")
                 if await vote_btn.is_disabled():
                     raise RuntimeError("「投票する」が disabled (締切超過?)")
-                # === click 直前の最終再検査 (2026-07-12 Codex第5R) ===
-                # 上の :769 検査から実 click までに時刻取得・locator 取得・
-                # `await count()`・`await is_disabled()` の 2 つの await があり、
-                # その待ち中に別プロセスが abandoned フラグを生成し得る (TOCTOU)。
-                # 全 await 完了後・click の直前でもう一度検査し、原子的に近づける
-                # (停止/判定不能なら click せず abort、fail-closed)。
-                _blk2, _why2 = _stop_flags_block(bets)
-                if _blk2:
+                # === 購入ゲート保持下で「最終再検査 → click」を原子化 (Codex第6R) ===
+                # 第5R までの再検査は同一イベントループ内では割り込まれないが、
+                # 検査後〜click 送出の間に**別プロセス**が abandoned フラグを生成
+                # する余地 (プロセス間 TOCTOU) が残っていた。
+                # 共有の購入ゲート named mutex を取得し、その保持下で最終検査と
+                # click 送出だけを最短で実行する。フラグ生成側 (auto_buy の
+                # WAIT_ABANDONED 経路) も同じゲートを取得してから書くため、
+                # ゲート保持中はフラグ生成がブロックされ、検査〜click に別プロセスの
+                # フラグを割り込ませられない。ブラウザ準備 (locator/count/is_disabled)
+                # はゲート外で済ませ済み。ゲート取得不能は fail-closed で発注中止。
+                # click 側は run mutex を一切取得しない (ネストは run mutex→gate の
+                # 一方向のみ) ため、フラグ生成側との循環待ち=デッドロックは起きない。
+                _root = str(ROOT)
+                if _root not in sys.path:
+                    sys.path.insert(0, _root)
+                import auto_buy as _abmod
+                _gate = _abmod.acquire_purchase_gate()
+                if _gate is None:
                     raise RuntimeError(
-                        f"click 直前の最終再検査で中止 (発注せず): {_why2}")
-                await vote_btn.click(timeout=5000)
+                        "購入ゲート取得不能 — 検査〜click の原子性を保証できない"
+                        "ため発注中止 (fail-closed)")
+                try:
+                    _blk2, _why2 = _stop_flags_block(bets)
+                    if _blk2:
+                        raise RuntimeError(
+                            f"click 直前の最終再検査で中止 (発注せず): {_why2}")
+                    await vote_btn.click(timeout=5000)
+                finally:
+                    _abmod.release_purchase_gate(_gate)
                 # 投票完了画面 / 結果メッセージを待つ
                 await asyncio.sleep(5)
             except Exception as e:

@@ -59,13 +59,17 @@ class _AutoBuySandbox:
         self.tmp = Path(tempfile.mkdtemp(prefix="autobuy_recheck_"))
         self.sent: list[tuple[str, str]] = []
         self.mutex_name = mutex_name or f"Global\\AutoRacingAITest_{uuid.uuid4().hex[:8]}"
+        # 購入ゲートも run mutex とは別名前空間でテスト分離
+        self.gate_name = f"Global\\AutoRacingAITestGate_{uuid.uuid4().hex[:8]}"
         self._orig: dict = {}
 
     def __enter__(self):
         self._orig = {k: getattr(auto_buy, k) for k in (
             "AUTO_BUY_ENABLED", "LOCK_WAIT_SEC", "STATE_FILE", "DATA",
             "BET_HISTORY_CSV", "ABANDONED_STOP_FLAG", "_notify",
-            "_run_execute_purchase", "_mutex_name", "check_guards")}
+            "_run_execute_purchase", "_mutex_name", "_purchase_gate_name",
+            "check_guards")}
+        auto_buy._purchase_gate_name = lambda: self.gate_name
         auto_buy.AUTO_BUY_ENABLED = True
         auto_buy.LOCK_WAIT_SEC = 5
         # 一般ガードは常に通す (.env の時間帯/上限設定に依存させず、
@@ -728,6 +732,98 @@ def test_click_precheck_blocks_when_flag_created_during_awaits():
     assert not any("投票する" in s for s in fake_page.clicks), fake_page.clicks
     assert any("投票確認へ" in s for s in fake_page.clicks), \
         "テスト前提: 確認画面までは到達している"
+
+
+# ─── ⑦ 購入ゲート (プロセス間 TOCTOU の完全原子化, Codex第6R) ───────────────
+
+def test_click_aborts_when_purchase_gate_unavailable():
+    """購入ゲートが取得不能 (None) → 検査〜click の原子性を保証できないため
+    click せず fail-closed で abort (buy_app/直CLI/auto_buy 全経路の最終防御)。"""
+    tmp, ab_flag = _new_click_tmp()  # フラグ無し: ゲート起因の中止を明確化
+    fake_page = _FakePage(_CONFIRM_TEXT, _CONFIRM_URL)
+    orig_gate = auto_buy.acquire_purchase_gate
+    try:
+        auto_buy.acquire_purchase_gate = lambda *a, **kw: None
+        raised = _drive_execute_buy(
+            fake_page, ab_flag, tmp,
+            [{"type": "fns", "cars": [5], "amount": 300}])
+    finally:
+        auto_buy.acquire_purchase_gate = orig_gate
+    assert raised is not None, "ゲート取得不能でも発注に進んでしまった"
+    assert "購入ゲート" in str(raised), str(raised)
+    assert not any("投票する" in s for s in fake_page.clicks), fake_page.clicks
+
+
+def test_purchase_gate_mutual_exclusion():
+    """購入ゲート保持中は別スレッド (別プロセス相当) が同ゲートを取得できず、
+    解放後に取得できる。これが「フラグ生成」と「最終検査→click」を同一排他
+    区間に入れて原子化する土台になる。"""
+    if not IS_WINDOWS:
+        print("  (skip: Windows 専用)")
+        return
+    name = f"Global\\AutoRacingAITestGate_{uuid.uuid4().hex[:8]}"
+    holder_ready = threading.Event()
+    release_holder = threading.Event()
+    res: dict = {}
+
+    def _holder():
+        g = auto_buy.acquire_purchase_gate(wait_sec=5, name=name)
+        res["holder_got"] = g is not None
+        holder_ready.set()
+        release_holder.wait(5)
+        auto_buy.release_purchase_gate(g)
+
+    th = threading.Thread(target=_holder)
+    th.start()
+    try:
+        assert holder_ready.wait(5)
+        assert res.get("holder_got") is True, "holder がゲートを取得できていない"
+        # 保持中は別スレッド (main) が即時取得できない (wait 0 → None)
+        g_blocked = auto_buy.acquire_purchase_gate(wait_sec=0, name=name)
+        assert g_blocked is None, "ゲート保持中に別スレッドが取得できてはいけない"
+    finally:
+        release_holder.set()
+        th.join(5)
+    # 解放後は取得できる
+    g_after = auto_buy.acquire_purchase_gate(wait_sec=5, name=name)
+    assert g_after is not None, "解放後は取得できる"
+    auto_buy.release_purchase_gate(g_after)
+
+
+def test_no_deadlock_run_mutex_then_purchase_gate():
+    """デッドロック回避: ネスト順 run mutex → 購入ゲート の一方向。run mutex
+    保持中に別スレッドがゲートを保持していても、解放後にゲートを取得でき
+    ハングしない (click 側は run mutex を取らないため循環待ちが生じない)。"""
+    if not IS_WINDOWS:
+        print("  (skip: Windows 専用)")
+        return
+    run_name = f"Global\\AutoRacingAITest_{uuid.uuid4().hex[:8]}"
+    gate_name = f"Global\\AutoRacingAITestGate_{uuid.uuid4().hex[:8]}"
+    holder_ready = threading.Event()
+    proceed = threading.Event()
+
+    def _gate_holder():
+        g = auto_buy.acquire_purchase_gate(wait_sec=5, name=gate_name)
+        holder_ready.set()
+        proceed.wait(5)  # main が gate 待ちに入る直前に解放
+        auto_buy.release_purchase_gate(g)
+
+    th = threading.Thread(target=_gate_holder)
+    th.start()
+    assert holder_ready.wait(5)
+    # run mutex を先に取得 (ネストの外側)
+    run_lock = auto_buy._acquire_lock(wait_sec=5, name=run_name)
+    assert run_lock is not None and run_lock[2] is False
+    try:
+        proceed.set()  # gate_holder がゲートを解放
+        # run mutex 保持中にゲートを取得 (循環しないのでデッドロックせず取れる)
+        gate = auto_buy.acquire_purchase_gate(wait_sec=10, name=gate_name)
+        assert gate is not None, \
+            "run mutex 保持中でも gate 取得はデッドロックしない"
+        auto_buy.release_purchase_gate(gate)
+    finally:
+        auto_buy._release_lock(run_lock)
+        th.join(5)
 
 
 def _run_all():
