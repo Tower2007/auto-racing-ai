@@ -826,55 +826,171 @@ def test_no_deadlock_run_mutex_then_purchase_gate():
         th.join(5)
 
 
-def test_generator_does_not_write_flag_when_gate_unavailable():
-    """Codex第7R: 生成側 (WAIT_ABANDONED 経路) は購入ゲート**所有下でのみ**書く。
-    - ゲート取得成功 → ゲート保持下で write (フラグ生成 + 解放)
-    - ゲート None (mutex 破損) → 排他外 write せず、フラグ未生成 (逃げ道廃止)
-    実 WAIT_ABANDONED は _acquire_lock 差替で模擬 (子プロセス不要・全 OS 可)。"""
+def test_purchase_gate_ex_distinguishes_timeout_vs_broken():
+    """Codex第8R: _acquire_purchase_gate_ex は「timeout(競合)」と「broken」を
+    区別する。実 mutex を別スレッドで保持させ、競合が GATE_TIMEOUT (broken でない)
+    と分類されること、解放後は GATE_OK になることを確認する。"""
+    if not IS_WINDOWS:
+        print("  (skip: Windows 専用)")
+        return
+    name = f"Global\\AutoRacingAITestGate_{uuid.uuid4().hex[:8]}"
+    holder_ready = threading.Event()
+    release_holder = threading.Event()
+
+    def _holder():
+        g = auto_buy.acquire_purchase_gate(wait_sec=10, name=name)
+        holder_ready.set()
+        release_holder.wait(10)
+        auto_buy.release_purchase_gate(g)
+
+    th = threading.Thread(target=_holder)
+    th.start()
+    try:
+        assert holder_ready.wait(5)
+        # 競合中: wait 0 → GATE_TIMEOUT (broken ではない)
+        status, gate = auto_buy._acquire_purchase_gate_ex(0, name=name)
+        assert status == auto_buy.GATE_TIMEOUT and gate is None, (status, gate)
+    finally:
+        release_holder.set()
+        th.join(5)
+    # 解放後: GATE_OK
+    status2, gate2 = auto_buy._acquire_purchase_gate_ex(2, name=name)
+    assert status2 == auto_buy.GATE_OK and gate2 is not None, status2
+    auto_buy.release_purchase_gate(gate2)
+
+
+def _patch_gate_ex(seq):
+    """`_acquire_purchase_gate_ex` を (status, gate) の列 seq を順に返す関数に
+    差し替える (最後の要素で以後固定)。呼び出し回数を返り値に記録する。"""
+    calls = {"n": 0}
+
+    def _fake_ex(*a, **kw):
+        i = min(calls["n"], len(seq) - 1)
+        calls["n"] += 1
+        return seq[i]
+    return _fake_ex, calls
+
+
+def test_generator_broken_does_not_write_but_ok_writes():
+    """Codex第8R: 生成側は購入ゲート **GATE_OK のときだけ** フラグを書く。
+    - GATE_BROKEN(mutex 生成不可) → 排他外 write せず、フラグ未生成 (逃げ道廃止)
+    - GATE_OK → ゲート保持下で write + 解放
+    _acquire_purchase_gate_ex を差し替えて status を制御 (子プロセス不要・全 OS 可)。"""
     with _AutoBuySandbox() as ab:
         flag = auto_buy.ABANDONED_STOP_FLAG
         cands = [_sanren_candidate()]
         orig_acquire = auto_buy._acquire_lock
         orig_release = auto_buy._release_lock
-        orig_gate = auto_buy.acquire_purchase_gate
+        orig_ex = auto_buy._acquire_purchase_gate_ex
         orig_relgate = auto_buy.release_purchase_gate
         orig_locked = auto_buy._run_auto_buy_locked
         try:
-            # abandoned lock を返す (発注本体には入らない経路を強制)
             auto_buy._acquire_lock = lambda *a, **kw: ("k32", "h", True)
             auto_buy._release_lock = lambda lk: None
             auto_buy._run_auto_buy_locked = _forbidden_execute
-
-            # (b) ゲート None → 排他外 write せず、フラグ未生成
             released: list = []
-            auto_buy.acquire_purchase_gate = lambda *a, **kw: None
             auto_buy.release_purchase_gate = lambda g: released.append(g)
+
+            # (b) GATE_BROKEN → 非write・未生成・release 呼ばない
+            fake_ex, _ = _patch_gate_ex([(auto_buy.GATE_BROKEN, None)])
+            auto_buy._acquire_purchase_gate_ex = fake_ex
             assert not flag.exists()
             out = auto_buy.run_auto_buy(cands, dry_run=False)
             assert [r["verdict"] for r in out] == ["skip_abandoned_lock"], out
-            assert not flag.exists(), "ゲート None 時に排他外 write してはいけない"
-            assert released == [], "None 経路では release も呼ばない"
-            # 停止周知の通知は出て、本文はゲート取得不能を明示
+            assert not flag.exists(), "broken 時に排他外 write してはいけない"
+            assert released == [], "broken 経路では release も呼ばない"
             assert len(ab.sent) == 1 and "ゲート" in ab.sent[0][1], ab.sent
 
-            # (a) ゲート取得成功 → 保持下で write + 解放
+            # (a) GATE_OK → 保持下で write + 解放
             ab.sent.clear()
-            fake_gate = ("k32gate", "hgate")
-            acquired: list = []
             released.clear()
-            auto_buy.acquire_purchase_gate = (
-                lambda *a, **kw: acquired.append(1) or fake_gate)
-            auto_buy.release_purchase_gate = lambda g: released.append(g)
+            fake_gate = ("k32gate", "hgate")
+            fake_ex2, calls2 = _patch_gate_ex([(auto_buy.GATE_OK, fake_gate)])
+            auto_buy._acquire_purchase_gate_ex = fake_ex2
             out2 = auto_buy.run_auto_buy(cands, dry_run=False)
             assert [r["verdict"] for r in out2] == ["skip_abandoned_lock"], out2
-            assert flag.exists(), "ゲート取得成功時はフラグを書く"
-            assert acquired == [1] and released == [fake_gate], \
-                (acquired, released)
+            assert flag.exists(), "GATE_OK 時はフラグを書く"
+            assert calls2["n"] == 1 and released == [fake_gate], \
+                (calls2, released)
         finally:
             auto_buy._acquire_lock = orig_acquire
             auto_buy._release_lock = orig_release
-            auto_buy.acquire_purchase_gate = orig_gate
+            auto_buy._acquire_purchase_gate_ex = orig_ex
             auto_buy.release_purchase_gate = orig_relgate
+            auto_buy._run_auto_buy_locked = orig_locked
+
+
+def test_generator_timeout_retries_then_writes():
+    """Codex第8R: timeout(競合) は諦めず再試行し続け、取得できたらゲート下で write。
+    _acquire_purchase_gate_ex が TIMEOUT を数回返した後 OK を返すよう差し替え、
+    再試行回数と「取得後にのみ write」を検証する (排他外 write なし)。"""
+    with _AutoBuySandbox() as ab:
+        flag = auto_buy.ABANDONED_STOP_FLAG
+        cands = [_sanren_candidate()]
+        orig_acquire = auto_buy._acquire_lock
+        orig_release = auto_buy._release_lock
+        orig_ex = auto_buy._acquire_purchase_gate_ex
+        orig_relgate = auto_buy.release_purchase_gate
+        orig_locked = auto_buy._run_auto_buy_locked
+        try:
+            auto_buy._acquire_lock = lambda *a, **kw: ("k32", "h", True)
+            auto_buy._release_lock = lambda lk: None
+            auto_buy._run_auto_buy_locked = _forbidden_execute
+            released: list = []
+            auto_buy.release_purchase_gate = lambda g: released.append(g)
+
+            fake_gate = ("k32gate", "hgate")
+            fake_ex, calls = _patch_gate_ex([
+                (auto_buy.GATE_TIMEOUT, None),
+                (auto_buy.GATE_TIMEOUT, None),
+                (auto_buy.GATE_OK, fake_gate)])
+            auto_buy._acquire_purchase_gate_ex = fake_ex
+            assert not flag.exists()
+            out = auto_buy.run_auto_buy(cands, dry_run=False)
+            assert [r["verdict"] for r in out] == ["skip_abandoned_lock"], out
+            assert calls["n"] == 3, f"competition を諦めず再試行するはず: {calls}"
+            assert flag.exists(), "取得後にフラグを書く"
+            assert released == [fake_gate], released
+        finally:
+            auto_buy._acquire_lock = orig_acquire
+            auto_buy._release_lock = orig_release
+            auto_buy._acquire_purchase_gate_ex = orig_ex
+            auto_buy.release_purchase_gate = orig_relgate
+            auto_buy._run_auto_buy_locked = orig_locked
+
+
+def test_generator_total_timeout_last_resort_writes():
+    """Codex第8R 最後の砦: 総上限を超えても競合が解消しない異常時のみ、
+    best-effort でフラグを書き後続購入を停止する (この click 単体の原子性は
+    既に達成不能だが sticky halt を残す)。総上限を極小にして到達を再現。"""
+    with _AutoBuySandbox() as ab:
+        flag = auto_buy.ABANDONED_STOP_FLAG
+        cands = [_sanren_candidate()]
+        orig_acquire = auto_buy._acquire_lock
+        orig_release = auto_buy._release_lock
+        orig_ex = auto_buy._acquire_purchase_gate_ex
+        orig_total = auto_buy.PURCHASE_GATE_TOTAL_WAIT_SEC
+        orig_locked = auto_buy._run_auto_buy_locked
+        try:
+            auto_buy._acquire_lock = lambda *a, **kw: ("k32", "h", True)
+            auto_buy._release_lock = lambda lk: None
+            auto_buy._run_auto_buy_locked = _forbidden_execute
+            auto_buy.PURCHASE_GATE_TOTAL_WAIT_SEC = 0.2  # 総上限を極小化
+            # 常に TIMEOUT (競合が永久に解消しない異常事態を模擬)
+            fake_ex, calls = _patch_gate_ex([(auto_buy.GATE_TIMEOUT, None)])
+            auto_buy._acquire_purchase_gate_ex = fake_ex
+            assert not flag.exists()
+            out = auto_buy.run_auto_buy(cands, dry_run=False)
+            assert [r["verdict"] for r in out] == ["skip_abandoned_lock"], out
+            assert calls["n"] >= 1
+            # 最後の砦で best-effort write されている
+            assert flag.exists(), "総上限超過時は best-effort でフラグを書く"
+            assert len(ab.sent) == 1 and "best-effort" in ab.sent[0][1], ab.sent
+        finally:
+            auto_buy._acquire_lock = orig_acquire
+            auto_buy._release_lock = orig_release
+            auto_buy._acquire_purchase_gate_ex = orig_ex
+            auto_buy.PURCHASE_GATE_TOTAL_WAIT_SEC = orig_total
             auto_buy._run_auto_buy_locked = orig_locked
 
 

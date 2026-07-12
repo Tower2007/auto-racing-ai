@@ -1,5 +1,36 @@
 # CHANGELOG
 
+## 2026-07-12 (9) — 購入ゲート: acquire を timeout/broken に3値化 — 競合は待ち続け、破損のみ非write
+
+(8) への Codex 第8R判定で残った 1 点。`acquire_purchase_gate()` は **30秒タイムアウト(競合)
+でも None** を返し、生成側はそれを一律「mutex 破損」と解釈して非write・正常復帰していた。
+この同値は不成立。反例: click 側が OS スケジューリング遅延でゲートを 30秒超保持 → 生成側が
+timeout → 非write で run mutex 解放 → click 再開して送出 → sticky フラグ無しで後続購入も再開。
+
+- **取得を 3 値化** (`auto_buy.py`): `_acquire_purchase_gate_ex()` が
+  `GATE_OK`(handle) / `GATE_TIMEOUT`(競合=ゲートは在るが他者保持) / `GATE_BROKEN`
+  (CreateMutexW 失敗・非Windows・異常 rc) を返す。timeout と broken を必ず区別。
+- **click 側ラッパ** `acquire_purchase_gate()`: 従来どおり gate-or-None を返す
+  (timeout も broken も None → click 側はどちらでも fail-closed abort が正しい)。互換維持。
+- **生成側 (WAIT_ABANDONED 経路)** は `acquire_purchase_gate_blocking()` を使用:
+  - `GATE_OK` → ゲート保持下で原子的に write + 解放。
+  - `GATE_TIMEOUT`(競合) → **諦めず再試行し続ける**。click 側は必ず finally で
+    解放する (最終検査 + click timeout 5秒 + 解放の最短区間) ため、総上限
+    `PURCHASE_GATE_TOTAL_WAIT_SEC=300秒` (click 保持 5秒を大幅超過) 内に必ず取得できる。
+  - `GATE_BROKEN`(mutex 生成不可) → **非write**。この時のみ「click 側も生成不可で
+    fail-closed=購入不可だからフラグ非writeでも安全」の論法が成立 (broken 限定で正しい)。
+  - 総上限超過 (通常起き得ない異常) のみ **最後の砦**: best-effort でフラグを書き
+    後続購入を停止 (この click 単体の原子性は既に達成不能=click は自ゲート保持下で
+    検査済みだが、sticky halt で後続を止めるのが安全上最重要)。
+- **デッドロック/ハング**: ネスト順 run mutex → 購入ゲート は不変。生成側が総上限まで
+  待つ間 run mutex を保持し続けるが、click 側は run mutex を取らないので循環しない。
+- `tests/test_final_gate_recheck.py`: ⑧ 3 値化の回帰 — `_acquire_purchase_gate_ex` の
+  timeout/broken 区別 (実 mutex 競合→GATE_TIMEOUT・解放後 GATE_OK) / broken→非write・
+  GATE_OK→write / timeout は再試行し取得後 write (排他外 write なし) / 総上限超過→
+  最後の砦 best-effort write。既存の実 mutex 待機テストも維持。
+- 回帰テスト 66 本全緑 (実発注は禁止スタブ/fake、通知スタブ、フラグ・mutex 名は
+  テスト用に一時分離)。`data/rt3_backstop_stop.flag` は不変 (SHA256 一致)。
+
 ## 2026-07-12 (8) — 購入ゲート: 生成側の排他外 write を廃止 (所有下のみ書込) — 最後の逃げ道閉塞
 
 (7) への Codex 第7R判定で残った**生成側の逃げ道**を訂正。(7) では「ゲートが取れなくても

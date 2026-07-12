@@ -576,7 +576,19 @@ def _release_lock(lock) -> None:
 #   - click 側 (execute_purchase) は run mutex を一切取得せず購入ゲートのみ取得する。
 # click 側が run mutex を待つ経路が存在しないため循環待ちが生じない。
 # 購入ゲートは最短区間だけ保持する (ブラウザ準備の await はゲート外)。
-PURCHASE_GATE_WAIT_SEC = 30
+PURCHASE_GATE_WAIT_SEC = 30          # 単発取得の待ち上限 (click 側/1トライ)
+# 生成側 (WAIT_ABANDONED) の総リトライ上限。click 側のゲート保持は
+# 「最終検査 + click(timeout 5秒) + 解放」の最短区間で、必ず finally 解放される
+# ため、通常運用ではこの上限に達する前に必ず取得できる (5秒 << 300秒)。
+PURCHASE_GATE_TOTAL_WAIT_SEC = 300
+
+# acquire の 3 値化 (2026-07-12 Codex第8R): 取得失敗を区別する。
+#   GATE_OK      … 取得成功 (gate=(k32,handle))
+#   GATE_TIMEOUT … 競合 (ゲートは存在するが他者が保持中で待ち上限内に取れず)
+#   GATE_BROKEN  … mutex サブシステム自体が使えない (CreateMutexW 失敗 / 非Windows /
+#                  WaitForSingleObject が異常 rc)。click 側も同じく生成不可で
+#                  fail-closed になるため、この時のみ「フラグ非writeでも安全」が成立
+GATE_OK, GATE_TIMEOUT, GATE_BROKEN = "ok", "timeout", "broken"
 
 
 def _purchase_gate_name() -> str:
@@ -586,58 +598,105 @@ def _purchase_gate_name() -> str:
     return f"Global\\AutoRacingAI_purchase_gate_{h}"
 
 
-def acquire_purchase_gate(wait_sec: float | None = None,
-                          name: str | None = None):
-    """購入ゲート named mutex を取得。成功なら (k32, handle)、取得不能なら None。
+def _acquire_purchase_gate_ex(wait_sec: float, name: str | None = None):
+    """購入ゲート取得の内部実装。返り値 (status, gate)。
 
-    短命クリティカルセクション用。abandoned (先行がReleaseせず異常終了) でも
-    所有を引き継いで続行する (短区間のため sticky 停止は不要)。
-    非Windows は排他保証がないため fail-closed (None → 呼び出し側は発注中止)。
-    name はテスト専用の注入口 (既定はパスハッシュ入り購入ゲート名)。"""
-    if wait_sec is None:
-        wait_sec = PURCHASE_GATE_WAIT_SEC
+    status は GATE_OK / GATE_TIMEOUT / GATE_BROKEN。
+    - GATE_OK: gate=(k32, handle) を所有 (WAIT_OBJECT_0 / WAIT_ABANDONED)。
+    - GATE_TIMEOUT: 競合 (他者が保持) で wait_sec 内に取得できず。gate=None。
+    - GATE_BROKEN: mutex 生成不可・非Windows・異常 rc。gate=None。
+    「タイムアウト(競合)」と「破損」を必ず区別する (第8R): 呼び出し側の
+    「待ち続ける / 非write」判断がこの区別に依存する。"""
     if os.name != "nt":
-        logger.warning("[auto_buy] 購入ゲートは Windows 専用 — "
-                       "排他保証がないため fail-closed (None)")
-        return None
+        # 非Windows: named mutex 自体が使えない = broken 扱い (fail-closed)。
+        logger.warning("[auto_buy] 購入ゲートは Windows 専用 — broken 扱い")
+        return GATE_BROKEN, None
     import ctypes
     try:
         k32 = _kernel32()
         handle = k32.CreateMutexW(None, False, name or _purchase_gate_name())
         if not handle:
             logger.warning("[auto_buy] 購入ゲート CreateMutexW 失敗 "
-                           "(WinError=%d)", ctypes.get_last_error())
-            return None
+                           "(WinError=%d) — broken", ctypes.get_last_error())
+            return GATE_BROKEN, None
     except Exception as e:  # noqa: BLE001
-        logger.warning("[auto_buy] 購入ゲート初期化失敗 (%s)", e)
-        return None
+        logger.warning("[auto_buy] 購入ゲート初期化失敗 (%s) — broken", e)
+        return GATE_BROKEN, None
     try:
         rc = k32.WaitForSingleObject(handle, 0)
         if rc == WAIT_TIMEOUT:
             rc = k32.WaitForSingleObject(handle, int(wait_sec * 1000))
         if rc == WAIT_TIMEOUT:
             k32.CloseHandle(handle)
-            logger.warning("[auto_buy] 購入ゲート取得タイムアウト (%ds) — "
-                           "fail-closed", int(wait_sec))
-            return None
+            # 競合: ゲートは存在するが他者が保持中。呼び出し側で再試行し得る。
+            return GATE_TIMEOUT, None
         if rc not in (WAIT_OBJECT_0, WAIT_ABANDONED):
-            logger.warning("[auto_buy] 購入ゲート WaitForSingleObject 失敗 "
-                           "(rc=0x%X, WinError=%d)", rc, ctypes.get_last_error())
+            logger.warning("[auto_buy] 購入ゲート WaitForSingleObject 異常 "
+                           "(rc=0x%X, WinError=%d) — broken",
+                           rc, ctypes.get_last_error())
             k32.CloseHandle(handle)
-            return None
+            return GATE_BROKEN, None
         if rc == WAIT_ABANDONED:
             # 先行がゲート保持中に異常終了。所有は OS が本プロセスに移譲済み。
             # 短区間ゲートなので所有を引き継いでそのまま続行する。
             logger.warning("[auto_buy] 購入ゲート abandoned (先行の異常終了) — "
                            "所有を引き継いで続行")
-        return (k32, handle)
+        return GATE_OK, (k32, handle)
     except Exception as e:  # noqa: BLE001
-        logger.warning("[auto_buy] 購入ゲート取得失敗 (%s)", e)
+        # 取得中の予期せぬ例外は broken 扱い (fail-closed 側)。
+        logger.warning("[auto_buy] 購入ゲート取得失敗 (%s) — broken", e)
         try:
             k32.CloseHandle(handle)
         except Exception:
             pass
-        return None
+        return GATE_BROKEN, None
+
+
+def acquire_purchase_gate(wait_sec: float | None = None,
+                          name: str | None = None):
+    """購入ゲート named mutex を単発取得。成功なら (k32, handle)、取得不能なら None。
+
+    click 側 (execute_purchase) 用の薄いラッパ: timeout(競合) も broken も None を
+    返す (click 側はどちらでも「原子性を保証できない」ので fail-closed abort が正しい)。
+    短命クリティカルセクション用。name はテスト専用の注入口。"""
+    status, gate = _acquire_purchase_gate_ex(
+        PURCHASE_GATE_WAIT_SEC if wait_sec is None else wait_sec, name)
+    return gate if status == GATE_OK else None
+
+
+def acquire_purchase_gate_blocking(name: str | None = None,
+                                   per_try_sec: float | None = None,
+                                   total_sec: float | None = None):
+    """生成側 (WAIT_ABANDONED 経路) 用の取得。返り値 (status, gate)。
+
+    第8R: timeout(競合) と broken(mutex 破損) を区別して扱う。
+    - GATE_TIMEOUT(競合) は**諦めずに再試行し続ける**。click 側は必ず finally で
+      ゲートを解放する (最終検査 + click timeout 5秒 + 解放の最短区間) ため、
+      現実には total_sec 内に必ず取得できる。取得後 GATE_OK を返す。
+    - GATE_BROKEN(CreateMutexW 失敗等) は即 (GATE_BROKEN, None)。この時のみ
+      「click 側も生成不可で fail-closed=購入不可だからフラグ非writeでも安全」が成立。
+    - total_sec を超えても競合が解消しない異常時のみ (GATE_TIMEOUT, None) を返す
+      (最後の砦: 呼び出し側が best-effort でフラグを書き sticky halt を残す)。
+    """
+    per_try = PURCHASE_GATE_WAIT_SEC if per_try_sec is None else per_try_sec
+    total = PURCHASE_GATE_TOTAL_WAIT_SEC if total_sec is None else total_sec
+    import time as _t
+    deadline = _t.monotonic() + total
+    attempts = 0
+    while True:
+        status, gate = _acquire_purchase_gate_ex(per_try, name)
+        if status == GATE_OK:
+            return GATE_OK, gate
+        if status == GATE_BROKEN:
+            return GATE_BROKEN, None
+        # GATE_TIMEOUT: 競合。click 側の解放を待って再試行する。
+        attempts += 1
+        if _t.monotonic() >= deadline:
+            logger.error("[auto_buy] 購入ゲート競合が総上限 %ds を超えても解消せず "
+                         "(%d 回試行) — 最後の砦へ", int(total), attempts)
+            return GATE_TIMEOUT, None
+        logger.warning("[auto_buy] 購入ゲート競合で取得できず — 再試行 "
+                       "(%d 回目、総上限 %ds まで)", attempts, int(total))
 
 
 def release_purchase_gate(gate) -> None:
@@ -748,34 +807,23 @@ def run_auto_buy(candidates: list[dict],
                  "timestamp": (now or now_jst()).isoformat()}
                 for c in candidates if c.get("bets")]
             flag_note = f"data/{ABANDONED_STOP_FLAG.name} を書き出しました。"
-            # 購入ゲート**所有下でのみ**フラグを書く (2026-07-12 Codex第6R→第7R)。
+            # 購入ゲート**所有下でのみ**フラグを書く (2026-07-12 Codex第6R→第7R→第8R)。
             # click 側 (execute_purchase) は同じ購入ゲートを保持して「最終検査 →
             # click」を行い、必ず finally で解放する (click timeout 5秒で必ず抜ける)。
             # よって生成側はゲートを待てば必ず取得でき、その保持下で書けば、検査〜
             # click の間にフラグ書込が割り込むことも、書込〜可視化の間に click が
-            # 抜けることもない (プロセス間で原子的)。取得待ちは click の最大保持
-            # 時間 (5秒) を十分上回る PURCHASE_GATE_WAIT_SEC(30秒) で行う。
+            # 抜けることもない (プロセス間で原子的)。
             #
-            # ★第7R訂正: None 時 (= mutex サブシステム自体が壊れている) の
-            #  「排他外 write」は**廃止**した。それが残ると「生成側がゲート取得を
-            #  タイムアウト → ゲート外で write → その隙に click が送出」という穴に
-            #  なる。根拠: 同じ壊れたゲートを click 側も取得できず fail-closed で
-            #  発注中止するため、ゲート破損中は購入が起き得ず、フラグを書けなくても
-            #  安全。トレードオフとして mutex 破損中は sticky halt の永続フラグが
-            #  残らないが、その間は購入自体が不可能なので実害はない。
-            _gate = acquire_purchase_gate()
-            if _gate is None:
-                # 待機しても取得できない = mutex 破損。排他外 write はしない。
-                logger.error(
-                    "[auto_buy] 購入ゲート取得不能 — 発注結果不明フラグの排他書込を"
-                    "断念 (排他外 write は原子性を壊すため行わない)。mutex 破損中は"
-                    "click 側も fail-closed で購入不可のため安全。手動確認を最優先")
-                flag_note = (
-                    "⚠️ 購入ゲート (named mutex) を取得できずフラグを書き出せません"
-                    "でした。mutex サブシステムが壊れている可能性があり、その間は"
-                    "自動発注・buy_app とも fail-closed で購入不可です。"
-                    "手動での状況確認を最優先してください。")
-            else:
+            # ★第8R訂正: acquire の失敗を「timeout(競合)」と「broken(mutex破損)」で
+            #  区別する。旧実装は 30秒タイムアウトでも None を返し、それを一律
+            #  「破損」と誤解釈して非write・正常復帰していた。反例: click 側が OS
+            #  スケジューリング遅延でゲートを 30秒超保持 → 生成側 timeout → 非write
+            #  → click 送出 → sticky フラグ無しで後続購入も再開、が残っていた。
+            #  対策: timeout(競合) は諦めず**再試行し続ける** (acquire_purchase_gate_
+            #  blocking)。click は必ず解放するので現実には必ず取得できる。
+            _gstatus, _gate = acquire_purchase_gate_blocking()
+            if _gstatus == GATE_OK:
+                # 通常経路: ゲート保持下で原子的に write。
                 try:
                     _write_abandoned_flag(_mutex_name())
                 except Exception as e:  # noqa: BLE001
@@ -784,6 +832,42 @@ def run_auto_buy(candidates: list[dict],
                                  "手動での状況確認を最優先してください。")
                 finally:
                     release_purchase_gate(_gate)
+            elif _gstatus == GATE_BROKEN:
+                # mutex サブシステム破損 (CreateMutexW 失敗・非Windows 等)。
+                # 排他外 write はしない。根拠: 同じ壊れたゲートを click 側も取得
+                # できず fail-closed で発注中止するため、破損中は購入が起き得ず、
+                # フラグを書けなくても安全 (この安全論法は broken 限定でのみ成立)。
+                # トレードオフ: 破損中は sticky halt の永続フラグが残らないが、
+                # その間は購入自体が不可能なので実害はない。
+                logger.error(
+                    "[auto_buy] 購入ゲート broken (mutex 生成不可) — 発注結果不明"
+                    "フラグの排他書込を断念 (排他外 write は原子性を壊すため行わ"
+                    "ない)。破損中は click 側も fail-closed で購入不可のため安全。"
+                    "手動確認を最優先")
+                flag_note = (
+                    "⚠️ 購入ゲート (named mutex) が生成不可のためフラグを書き出せ"
+                    "ませんでした。mutex サブシステムが壊れている可能性があり、その"
+                    "間は自動発注・buy_app とも fail-closed で購入不可です。"
+                    "手動での状況確認を最優先してください。")
+            else:
+                # GATE_TIMEOUT: 総上限を超えても競合が解消しない異常事態
+                # (click 側が総上限を超えてゲートを保持=通常は起き得ない)。
+                # 最後の砦: この click 単体の原子性は既に達成不能 (click 側は
+                # 自分のゲート保持下で検査済み) だが、sticky halt で**後続**購入を
+                # 止めることが安全上最も重要なので、best-effort でフラグを書く。
+                logger.error(
+                    "[auto_buy] 購入ゲート競合が総上限を超え解消せず — 最後の砦: "
+                    "best-effort でフラグを書き後続購入を停止する (要人手確認)")
+                try:
+                    _write_abandoned_flag(_mutex_name())
+                    flag_note = (
+                        "⚠️ 購入ゲートの競合が異常に長く解消しなかったため、"
+                        "best-effort でフラグを書き出しました (後続購入の停止優先)。"
+                        "実行中の click が二重投票していないか最優先で確認ください。")
+                except Exception as e:  # noqa: BLE001
+                    logger.error("[auto_buy] 最後の砦のフラグ書込も失敗: %s", e)
+                    flag_note = (f"⚠️ フラグ書き出しに失敗しました ({e})。"
+                                 "手動での状況確認を最優先してください。")
             _mark_abandoned_alerted(now)
             _notify(
                 "[AUTO-BUY] 🛑 先行プロセス異常終了検知 — 全券種の発注を停止 (要人手照合)",
