@@ -586,8 +586,9 @@ PURCHASE_GATE_TOTAL_WAIT_SEC = 300
 #   GATE_OK      … 取得成功 (gate=(k32,handle))
 #   GATE_TIMEOUT … 競合 (ゲートは存在するが他者が保持中で待ち上限内に取れず)
 #   GATE_BROKEN  … mutex サブシステム自体が使えない (CreateMutexW 失敗 / 非Windows /
-#                  WaitForSingleObject が異常 rc)。click 側も同じく生成不可で
-#                  fail-closed になるため、この時のみ「フラグ非writeでも安全」が成立
+#                  WaitForSingleObject が異常 rc)。破損は一時的/局所的でありうる (全
+#                  プロセスで恒久的に購入不能とは限らない) ため、halt を落とさぬよう
+#                  broken でも best-effort でフラグを書く (第10R Codex 指摘で修正)
 GATE_OK, GATE_TIMEOUT, GATE_BROKEN = "ok", "timeout", "broken"
 
 
@@ -606,7 +607,8 @@ def _acquire_purchase_gate_ex(wait_sec: float, name: str | None = None):
     - GATE_TIMEOUT: 競合 (他者が保持) で wait_sec 内に取得できず。gate=None。
     - GATE_BROKEN: mutex 生成不可・非Windows・異常 rc。gate=None。
     「タイムアウト(競合)」と「破損」を必ず区別する (第8R): 呼び出し側の
-    「待ち続ける / 非write」判断がこの区別に依存する。"""
+    「取得まで待ち続ける (timeout) / best-effort write (broken) 」判断がこの区別に
+    依存する。broken でも halt は best-effort で永続化する (第10R)。"""
     if os.name != "nt":
         # 非Windows: named mutex 自体が使えない = broken 扱い (fail-closed)。
         logger.warning("[auto_buy] 購入ゲートは Windows 専用 — broken 扱い")
@@ -809,7 +811,9 @@ def run_auto_buy(candidates: list[dict],
                  "timestamp": (now or now_jst()).isoformat()}
                 for c in candidates if c.get("bets")]
             flag_note = f"data/{ABANDONED_STOP_FLAG.name} を書き出しました。"
-            # 購入ゲート**所有下でのみ**フラグを書く (2026-07-12 Codex第6R→第7R→第8R)。
+            # 通常経路では購入ゲート**所有下で**フラグを書く (2026-07-12 Codex第6R→
+            # 第7R→第8R→第9R)。縮退経路 (broken / 総上限超過) は下記のとおり
+            # best-effort で必ず書く (halt 永続化を最優先)。
             # click 側 (execute_purchase) は同じ購入ゲートを保持して「最終検査 →
             # click」を行い、必ず finally で解放する (click timeout 5秒で必ず抜ける)。
             # よって生成側はゲートを待てば必ず取得でき、その保持下で書けば、検査〜
