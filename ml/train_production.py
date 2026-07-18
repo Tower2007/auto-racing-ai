@@ -13,14 +13,25 @@
 - data/production_calib.pkl : IsotonicRegression
 - data/production_meta.json : メタデータ(学習日・特徴量・metrics)
 
+採用ゲート v2: ROI 劣化拒否権 (2026-07 追加。仕様は ml/roi_gate.py 参照):
+  精度ゲート (_should_adopt) が採用判定 (OK/WARN) を出した後の最終チェックとして、
+  champion (現役 production_model.lgb) / candidate の「top1 単勝 1 点 100 円」ROI を
+  同一 val 集合・同一レース集合でペア比較する (払戻は payouts.csv の tns 確定払戻)。
+  dROI <= -10pt かつブートストラップ 95%CI 上限 < 0 のときのみ NG (採用拒否)。
+  SKIP (n_bets<200 or 初回) / ERROR (計算失敗) / WARN (dROI <= -5pt) は記録のみで
+  精度ゲートの判定に従う (フェイルセーフ: ROI ゲート不具合で再学習を止めない)。
+  結果は retrain_history.csv の roi_* 列と meta の roi_gate に毎回記録。
+
 月 1 回 task scheduler から呼ぶ想定。
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
+import os
 import pickle
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +41,11 @@ import numpy as np
 import pandas as pd
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import roc_auc_score, log_loss
+
+try:
+    from ml.roi_gate import evaluate_roi_gate  # python -m ml.train_production
+except ImportError:  # 直接実行 (python ml/train_production.py) 時
+    from roi_gate import evaluate_roi_gate
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
@@ -225,33 +241,86 @@ def _load_current_meta() -> dict | None:
         return None
 
 
-def _append_retrain_history(verdict: str, reason: str, metrics: dict) -> None:
+HISTORY_PATH = DATA / "retrain_history.csv"
+HISTORY_HEADER = [
+    "timestamp", "verdict", "reason",
+    "valid_auc", "valid_logloss", "best_iteration",
+    "target_definition_version",
+    # 採用ゲート v2 (ROI 拒否権) — 2026-07 追加。旧行は空欄のまま
+    "roi_champion", "roi_candidate", "roi_delta_pt",
+    "roi_ci_low", "roi_ci_high", "roi_n_bets", "roi_verdict",
+]
+
+
+def _roi_history_fields(roi: dict) -> dict:
+    """roi_gate の verdict dict を retrain_history.csv 用の列に写す。"""
+    def _v(key):
+        v = roi.get(key)
+        return "" if v is None else v
+    return {
+        "roi_champion": _v("roi_champion"),
+        "roi_candidate": _v("roi_candidate"),
+        "roi_delta_pt": _v("roi_delta_pt"),
+        "roi_ci_low": _v("roi_ci_low"),
+        "roi_ci_high": _v("roi_ci_high"),
+        "roi_n_bets": roi.get("n_bets", ""),
+        "roi_verdict": roi.get("verdict", ""),
+    }
+
+
+def _migrate_history_header() -> None:
+    """既存 retrain_history.csv が旧ヘッダなら新ヘッダへ桁揃えして書き直す。
+
+    列追加時に CSV がラグド (行ごとに列数不一致) になると pandas 読者
+    (weekly_status.py の check_model_freshness) が落ちるため、旧行は既知列を
+    位置合わせでコピーし、新列は空欄で埋める (後方互換)。tmp → os.replace。
+    """
+    if not HISTORY_PATH.exists():
+        return
+    with open(HISTORY_PATH, encoding="utf-8", newline="") as f:
+        rows = list(csv.reader(f))
+    if not rows or rows[0] == HISTORY_HEADER:
+        return
+    old_idx = {c: i for i, c in enumerate(rows[0])}
+    out = [HISTORY_HEADER]
+    for r in rows[1:]:
+        out.append([
+            r[old_idx[c]] if c in old_idx and old_idx[c] < len(r) else ""
+            for c in HISTORY_HEADER
+        ])
+    tmp = HISTORY_PATH.with_suffix(".csv.tmp")
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
+        csv.writer(f).writerows(out)
+    os.replace(tmp, HISTORY_PATH)
+    logger.info("履歴ヘッダ移行: %s に ROI 列を追加 (旧行は空欄)", HISTORY_PATH.name)
+
+
+def _append_retrain_history(verdict: str, reason: str, metrics: dict,
+                            roi: dict | None = None) -> None:
     """再学習結果を data/retrain_history.csv に追記。
 
     weekly_status の塩漬けリスク監視 (Antigravity 2026-05-23 提案) で
     連続却下回数を集計するために OK/WARN/NG 全件を蓄積する。
+    2026-07 から採用ゲート v2 (ROI 拒否権) の roi_* 列も毎回記録する。
     """
-    import csv
-    history_path = DATA / "retrain_history.csv"
-    header = ["timestamp", "verdict", "reason",
-              "valid_auc", "valid_logloss", "best_iteration",
-              "target_definition_version"]
-    row = [
-        datetime.now().isoformat(timespec="seconds"),
-        verdict,
-        reason,
-        metrics.get("valid_auc", ""),
-        metrics.get("valid_logloss", ""),
-        metrics.get("best_iteration", ""),
-        TARGET_DEFINITION_VERSION,
-    ]
+    row = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "verdict": verdict,
+        "reason": reason,
+        "valid_auc": metrics.get("valid_auc", ""),
+        "valid_logloss": metrics.get("valid_logloss", ""),
+        "best_iteration": metrics.get("best_iteration", ""),
+        "target_definition_version": TARGET_DEFINITION_VERSION,
+        **_roi_history_fields(roi or {}),
+    }
     try:
-        new_file = not history_path.exists()
-        with open(history_path, "a", encoding="utf-8", newline="") as f:
+        _migrate_history_header()
+        new_file = not HISTORY_PATH.exists()
+        with open(HISTORY_PATH, "a", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
             if new_file:
-                writer.writerow(header)
-            writer.writerow(row)
+                writer.writerow(HISTORY_HEADER)
+            writer.writerow([row.get(k, "") for k in HISTORY_HEADER])
     except Exception as e:
         logger.warning("retrain_history.csv 追記失敗: %s", e)
 
@@ -382,6 +451,55 @@ def _should_adopt(new_metrics: dict, old_meta: dict | None,
     )
 
 
+# 採用ゲート v2 (ROI 拒否権) のレースキー。CSV 系プロジェクト共通の構成
+ROI_RACE_KEYS = ["race_date", "place_code", "race_no"]
+
+
+def _roi_veto(model: lgb.Booster, old_meta: dict | None,
+              X_va: pd.DataFrame, df_va: pd.DataFrame) -> dict:
+    """採用ゲート v2: ROI 劣化拒否権 (ml/roi_gate.py 共通仕様の呼び出し側)。
+
+    champion (現役 production_model.lgb) と candidate を同一 val 集合・
+    同一レース集合上で「予測スコア top1 の単勝 1 点 100 円」の ROI ペア比較に
+    かける。払戻は data/payouts.csv (bet_type=tns) の確定払戻 (refund/100 =
+    確定オッズ倍率)。精度ゲートが採用判定を出した後の最終チェックとしてのみ
+    呼ぶこと。例外は evaluate_roi_gate 同様 verdict="ERROR" に畳む
+    (フェイルセーフ: ROI ゲートの不具合で再学習パイプラインを止めない)。
+    """
+    try:
+        model_path = DATA / "production_model.lgb"
+        if old_meta is None or not model_path.exists():
+            return {"verdict": "SKIP",
+                    "reason": "現役モデルなし (初回採用) のため ROI 比較不能"}
+        champ = lgb.Booster(model_file=str(model_path))
+        cols = old_meta.get("feature_columns")
+        if cols and all(c in X_va.columns for c in cols):
+            Xv = X_va[cols]
+        else:
+            Xv = X_va  # 列不一致時は素のまま (_incumbent_auc_on_val と同じ扱い)
+
+        d = df_va[ROI_RACE_KEYS + ["car_no"]].copy().reset_index(drop=True)
+        d["race_date"] = pd.to_datetime(d["race_date"]).dt.normalize()
+        d["p_champion"] = champ.predict(Xv)
+        d["p_candidate"] = model.predict(X_va, num_iteration=model.best_iteration)
+
+        # 単勝確定払戻: payouts.csv の tns 行 (refund は 100 円あたり払戻金)
+        pay = pd.read_csv(DATA / "payouts.csv", low_memory=False)
+        tns = pay[pay["bet_type"] == "tns"].copy()
+        tns["race_date"] = pd.to_datetime(tns["race_date"], errors="coerce").dt.normalize()
+        tns = tns.dropna(subset=["race_date", "car_no_1", "refund"])
+        tns = tns.drop_duplicates(subset=ROI_RACE_KEYS)  # 同着はレース先頭のみ
+        winners = tns[ROI_RACE_KEYS + ["car_no_1", "refund"]]
+
+        d = d.merge(winners, on=ROI_RACE_KEYS, how="left")
+        d["is_win"] = (d["car_no"] == d["car_no_1"]).astype(int)
+        d["odds"] = d["refund"] / 100.0  # 払戻未取得レースは NaN → ペアごと除外
+        return evaluate_roi_gate(d, race_keys=ROI_RACE_KEYS)
+    except Exception as e:
+        return {"verdict": "ERROR",
+                "reason": f"ROI 拒否権 実行失敗 ({type(e).__name__}: {e})"}
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--target", default="target_top3", choices=["target_top3", "target_win"])
@@ -408,8 +526,24 @@ def main():
     verdict, reason = _should_adopt(
         train_metrics, old_meta, incumbent_auc, age_days, force=args.force)
 
-    # 学習履歴を append (OK/WARN/NG 全件、塩漬け監視用)
-    _append_retrain_history(verdict, reason, train_metrics)
+    # 採用ゲート v2: ROI 劣化拒否権 (精度ゲートが採用判定のときのみ最終チェック)。
+    # NG (大幅かつ有意な ROI 劣化) だけ採用をブロックする。SKIP/ERROR/WARN は
+    # 記録のみで精度ゲートの判定のまま進める (フェイルセーフ。--force は例外経路)。
+    if verdict == "NG":
+        roi_res = {"verdict": "SKIP", "reason": "精度ゲート NG のため ROI 比較不要"}
+    else:
+        roi_res = _roi_veto(model, old_meta, X_va, df_kept.loc[X_va.index])
+    logger.info("ROI 拒否権 (採用ゲート v2): %s: %s",
+                roi_res["verdict"], roi_res.get("reason", ""))
+    if roi_res["verdict"] == "ERROR":
+        logger.warning("ROI ゲート失敗。精度ゲート判定のまま進行 (フェイルセーフ)")
+    if roi_res["verdict"] == "NG" and not args.force:
+        verdict = "NG"
+        reason = f"[ROI拒否権] {roi_res.get('reason', '')} (精度ゲートは採用判定だった)"
+        logger.warning("verdict = NG へ上書き (ROI 拒否権発動)")
+
+    # 学習履歴を append (OK/WARN/NG 全件、塩漬け監視用 + roi_* 列)
+    _append_retrain_history(verdict, reason, train_metrics, roi=roi_res)
 
     if verdict == "NG":
         logger.warning("=" * 60)
@@ -422,6 +556,7 @@ def main():
             "verdict": verdict,
             "rejected_reason": reason,
             "train_metrics": train_metrics,
+            "roi_gate": roi_res,
         }
         with open(rejected_path, "w", encoding="utf-8") as f:
             json.dump(rejected, f, ensure_ascii=False, indent=2)
@@ -462,6 +597,7 @@ def main():
         "calib_metrics": calib_metrics,
         "quality_gate_verdict": verdict,
         "adoption_reason": reason,
+        "roi_gate": roi_res,
     }
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
