@@ -84,10 +84,14 @@ AUTO_BUY_ENABLED = _env_bool("AUTO_BUY_ENABLED", False)
 AUTO_BUY_DRY_RUN = _env_bool("AUTO_BUY_DRY_RUN", True)
 # 三連系 (rt3+rf3) も自動対象にするか。Week2 は複勝のみ (False)、Week3 で True。
 AUTO_BUY_INCLUDE_RT3 = _env_bool("AUTO_BUY_INCLUDE_RT3", False)
-# 複勝 (fns) を自動投票に含めるか。2026-06-26: 複勝は実弾 ROI 93.6% で控除率の壁を
-# 越えず累計を削る主因と判明したため **デフォルト OFF (三連系一本)**。
-# 復活させる場合は env AUTO_BUY_INCLUDE_FNS=1。経緯: memory project_decisions.md 2026-06-26。
-AUTO_BUY_INCLUDE_FNS = _env_bool("AUTO_BUY_INCLUDE_FNS", False)
+# 複勝 (fns) を自動投票に含めるか。
+# 2026-06-26: 実弾 ROI 93.6% で控除率の壁を越えないため OFF にした (三連系一本)。
+# 2026-07-18: **娯楽目的で復活 (デフォルト ON)**。三連系のみでは的中率 18% で
+#   当たりが数週間出ず「つまらない」ため。複勝は的中率 65〜69% で通算ほぼトントン
+#   (shadow 251R で ROI 100.9%) なので、期待損失は月数百円程度＝安価な娯楽費。
+#   ※ これは収益判断ではなく娯楽判断。三連系 100R レビューの評価は券種別に
+#     集計するため複勝復活で汚染されない (kill-switch も rt3/rf3 のみ対象)。
+AUTO_BUY_INCLUDE_FNS = _env_bool("AUTO_BUY_INCLUDE_FNS", True)
 # 時間帯ガードを無視して常時自動発注するか (2026-05-31 ユーザー要望でデフォ True)。
 # False にすると下の AUTO_BUY_HOUR_START/END の夜間限定に戻る。
 AUTO_BUY_ANYTIME = _env_bool("AUTO_BUY_ANYTIME", True)
