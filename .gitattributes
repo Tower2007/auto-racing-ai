@@ -3,3 +3,7 @@
 *.lgb     binary
 *.pkl     binary
 *.parquet binary
+
+# bat ファイルは cmd.exe が CRLF 必須のため強制
+# (LF だと括弧ブロックを誤パースし python 到達前に 0xFF/9009 で即死する)
+*.bat text eol=crlf
