@@ -242,3 +242,9 @@ date,place_code,place_name,race_no,bet_amount,refund_amount,profit
 2026-07-30,6,sanyou,1,100,180,80
 2026-07-30,6,sanyou,2,300,380,80
 2026-07-31,6,sanyou,4,300,200,-100
+2026-08-01,2,kawaguchi,4,100,130,30
+2026-08-01,4,hamamatsu,5,100,0,-100
+2026-08-01,4,hamamatsu,6,300,180,-120
+2026-08-01,4,hamamatsu,7,100,160,60
+2026-08-01,6,sanyou,6,100,100,0
+2026-08-01,6,sanyou,7,300,240,-60

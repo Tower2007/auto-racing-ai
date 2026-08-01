@@ -1,5 +1,5 @@
 {
-  "trained_at": "2026-07-26T03:05:41",
+  "trained_at": "2026-08-02T03:04:19",
   "target": "target_top3",
   "target_definition_version": 1,
   "n_features": 55,
@@ -76,52 +76,52 @@
   ],
   "data_date_range": {
     "min": "2021-04-26",
-    "max": "2026-07-24"
+    "max": "2026-07-31"
   },
   "train_metrics": {
-    "n_train": 248738,
-    "n_val": 27763,
-    "best_iteration": 190,
-    "train_auc": 0.8252909892471093,
-    "valid_auc": 0.8197086584189874,
-    "valid_logloss": 0.5084407472220358
+    "n_train": 249879,
+    "n_val": 27902,
+    "best_iteration": 210,
+    "train_auc": 0.8272052873988274,
+    "valid_auc": 0.8199479791916766,
+    "valid_logloss": 0.5083163984557901
   },
   "calib_metrics": {
     "fit_data_diagnostic": {
-      "n_calib": 231603,
-      "raw_auc": 0.8094331516154425,
-      "calib_auc": 0.8096623522385996,
-      "raw_logloss": 0.5197715038770212,
-      "calib_logloss": 0.5191761071989182,
+      "n_calib": 232883,
+      "raw_auc": 0.8095257446574907,
+      "calib_auc": 0.8097543355135055,
+      "raw_logloss": 0.519653707483887,
+      "calib_logloss": 0.51905630418857,
       "note": "in-sample (fit data 上の診断値)。honest 評価値として引用しないこと。校正性能の評価指標は honest_split を見ること。"
     },
     "honest_split": {
       "cutoff": "2024-04",
       "n_calib": 103360,
-      "n_eval": 128243,
-      "raw_auc": 0.8155208058714244,
-      "calib_auc": 0.8153995690357068,
-      "raw_logloss": 0.512753583121731,
-      "calib_logloss": 0.5168519845472819,
+      "n_eval": 129523,
+      "raw_auc": 0.8156267943834272,
+      "calib_auc": 0.8155072876960977,
+      "raw_logloss": 0.5126111386226422,
+      "calib_logloss": 0.5166654674605523,
       "note": "honest: fit on test_month < 2024-04, eval on test_month >= 2024-04"
     },
-    "n_calib": 231603,
-    "raw_auc": 0.8094331516154425,
-    "calib_auc": 0.8096623522385996,
-    "raw_logloss": 0.5197715038770212,
-    "calib_logloss": 0.5191761071989182,
+    "n_calib": 232883,
+    "raw_auc": 0.8095257446574907,
+    "calib_auc": 0.8097543355135055,
+    "raw_logloss": 0.519653707483887,
+    "calib_logloss": 0.51905630418857,
     "_legacy_keys_note": "n_calib/raw_auc/calib_auc/raw_logloss/calib_logloss は in-sample 値で 後方互換のため残置。新しいコードは fit_data_diagnostic か honest_split を参照。"
   },
   "quality_gate_verdict": "OK",
-  "adoption_reason": "同一val 公平比較: 候補0.8197 vs 現役0.8195 (diff=+0.0002, 許容-0.003)",
+  "adoption_reason": "同一val 公平比較: 候補0.8199 vs 現役0.8195 (diff=+0.0004, 許容-0.003)",
   "roi_gate": {
     "verdict": "OK",
-    "reason": "dROI=-0.00pt (champ 73.5% -> cand 73.5%), 95%CI [-1.26, +1.22], n_bets=3805",
+    "reason": "dROI=+0.36pt (champ 73.5% -> cand 73.9%), 95%CI [-1.00, +1.84], n_bets=3827",
     "roi_champion": 73.53,
-    "roi_candidate": 73.52,
-    "roi_delta_pt": -0.0,
-    "roi_ci_low": -1.26,
-    "roi_ci_high": 1.22,
-    "n_bets": 3805
+    "roi_candidate": 73.89,
+    "roi_delta_pt": 0.36,
+    "roi_ci_low": -1.0,
+    "roi_ci_high": 1.84,
+    "n_bets": 3827
   }
 }
