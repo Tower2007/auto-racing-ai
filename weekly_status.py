@@ -107,6 +107,7 @@ def get_recent_days_status(days: int) -> list[dict]:
     df["race_date"] = pd.to_datetime(df["race_date"]).dt.date.astype(str)
 
     today = dt.date.today()
+    today_iso = today.isoformat()
     result = []
     for i in range(1, days + 1):
         d = (today - dt.timedelta(days=i)).isoformat()
@@ -121,6 +122,11 @@ def get_recent_days_status(days: int) -> list[dict]:
             "race_count": total_races,
             "per_venue": per_venue,
             "status": "OK" if total_races > 0 else "NO DATA",
+            # 進行中 (結果未確定) の日は総合判定と OK n/m 日の分母から外す。
+            # range(1, days+1) は前日起点なので通常は常に False だが、集計範囲を
+            # 変えたときに「当日を欠損として数える」事故が起きないよう明示する
+            # (2026-08-05 統合監視 P1)。
+            "in_progress": d >= today_iso,
         })
     result.reverse()  # 古い順に
     return result
@@ -611,8 +617,11 @@ def render_3point_html(tp: dict) -> str:
         f'{tp["stop_reason"]} → RT3 購入停止 (複勝継続)。'
         f'再開は data/rt3_stop.flag 削除。</p>' if tp.get("triggered") else "")
     return (
-        '<h4 style="margin:14px 0 4px 0; font-size:13px;">'
-        '🎯 三連系まとめ買い 停止基準監視 (現役スコープ rt3+rf3)</h4>'
+        # 本文の独立セクション (plaintext では 【】 見出し) なので h3。
+        # 以前は h4 で、直前の「三連系実弾 判定指標」(h3) の小見出しに
+        # 見える階層のずれがあった (2026-08-05 P2 点検)。
+        '<h3 style="color:#444; margin:18px 0 8px 0;">'
+        '🎯 三連系まとめ買い 停止基準監視 (現役スコープ rt3+rf3)</h3>'
         + flag_banner
         + f'<p style="margin:2px 0; font-size:12px;">'
         f'n={tp["n_picks"]} / 投資 ¥{tp["invest"]:,} / 払戻 ¥{tp["payout"]:,} '
@@ -1018,6 +1027,109 @@ def _health_reason(bh: dict, st: dict, ehi: dict | None = None,
     return ""
 
 
+# ─── 総合状態の単一判定 (2026-08-05 統合監視指摘 P1) ────────────────────
+# 従来は「件名」「HTML 本文ヘッダ」「死活監視セクション」がそれぞれ別ロジックで
+# 状態を出しており、受信箱で件名 🟡WARN / 本文 🟢正常 のような矛盾が起きていた。
+#   - 件名   : max(ingest_status, _overall_health(bh, st, ehi))  ← ng/mf を無視
+#   - 本文h2 : overall_ok = (fail_count <= 1 and not errors)     ← health を無視
+# ここで一元化し、件名・HTML 本文・plaintext の全てが同じ dict から状態を取る。
+# 判定条件は本文末尾の「判定基準」ブロックにも同じ文言で出す。
+INGEST_WARN_NODATA_DAYS = 4   # NO_DATA がこの日数以上で収集 WARN (従来と同値)
+_LEVEL_RANK = {"OK": 0, "WARN": 1, "NG": 2}
+STATUS_MARK = {"OK": "🟢", "WARN": "🟡", "NG": "🔴"}
+STATUS_COLOR = {"OK": "#2e7d32", "WARN": "#e65100", "NG": "#c62828"}
+
+OVERALL_CRITERIA = [
+    "🔴 NG: daily_ingest ログにエラー行がある、または死活監視 "
+    "(bet_history / schtasks / EHI / ngrok / モデル鮮度) のいずれかが NG",
+    f"🟡 WARN: 収集 NO_DATA 日が {INGEST_WARN_NODATA_DAYS} 日以上、"
+    "または死活監視のいずれかが WARN (死活監視が例外で判定不能な場合も WARN)",
+    "🟢 OK: 上記いずれにも該当しない",
+    "※ 当日は結果が未確定のため集計対象外 (直近 N 日は前日起点で数える)。"
+    "「OK n/m日」の分母 m も確定した日だけを数える",
+    "※ 🛑RT3 タグは総合状態とは独立の購入停止フラグ (件名・本文の両方に出す)",
+]
+
+
+def compute_overall_status(days: list[dict], errors: list[str],
+                           bh: dict, st: dict, ehi: dict | None = None,
+                           ng: dict | None = None, mf: dict | None = None,
+                           tp: dict | None = None) -> dict:
+    """週次メールの総合状態を1箇所で決める (件名・本文の唯一の情報源)。
+
+    返り値: {level, mark, label, color, badge, detail, rt3_tag,
+             ingest, health, health_reason,
+             n_ok_days, n_total_days, n_nodata_days, n_errors, n_inprogress}
+      level : "OK" | "WARN" | "NG"  (収集と死活監視の **悪い方**)
+      mark  : 🟢 / 🟡 / 🔴          (件名・本文で共通利用)
+      badge : mark + label ("🟡WARN")。件名と本文ヘッダはこの文字列を共有する。
+
+    進行中の日 (in_progress=True) は結果が未確定なので、判定からも
+    「OK n/m日」の分母からも除外する。除外しないと全て正常でも
+    「OK 6/7日」と表示され、受信者が欠損と誤読する (keirin で実際に発生)。
+    auto-racing では get_recent_days_status が前日起点なので通常 0 件だが、
+    集計範囲を変えたときに黙って壊れないよう明示的に除外しておく。
+    """
+    n_inprogress = sum(1 for d in days if d.get("in_progress"))
+    settled = [d for d in days if not d.get("in_progress")]
+    n_total = len(settled)
+    n_ok = sum(1 for d in settled if d["status"] == "OK")
+    n_nodata = n_total - n_ok
+
+    if errors:
+        ingest = "NG"
+    elif n_nodata >= INGEST_WARN_NODATA_DAYS:
+        ingest = "WARN"
+    else:
+        ingest = "OK"
+
+    # 死活監視: 材料が 1 つも取れていない/例外時は「判定不能」= WARN 扱い。
+    # 旧実装は "?" (❔) という第 4 の状態を作っていたが、3 段階に寄せる。
+    health_reason = ""
+    if bh or st or ehi or ng or mf:
+        try:
+            health = _overall_health(bh or {}, st or {}, ehi, ng, mf)
+            health_reason = _health_reason(bh or {}, st or {}, ehi, ng, mf)
+        except Exception as e:  # noqa: BLE001
+            health, health_reason = "WARN", f"死活監視 判定失敗: {e}"
+    else:
+        health, health_reason = "WARN", "死活監視 判定不能 (材料なし)"
+
+    level = max((ingest, health), key=lambda s: _LEVEL_RANK.get(s, 1))
+
+    # RT3 購入停止は総合状態とは独立のフラグ (件名・本文で同じ文字列を使う)
+    tp = tp or {}
+    if (tp.get("backstop") or {}).get("newly_triggered"):
+        rt3_tag = "🛑RT3全場バックストップ発動"
+    elif tp.get("triggered"):
+        rt3_tag = "🛑RT3停止"
+    elif tp.get("flag_exists") or (tp.get("backstop") or {}).get("active"):
+        rt3_tag = "🛑RT3停止中"
+    else:
+        rt3_tag = ""
+
+    detail = f"ingest {ingest} {n_ok}/{n_total}日"
+    detail += f" / health: {health_reason}" if health_reason else f" / health {health}"
+
+    return {
+        "level": level,
+        "mark": STATUS_MARK.get(level, "🟡"),
+        "label": level,
+        "badge": f"{STATUS_MARK.get(level, '🟡')}{level}",
+        "color": STATUS_COLOR.get(level, "#e65100"),
+        "detail": detail,
+        "rt3_tag": rt3_tag,
+        "ingest": ingest,
+        "health": health,
+        "health_reason": health_reason,
+        "n_ok_days": n_ok,
+        "n_total_days": n_total,
+        "n_nodata_days": n_nodata,
+        "n_errors": len(errors),
+        "n_inprogress": n_inprogress,
+    }
+
+
 def render_health_text(bh: dict, st: dict, ehi: dict | None = None,
                        ng: dict | None = None, mf: dict | None = None) -> str:
     lines = []
@@ -1326,11 +1438,35 @@ MISSING_MARK = "—"
 #  死活監視・実購入損益等が連結され、本文の途中にフッタが挟まっていた)。
 TEXT_FOOTER = "-- auto-racing-ai daily ingest watchdog --"
 
+# セル基本スタイル (属性形ではなく宣言のみ。td() が単一 style= に合成する)
+_TD_BASE = "padding:6px 10px; border:1px solid #ddd;"
 
-def render_text(summary: dict, days: list[dict], errors: list[str]) -> str:
+
+def td(content, align: str = "left", extra: str = "") -> str:
+    """<td> を生成。基本 style と条件付き style を **単一の style 属性** に合成する。
+
+    2026-08-03 修正 (P3): 従来は f'<td {TD_R} style="...">' と書いたため
+    style 属性が 2 回出力され、HTML は先勝ちで後を捨てるため
+    「非開催を灰色」「合計を緑の太字」という条件色が全て無効化されていた。
+    email クライアント (Gmail 等) は <head><style> を剥がすことがあるため、
+    class 方式ではなく inline style の合成で対応する。
+    セル生成をこの関数に集約することで style= の二重出力が構造的に起こらない。
+    検出: grep -c 'style="[^"]*"\\s*style="' <出力HTML> が 0 になること。
+    """
+    style = f"text-align:{align}; {_TD_BASE}"
+    if extra:
+        style = f"{style} {extra.strip()}"
+    return f'<td style="{style}">{content}</td>'
+
+
+def render_text(summary: dict, days: list[dict], errors: list[str],
+                overall: dict) -> str:
     lines = []
     today = dt.date.today().isoformat()
     lines.append(f"📊 auto-racing-ai 週次ステータス ({today})")
+    # 総合状態は件名・HTML と同一の compute_overall_status から取る (P1)
+    lines.append(f"総合状態: {overall['badge']} ({overall['detail']})"
+                 + (f" {overall['rt3_tag']}" if overall["rt3_tag"] else ""))
     lines.append("=" * 60)
     lines.append("")
     lines.append("【データサマリー】")
@@ -1340,9 +1476,11 @@ def render_text(summary: dict, days: list[dict], errors: list[str]) -> str:
     lines.append(f"  期間: {summary['oldest_date']} 〜 {summary['latest_date']}")
     lines.append("")
 
-    ok_count = sum(1 for d in days if d["status"] == "OK")
-    fail_count = len(days) - ok_count
-    lines.append(f"【直近{len(days)}日の収集状況】 OK={ok_count} / NO_DATA={fail_count}")
+    ok_count = overall["n_ok_days"]
+    fail_count = overall["n_nodata_days"]
+    lines.append(f"【直近{len(days)}日の収集状況】 OK={ok_count} / NO_DATA={fail_count}"
+                 + (f" / 進行中={overall['n_inprogress']} (判定対象外)"
+                    if overall["n_inprogress"] else ""))
     header = f"  {'date':12s}" + "".join(f" {n:>4s}" for n in VENUE_NAMES.values()) + " 計"
     lines.append(header)
     for d in days:
@@ -1367,13 +1505,18 @@ def render_text(summary: dict, days: list[dict], errors: list[str]) -> str:
     return "\n".join(lines)
 
 
-def render_html(summary: dict, days: list[dict], errors: list[str]) -> str:
-    """Email クライアント(Gmail 等)で剥がされない inline-style 版。"""
+def render_html(summary: dict, days: list[dict], errors: list[str],
+                overall: dict) -> str:
+    """Email クライアント(Gmail 等)で剥がされない inline-style 版。
+
+    ヘッダの状態バッジは compute_overall_status の結果のみを使う
+    (件名と同一の文字列。2026-08-05 統合監視 P1: 以前は
+     overall_ok = fail_count<=1 and not errors という別ロジックで
+     「🟢 正常」を出しており、死活監視 WARN の週に件名 🟡 / 本文 🟢 と矛盾した)。
+    """
     today = dt.date.today().isoformat()
-    ok_count = sum(1 for d in days if d["status"] == "OK")
-    fail_count = len(days) - ok_count
-    overall_ok = (fail_count <= 1 and not errors)
-    status_badge = ("🟢 正常" if overall_ok else "🟡 要確認" if fail_count <= 3 else "🔴 異常")
+    ok_count = overall["n_ok_days"]
+    fail_count = overall["n_nodata_days"]
 
     # 共通スタイル(全部インライン)
     TBL = ('border="1" cellpadding="6" cellspacing="0" '
@@ -1383,32 +1526,26 @@ def render_html(summary: dict, days: list[dict], errors: list[str]) -> str:
           'font-weight:bold; border:1px solid #bbb;"')
     TH_R = ('style="background:#e8e8e8; text-align:right; padding:6px 10px; '
             'font-weight:bold; border:1px solid #bbb;"')
-    TD_L = 'style="text-align:left; padding:6px 10px; border:1px solid #ddd;"'
-    TD_R = 'style="text-align:right; padding:6px 10px; border:1px solid #ddd;"'
+    # <td> は必ずモジュール関数 td() で作る (style= 二重出力を構造的に防ぐ、P3)
     ROW_ALT = 'style="background:#fafafa;"'
-
-    def _td(content, align: str = "left", extra: str = "") -> str:
-        """<td> を生成。基本 style と条件 style を **1 つの style 属性** に統合。
-
-        2026-08-03 修正 (P1): 従来は f'<td {TD_R} style="...">' と書いたため
-        style 属性が 2 回出力され、HTML 仕様上 最初の 1 つだけが採用されて
-        「非開催を灰色」「合計を緑の太字」という条件色が全て無効化されていた。
-        email クライアント (Gmail 等) は <head><style> を剥がすことがあるため、
-        class 方式ではなく inline style のマージで対応する。
-        """
-        style = f"text-align:{align}; padding:6px 10px; border:1px solid #ddd;"
-        if extra:
-            style = f"{style} {extra.strip()}"
-        return f'<td style="{style}">{content}</td>'
 
     parts = []
     parts.append(
         '<div style="font-family:Arial,sans-serif; font-size:14px; color:#222; line-height:1.55; max-width:720px;">'
     )
     parts.append(
-        f'<h2 style="color:#c62828; margin:0 0 12px 0; padding-bottom:6px; border-bottom:2px solid #c62828;">'
+        f'<h2 style="color:{overall["color"]}; margin:0 0 12px 0; padding-bottom:6px; '
+        f'border-bottom:2px solid {overall["color"]};">'
         f'📊 auto-racing-ai 週次ステータス &nbsp; <span style="color:#222; font-weight:normal;">{today}</span> '
-        f'&nbsp; <span style="font-weight:normal;">{status_badge}</span></h2>'
+        f'&nbsp; <span style="font-weight:normal;">{overall["badge"]}</span></h2>'
+    )
+    parts.append(
+        f'<p style="margin:0 0 12px 0; color:#555;">{overall["detail"]}'
+        + (f' &nbsp;|&nbsp; <b style="color:#c62828;">{overall["rt3_tag"]}</b>'
+           if overall["rt3_tag"] else "")
+        + (f' &nbsp;|&nbsp; 進行中 <b>{overall["n_inprogress"]}</b>日 (判定対象外)'
+           if overall["n_inprogress"] else "")
+        + '</p>'
     )
 
     # データサマリー
@@ -1417,14 +1554,15 @@ def render_html(summary: dict, days: list[dict], errors: list[str]) -> str:
     parts.append(f'<tr><th {TH}>ファイル</th><th {TH_R}>行数</th></tr>')
     for i, (f, c) in enumerate(summary["counts"].items()):
         alt = ROW_ALT if i % 2 == 1 else ""
-        parts.append(f'<tr {alt}><td {TD_L}>{f}</td><td {TD_R}>{c:,}</td></tr>')
+        parts.append(f'<tr {alt}>{td(f)}{td(f"{c:,}", "right")}</tr>')
     parts.append(
-        f'<tr {ROW_ALT}><td {TD_L}><b>合計サイズ</b></td>'
-        f'<td {TD_R}><b>{summary["total_size_mb"]:.1f} MB</b></td></tr>'
+        f'<tr {ROW_ALT}>{td("<b>合計サイズ</b>")}'
+        + td(f'<b>{summary["total_size_mb"]:.1f} MB</b>', "right") + '</tr>'
     )
     parts.append(
-        f'<tr><td {TD_L}><b>期間</b></td>'
-        f'<td {TD_R}><b>{summary["oldest_date"]} 〜 {summary["latest_date"]}</b></td></tr>'
+        f'<tr>{td("<b>期間</b>")}'
+        + td(f'<b>{summary["oldest_date"]} 〜 {summary["latest_date"]}</b>', "right")
+        + '</tr>'
     )
     parts.append('</table>')
 
@@ -1441,19 +1579,19 @@ def render_html(summary: dict, days: list[dict], errors: list[str]) -> str:
     for i, d in enumerate(days):
         alt = ROW_ALT if i % 2 == 1 else ""
         venue_cells = "".join(
-            _td(d["per_venue"][n], "right") if d["per_venue"][n] > 0
-            else _td(MISSING_MARK, "right", "color:#bbb;")
+            td(d["per_venue"][n], "right") if d["per_venue"][n] > 0
+            else td(MISSING_MARK, "right", "color:#bbb;")
             for n in VENUE_NAMES.values()
         )
         if d["status"] == "OK":
-            total_cell = _td(d["race_count"], "right",
-                             "color:#2e7d32; font-weight:bold;")
-            flag = _td("✅", "center")
+            total_cell = td(d["race_count"], "right",
+                            "color:#2e7d32; font-weight:bold;")
+            flag = td("✅", "center")
         else:
-            total_cell = _td(0, "right", "color:#999;")
-            flag = _td(MISSING_MARK, "center", "color:#999;")
+            total_cell = td(0, "right", "color:#999;")
+            flag = td(MISSING_MARK, "center", "color:#999;")
         parts.append(
-            f'<tr {alt}>{_td(d["date"])}{venue_cells}{total_cell}{flag}</tr>'
+            f'<tr {alt}>{td(d["date"])}{venue_cells}{total_cell}{flag}</tr>'
         )
     parts.append('</table>')
     parts.append(
@@ -1498,6 +1636,28 @@ def _insert_before_footer(html: str, section_html: str) -> str:
     )
 
 
+def render_criteria_text() -> str:
+    """本文末尾の「判定基準」ブロック (plaintext)。HTML と同じ文言を使う。"""
+    lines = ["【判定基準 (件名・本文の総合状態)】",
+             "  件名と本文ヘッダの状態は同一の判定関数 (compute_overall_status) が"
+             "決めており、常に一致する。"]
+    lines += [f"  - {c}" for c in OVERALL_CRITERIA]
+    return "\n".join(lines)
+
+
+def render_criteria_html() -> str:
+    """本文末尾の「判定基準」ブロック (HTML)。plaintext と同じ文言を使う。"""
+    return (
+        '<h3 style="color:#444; margin:18px 0 8px 0;">'
+        '判定基準 (件名・本文の総合状態)</h3>'
+        '<p style="color:#555; margin:0 0 6px 0; font-size:12px;">'
+        '件名と本文ヘッダの状態は同一の判定関数が決めており、常に一致する。</p>'
+        '<ul style="margin:0 0 8px 0; padding-left:20px; color:#555; font-size:12px;">'
+        + "".join(f'<li>{c}</li>' for c in OVERALL_CRITERIA)
+        + '</ul>'
+    )
+
+
 def main() -> None:
     # Windows console (cp932) で絵文字が落ちないようにする
     import sys
@@ -1516,9 +1676,9 @@ def main() -> None:
     log_lines = get_log_tail(500)
     errors = extract_errors(log_lines)
 
-    text = render_text(summary, days, errors)
-    html = render_html(summary, days, errors)
-
+    # ── 総合状態の材料を先に全部そろえる (2026-08-05 統合監視 P1) ──────────
+    # 件名・HTML 本文・plaintext が同じ compute_overall_status の結果を使うため、
+    # レンダリングより先に死活監視と三連系判定を評価しておく。
     # 死活監視(Codex R6 提案: bet_history + schtasks + EHI、
     # Antigravity 2026-05-23 提案: ngrok + model_freshness)
     bh_health: dict = {}
@@ -1526,6 +1686,7 @@ def main() -> None:
     ehi_health: dict | None = None
     ng_health: dict | None = None
     mf_health: dict | None = None
+    health_error: Exception | None = None
     try:
         if _EHI_AVAILABLE:
             ehi_health = calculate_ehi(7)
@@ -1535,15 +1696,34 @@ def main() -> None:
         ng_health = check_ngrok_health(args.days)
         # st_health を渡すことで「再学習未実行」と「連続却下」を区別
         mf_health = check_model_freshness(st_health)
+    except Exception as e:  # noqa: BLE001
+        health_error = e
+
+    # 三連系まとめ買い 停止基準の評価 (セクション出力は本文末尾のまま)
+    tp_health: dict = {}
+    tp_error: Exception | None = None
+    try:
+        tp_health = check_3point_health()
+    except Exception as e:  # noqa: BLE001
+        tp_error = e
+
+    overall = compute_overall_status(
+        days, errors, bh_health, st_health, ehi_health, ng_health, mf_health,
+        tp_health,
+    )
+
+    text = render_text(summary, days, errors, overall)
+    html = render_html(summary, days, errors, overall)
+
+    if health_error is not None:
+        text += f"\n\n(死活監視スキップ: {health_error})"
+    else:
         text += "\n\n" + render_health_text(
             bh_health, st_health, ehi_health, ng_health, mf_health
         )
-        health_html = render_health_html(
+        html = _insert_before_footer(html, render_health_html(
             bh_health, st_health, ehi_health, ng_health, mf_health
-        )
-        html = _insert_before_footer(html, health_html)
-    except Exception as e:
-        text += f"\n\n(死活監視スキップ: {e})"
+        ))
 
     # 全期間累積成績(daily_predict と同じソース・フォーマット)
     try:
@@ -1612,17 +1792,19 @@ def main() -> None:
         text += f"\n\n(三連系判定指標スキップ: {e})"
 
     # 三連系まとめ買い 停止基準監視 + 発動時 kill-switch
-    tp_health: dict = {}
-    try:
-        tp_health = check_3point_health()
+    # (評価自体は overall 算出前に済ませてある。ここは出力とフラグ書き出しのみ)
+    if tp_error is not None:
+        text += f"\n\n(三連系停止基準スキップ: {tp_error})"
+    else:
         text += "\n\n" + render_3point_text(tp_health)
-        tp_html = render_3point_html(tp_health)
-        html = _insert_before_footer(html, tp_html)
+        html = _insert_before_footer(html, render_3point_html(tp_health))
         if tp_health.get("triggered") and not tp_health.get("flag_exists"):
             write_rt3_stop_flag(tp_health.get("stop_reason", "stop"))
             text += "\n  → data/rt3_stop.flag を書き出しました (三連系購入を停止)。"
-    except Exception as e:
-        text += f"\n\n(三連系停止基準スキップ: {e})"
+
+    # 判定基準 (件名と本文が同一関数から出ることを明記、2026-08-05 P1)
+    text += "\n\n" + render_criteria_text()
+    html = _insert_before_footer(html, render_criteria_html())
 
     # フッタは全セクション連結後に 1 回だけ (P2)。
     text += f"\n\n{TEXT_FOOTER}"
@@ -1632,52 +1814,18 @@ def main() -> None:
     if args.no_email:
         return
 
-    today = dt.date.today().isoformat()
-    ok_count = sum(1 for d in days if d["status"] == "OK")
-    fail_count = len(days) - ok_count
-    if errors:
-        ingest_status = "NG"
-    elif fail_count >= 4:
-        ingest_status = "WARN"
-    else:
-        ingest_status = "OK"
-
-    # R9: subject に health overall(bet_history + schtasks + EHI)を反映
-    # 上で計算した bh_health / st_health / ehi_health を再利用
-    health_reason = ""
-    try:
-        if bh_health or st_health or ehi_health:
-            health_overall = _overall_health(bh_health, st_health, ehi_health)
-            health_reason = _health_reason(bh_health, st_health, ehi_health)
-        else:
-            health_overall = "?"
-    except Exception:
-        health_overall = "?"
-    rt3_tag = ""
-    if (tp_health.get("backstop") or {}).get("newly_triggered"):
-        rt3_tag = " 🛑RT3全場バックストップ発動"
-    elif tp_health.get("triggered"):
-        rt3_tag = " 🛑RT3停止"
-    elif (tp_health.get("flag_exists")
-          or (tp_health.get("backstop") or {}).get("active")):
-        rt3_tag = " 🛑RT3停止中"
-    # 件名の総合状態は 1 つだけ (2026-08-03 修正 P4)。
-    # ingest / health の 2 状態を並べると「今どっちなのか」が一目で決まらないため、
-    # **悪い方に寄せた総合状態** を 1 つ出し、括弧内に内訳を書く。
-    # 例: [autorace] 📊 週次 2026-08-03 🟡WARN (ingest OK 7/7 / health: 推奨済み購入なし 1R)
-    _RANK = {"OK": 0, "?": 1, "WARN": 2, "NG": 3}
-    overall = max((ingest_status, health_overall), key=lambda s: _RANK.get(s, 1))
-    overall_emoji = {"OK": "🟢", "WARN": "🟡", "NG": "🔴", "?": "❔"}.get(
-        overall, "❔"
-    )
-    detail = f"ingest {ingest_status} {ok_count}/{len(days)}"
-    detail += (f" / health: {health_reason}" if health_reason
-               else f" / health {health_overall}")
+    # 件名の状態は本文ヘッダと同一の compute_overall_status から取る
+    # (2026-08-05 統合監視 P1: 件名と本文 h2 が別ロジックだった矛盾を解消)。
+    # 書式: [autorace] 📊 週次 <送信日> 🟡WARN (簡潔なサマリ)
+    #   - 日付は集計期間ではなく送信日 1 つ (期間は本文見出しにある)
+    #   - overall["badge"] は本文 h2 / plaintext ヘッダと同じ文字列
+    sent_date = dt.date.today().isoformat()
     subject = (
-        f"[autorace] 📊 週次 {today} {overall_emoji}{overall} ({detail})"
-        f"{rt3_tag}"
+        f"[autorace] 📊 週次 {sent_date} {overall['badge']} ({overall['detail']})"
+        + (f" {overall['rt3_tag']}" if overall["rt3_tag"] else "")
     )
 
+    # 送信成功ログ [mail] sent to <宛先> は gmail_notify.send_email が出す
     send_email(subject=subject, body=text, html=html)
 
 
