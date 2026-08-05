@@ -254,3 +254,7 @@ date,place_code,place_name,race_no,bet_amount,refund_amount,profit
 2026-08-03,2,kawaguchi,7,100,130,30
 2026-08-03,5,iizuka,2,100,0,-100
 2026-08-03,5,iizuka,3,100,0,-100
+2026-08-05,3,isesaki,2,100,140,40
+2026-08-05,3,isesaki,4,200,100,-100
+2026-08-05,3,isesaki,6,200,360,160
+2026-08-05,6,sanyou,5,300,150,-150
