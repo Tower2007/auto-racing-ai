@@ -984,6 +984,40 @@ def _overall_health(bh: dict, st: dict, ehi: dict | None = None,
     return "OK"
 
 
+def _health_reason(bh: dict, st: dict, ehi: dict | None = None,
+                   ng: dict | None = None, mf: dict | None = None) -> str:
+    """_overall_health が OK 以外になった理由を 1 つだけ短く返す (件名の内訳用)。
+
+    判定順は _overall_health と同一。OK / 理由不明なら空文字を返す。
+    """
+    def _first(d: dict | None, level: str) -> str:
+        for lv, msg in (d or {}).get("alerts", []) or []:
+            if lv == level:
+                return str(msg)
+        return ""
+
+    for level in ("NG", "WARN"):
+        if bh.get("status") == level:
+            return _first(bh, level) or f"bet_history {level}"
+        hit = _first(bh, level)
+        if hit:
+            return hit
+        if level == "NG" and ehi and ehi.get("status") == "DANGER":
+            return "EHI DANGER"
+        if level == "WARN" and ehi and ehi.get("status") == "WARNING":
+            return "EHI WARNING"
+        if level == "WARN":
+            if st.get("ng_count", 0) > 0:
+                return f"schtasks NG {st['ng_count']} 件"
+            if st.get("warnings"):
+                return str(st["warnings"][0])
+        for src, tag in ((ng, "ngrok"), (mf, "model")):
+            hit = _first(src, level)
+            if hit:
+                return hit
+    return ""
+
+
 def render_health_text(bh: dict, st: dict, ehi: dict | None = None,
                        ng: dict | None = None, mf: dict | None = None) -> str:
     lines = []
@@ -1282,6 +1316,17 @@ def _append_model_freshness_html(parts: list[str], mf: dict | None) -> None:
             parts.append("</ul>")
 
 
+# 非開催マーク。plaintext / HTML で必ず同じ表記を使う (2026-08-03 修正 P5)。
+# 以前は HTML が "—"、plaintext が "0" で、plaintext 側が
+# 「開催したが 0 レース」と誤読できる状態だった。
+MISSING_MARK = "—"
+
+# plaintext フッタ。**全セクションを連結した後に 1 回だけ** 付ける
+# (2026-08-03 修正 P2: 以前は render_text 内で付けていたため、その後ろに
+#  死活監視・実購入損益等が連結され、本文の途中にフッタが挟まっていた)。
+TEXT_FOOTER = "-- auto-racing-ai daily ingest watchdog --"
+
+
 def render_text(summary: dict, days: list[dict], errors: list[str]) -> str:
     lines = []
     today = dt.date.today().isoformat()
@@ -1301,9 +1346,15 @@ def render_text(summary: dict, days: list[dict], errors: list[str]) -> str:
     header = f"  {'date':12s}" + "".join(f" {n:>4s}" for n in VENUE_NAMES.values()) + " 計"
     lines.append(header)
     for d in days:
-        v_str = "".join(f" {d['per_venue'][n]:>4d}" for n in VENUE_NAMES.values())
-        flag = "✅" if d["status"] == "OK" else "—"
+        # 非開催 (0 レース) は HTML と同じ "—" 表記に揃える (P5)
+        v_str = "".join(
+            f" {d['per_venue'][n]:>4d}" if d["per_venue"][n] > 0
+            else f" {MISSING_MARK:>4s}"
+            for n in VENUE_NAMES.values()
+        )
+        flag = "✅" if d["status"] == "OK" else MISSING_MARK
         lines.append(f"  {d['date']} {v_str} {d['race_count']:>3d} {flag}")
+    lines.append(f"  ({MISSING_MARK} = 非開催)")
     lines.append("")
 
     if errors:
@@ -1312,8 +1363,7 @@ def render_text(summary: dict, days: list[dict], errors: list[str]) -> str:
             lines.append(f"  {e}")
     else:
         lines.append("【エラー】 なし ✅")
-    lines.append("")
-    lines.append("-- auto-racing-ai daily ingest watchdog --")
+    # フッタはここでは付けない (main() が全セクション連結後に 1 回だけ付ける)
     return "\n".join(lines)
 
 
@@ -1336,6 +1386,20 @@ def render_html(summary: dict, days: list[dict], errors: list[str]) -> str:
     TD_L = 'style="text-align:left; padding:6px 10px; border:1px solid #ddd;"'
     TD_R = 'style="text-align:right; padding:6px 10px; border:1px solid #ddd;"'
     ROW_ALT = 'style="background:#fafafa;"'
+
+    def _td(content, align: str = "left", extra: str = "") -> str:
+        """<td> を生成。基本 style と条件 style を **1 つの style 属性** に統合。
+
+        2026-08-03 修正 (P1): 従来は f'<td {TD_R} style="...">' と書いたため
+        style 属性が 2 回出力され、HTML 仕様上 最初の 1 つだけが採用されて
+        「非開催を灰色」「合計を緑の太字」という条件色が全て無効化されていた。
+        email クライアント (Gmail 等) は <head><style> を剥がすことがあるため、
+        class 方式ではなく inline style のマージで対応する。
+        """
+        style = f"text-align:{align}; padding:6px 10px; border:1px solid #ddd;"
+        if extra:
+            style = f"{style} {extra.strip()}"
+        return f'<td style="{style}">{content}</td>'
 
     parts = []
     parts.append(
@@ -1377,18 +1441,25 @@ def render_html(summary: dict, days: list[dict], errors: list[str]) -> str:
     for i, d in enumerate(days):
         alt = ROW_ALT if i % 2 == 1 else ""
         venue_cells = "".join(
-            f'<td {TD_R}>{d["per_venue"][n]}</td>' if d["per_venue"][n] > 0
-            else f'<td {TD_R} style="text-align:right; padding:6px 10px; border:1px solid #ddd; color:#bbb;">—</td>'
+            _td(d["per_venue"][n], "right") if d["per_venue"][n] > 0
+            else _td(MISSING_MARK, "right", "color:#bbb;")
             for n in VENUE_NAMES.values()
         )
         if d["status"] == "OK":
-            total_cell = f'<td {TD_R} style="text-align:right; padding:6px 10px; border:1px solid #ddd; color:#2e7d32; font-weight:bold;">{d["race_count"]}</td>'
-            flag = '<td {} style="text-align:center; padding:6px 10px; border:1px solid #ddd;">✅</td>'.format(TD_L.replace('style="', 'style="text-align:center; '))
+            total_cell = _td(d["race_count"], "right",
+                             "color:#2e7d32; font-weight:bold;")
+            flag = _td("✅", "center")
         else:
-            total_cell = f'<td {TD_R} style="text-align:right; padding:6px 10px; border:1px solid #ddd; color:#999;">0</td>'
-            flag = f'<td {TD_L} style="text-align:center; padding:6px 10px; border:1px solid #ddd; color:#999;">—</td>'
-        parts.append(f'<tr {alt}><td {TD_L}>{d["date"]}</td>{venue_cells}{total_cell}{flag}</tr>')
+            total_cell = _td(0, "right", "color:#999;")
+            flag = _td(MISSING_MARK, "center", "color:#999;")
+        parts.append(
+            f'<tr {alt}>{_td(d["date"])}{venue_cells}{total_cell}{flag}</tr>'
+        )
     parts.append('</table>')
+    parts.append(
+        f'<p style="margin:4px 0 0 0; color:#777; font-size:11px;">'
+        f'{MISSING_MARK} = 非開催</p>'
+    )
 
     # エラー
     if errors:
@@ -1553,6 +1624,9 @@ def main() -> None:
     except Exception as e:
         text += f"\n\n(三連系停止基準スキップ: {e})"
 
+    # フッタは全セクション連結後に 1 回だけ (P2)。
+    text += f"\n\n{TEXT_FOOTER}"
+
     print(text)
 
     if args.no_email:
@@ -1562,24 +1636,23 @@ def main() -> None:
     ok_count = sum(1 for d in days if d["status"] == "OK")
     fail_count = len(days) - ok_count
     if errors:
-        ingest_status = "🔴NG"
+        ingest_status = "NG"
     elif fail_count >= 4:
-        ingest_status = "🟡WARN"
+        ingest_status = "WARN"
     else:
-        ingest_status = "🟢OK"
+        ingest_status = "OK"
 
     # R9: subject に health overall(bet_history + schtasks + EHI)を反映
     # 上で計算した bh_health / st_health / ehi_health を再利用
+    health_reason = ""
     try:
         if bh_health or st_health or ehi_health:
             health_overall = _overall_health(bh_health, st_health, ehi_health)
+            health_reason = _health_reason(bh_health, st_health, ehi_health)
         else:
             health_overall = "?"
     except Exception:
         health_overall = "?"
-    health_emoji = {"OK": "🟢", "WARN": "🟡", "NG": "🔴", "?": "❔"}.get(
-        health_overall, "❔"
-    )
     rt3_tag = ""
     if (tp_health.get("backstop") or {}).get("newly_triggered"):
         rt3_tag = " 🛑RT3全場バックストップ発動"
@@ -1588,9 +1661,20 @@ def main() -> None:
     elif (tp_health.get("flag_exists")
           or (tp_health.get("backstop") or {}).get("active")):
         rt3_tag = " 🛑RT3停止中"
+    # 件名の総合状態は 1 つだけ (2026-08-03 修正 P4)。
+    # ingest / health の 2 状態を並べると「今どっちなのか」が一目で決まらないため、
+    # **悪い方に寄せた総合状態** を 1 つ出し、括弧内に内訳を書く。
+    # 例: [autorace] 📊 週次 2026-08-03 🟡WARN (ingest OK 7/7 / health: 推奨済み購入なし 1R)
+    _RANK = {"OK": 0, "?": 1, "WARN": 2, "NG": 3}
+    overall = max((ingest_status, health_overall), key=lambda s: _RANK.get(s, 1))
+    overall_emoji = {"OK": "🟢", "WARN": "🟡", "NG": "🔴", "?": "❔"}.get(
+        overall, "❔"
+    )
+    detail = f"ingest {ingest_status} {ok_count}/{len(days)}"
+    detail += (f" / health: {health_reason}" if health_reason
+               else f" / health {health_overall}")
     subject = (
-        f"[autorace] 週次 {today} ingest={ingest_status} "
-        f"health={health_emoji}{health_overall} (OK {ok_count}/{len(days)})"
+        f"[autorace] 📊 週次 {today} {overall_emoji}{overall} ({detail})"
         f"{rt3_tag}"
     )
 

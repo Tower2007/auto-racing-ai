@@ -38,6 +38,17 @@ SANREN_DECISION_MIN_N = 100         # 判定に必要な最小 R 数 (事前固�
 SANREN_DECISION_ROI = 120.0         # 維持すべき ROI 下限 % (事前固定)
 
 
+def yen(v: float | int, width: int = 0, signed: bool = False) -> str:
+    """金額を **¥ 前置** で表記する (2026-08-03 週次メール仕様 P3)。
+
+    以前は「投資 ¥4,200 / 損益 -790 円」のように ¥ 前置と 円 後置が同一表内で
+    混在していた。以後は ¥ 前置に統一する (例: ¥-790 / ¥+50)。
+    width を指定すると右詰めで桁揃えする (等幅 plaintext 用)。
+    """
+    s = f"¥{int(v):+,}" if signed else f"¥{int(v):,}"
+    return f"{s:>{width}}" if width else s
+
+
 def load_summary() -> pd.DataFrame | None:
     """bet_history.csv (R 単位) を読み、無ければ None。"""
     if not SUMMARY_CSV.exists():
@@ -204,14 +215,16 @@ def render_sanren_text(alltime: dict, recent: dict, days: int,
              f"  判定基準 (2026-07-26): 100R / ROI>120% を維持できるか"]
     lines.append(
         f"  全期間: {alltime['n']:>3d} R / 的中 {alltime['hits']:>3d} "
-        f"({alltime['hit_rate']:>4.1f}%) / 投資 ¥{alltime['bet']:>7,} / "
-        f"払戻 ¥{alltime['refund']:>7,} / 損益 {alltime['profit']:>+8,} 円 / "
+        f"({alltime['hit_rate']:>4.1f}%) / 投資 {yen(alltime['bet'], 8)} / "
+        f"払戻 {yen(alltime['refund'], 8)} / "
+        f"損益 {yen(alltime['profit'], 9, signed=True)} / "
         f"ROI {alltime['roi']:>5.1f}%"
     )
     lines.append(
         f"  直近{days}日: {recent['n']:>3d} R / 的中 {recent['hits']:>3d} "
-        f"({recent['hit_rate']:>4.1f}%) / 投資 ¥{recent['bet']:>7,} / "
-        f"払戻 ¥{recent['refund']:>7,} / 損益 {recent['profit']:>+8,} 円 / "
+        f"({recent['hit_rate']:>4.1f}%) / 投資 {yen(recent['bet'], 8)} / "
+        f"払戻 {yen(recent['refund'], 8)} / "
+        f"損益 {yen(recent['profit'], 9, signed=True)} / "
         f"ROI {recent['roi']:>5.1f}%"
     )
     lines.append(f"  判定: {mark} {verdict}")
@@ -221,7 +234,7 @@ def render_sanren_text(alltime: dict, recent: dict, days: int,
         for r in cum:
             lines.append(
                 f"    {r['date']:12s} {r['n']:>3d} {r['cum_n']:>5d} "
-                f"{r['cum_roi']:>6.1f}% {r['cum_profit']:>+8,}円"
+                f"{r['cum_roi']:>6.1f}% {yen(r['cum_profit'], 9, signed=True)}"
             )
     return "\n".join(lines)
 
@@ -243,7 +256,8 @@ def render_sanren_html(alltime: dict, recent: dict, days: int,
     def _profit(p: int) -> str:
         c = "#2e7d32" if p > 0 else ("#c62828" if p < 0 else "#444")
         return (f'<td style="text-align:right; padding:6px 10px; '
-                f'border:1px solid #ddd; color:{c}; font-weight:bold;">{p:+,} 円</td>')
+                f'border:1px solid #ddd; color:{c}; font-weight:bold;">'
+                f'{yen(p, signed=True)}</td>')
 
     def _roi(roi: float) -> str:
         c = "#2e7d32" if roi >= SANREN_DECISION_ROI else "#c62828"
@@ -327,8 +341,9 @@ def render_text(days: int, recent: dict, venues: list[dict],
     # ① 直近 N 日 全体
     lines.append(
         f"  直近{days}日: {recent['n']:>3d} R / "
-        f"投資 ¥{recent['bet']:>7,} / 払戻 ¥{recent['refund']:>7,} / "
-        f"損益 {recent['profit']:>+8,} 円 / ROI {recent['roi']:>5.1f}%"
+        f"投資 {yen(recent['bet'], 8)} / 払戻 {yen(recent['refund'], 8)} / "
+        f"損益 {yen(recent['profit'], 9, signed=True)} / "
+        f"ROI {recent['roi']:>5.1f}%"
     )
     lines.append("")
 
@@ -338,8 +353,9 @@ def render_text(days: int, recent: dict, venues: list[dict],
         lines.append(f"  {'場':6s} {'R':>3s} {'投資':>9s} {'払戻':>9s} {'損益':>10s} {'ROI':>6s}")
         for v in venues:
             lines.append(
-                f"  {v['place_name']:6s} {v['n']:>3d} ¥{v['bet']:>7,} ¥{v['refund']:>7,} "
-                f"{v['profit']:>+8,}円 {v['roi']:>5.1f}%"
+                f"  {v['place_name']:6s} {v['n']:>3d} "
+                f"{yen(v['bet'], 8)} {yen(v['refund'], 8)} "
+                f"{yen(v['profit'], 9, signed=True)} {v['roi']:>5.1f}%"
             )
         lines.append("")
 
@@ -349,16 +365,18 @@ def render_text(days: int, recent: dict, venues: list[dict],
         lines.append(f"  {'券種':10s} {'件':>3s} {'投資':>9s} {'払戻':>9s} {'損益':>10s} {'ROI':>6s}")
         for b in bet_types:
             lines.append(
-                f"  {b['bet_type_label']:10s} {b['n']:>3d} ¥{b['bet']:>7,} ¥{b['refund']:>7,} "
-                f"{b['profit']:>+8,}円 {b['roi']:>5.1f}%"
+                f"  {b['bet_type_label']:10s} {b['n']:>3d} "
+                f"{yen(b['bet'], 8)} {yen(b['refund'], 8)} "
+                f"{yen(b['profit'], 9, signed=True)} {b['roi']:>5.1f}%"
             )
         lines.append("")
 
     # ④ 全期間
     lines.append(
         f"  全期間 ({alltime_label}): {alltime['n']:>3d} R / "
-        f"投資 ¥{alltime['bet']:>7,} / 払戻 ¥{alltime['refund']:>7,} / "
-        f"損益 {alltime['profit']:>+8,} 円 / ROI {alltime['roi']:>5.1f}%"
+        f"投資 {yen(alltime['bet'], 8)} / 払戻 {yen(alltime['refund'], 8)} / "
+        f"損益 {yen(alltime['profit'], 9, signed=True)} / "
+        f"ROI {alltime['roi']:>5.1f}%"
     )
     return "\n".join(lines)
 
@@ -381,7 +399,7 @@ def render_html(days: int, recent: dict, venues: list[dict],
         color = "#2e7d32" if p > 0 else ("#c62828" if p < 0 else "#444")
         return (f'<td style="text-align:right; padding:6px 10px; '
                 f'border:1px solid #ddd; color:{color}; font-weight:bold;">'
-                f'{p:+,} 円</td>')
+                f'{yen(p, signed=True)}</td>')
 
     def _roi_cell(roi: float) -> str:
         color = "#2e7d32" if roi >= 100 else "#c62828"
