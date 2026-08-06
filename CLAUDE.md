@@ -112,7 +112,7 @@ reports/               # 各種分析レポート(commit 対象)
 #### 旧 fixed-slot 方式(参考、2026-04-30 まで)
 朝 10:00 / 昼 13:00 / 夕 17:00 の 3 固定 task で `--time-slot` フィルタ。
 - 問題: 09:00 はオッズ未公開 → 10:00 に変更 → それでも morning slot 後半 R(11:00–13:00 開始)で odds 薄く NaN → 取りこぼし発生
-- 動的方式に置換。`AutoraceMorningPredict` / `NoonPredict` / `EveningPredict` は 動的稼働確認後に disable / 削除予定
+- 動的方式に置換。`AutoraceMorningPredict` / `NoonPredict` / `EveningPredict` は disable を経て **2026-08-06 に削除済み** (3 つとも Disabled のまま 3 ヶ月無発火を確認の上で schtasks /Delete)
 
 戦略仕様: `docs/ev_strategy_findings.md` 参照(thr=1.50、中間モデル、複勝 top-1)。
 EV 閾値は 2026-05-31 の `scripts/ev_threshold_sweep.py` (walk-forward 25ヶ月) で
