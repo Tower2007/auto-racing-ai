@@ -22,7 +22,13 @@ EV 乖離分析 / AI 振り返り (API 無ければテンプレ) / MD レポー�
   python night_report.py             # 集計 + MD/反省保存 + メール送信
   python night_report.py --dry-run   # 送信せず本文表示 (保存もしない)
   python night_report.py --no-email  # 保存はするが送信しない
-タスク: AutoraceNightReport 毎日 22:00 (scripts/run_night_report_hidden.vbs)
+タスク: AutoraceNightReport 毎日 00:00 (scripts/run_night_report_hidden.vbs)
+
+対象日の決定 (2026-08-08 変更): 22:00 実行では山陽ミッドナイト (〜23:50) の
+発注が報告から漏れる (8/7 に 22:42/23:08 の 2 発が実際に漏れた) ため、
+全レース確定後の 00:00 実行に変更。日付が跨いでいるので、実行時刻が
+正午より前なら「前日」をレポート対象にする (00:00 発火 → 直前に終わった
+開催日を報告)。--date 指定時はそちらが優先。
 """
 
 from __future__ import annotations
@@ -751,7 +757,13 @@ def main() -> int:
                     help="MD/反省は保存するが送信しない")
     args = ap.parse_args()
 
-    today_str = args.date or dt.date.today().isoformat()
+    if args.date:
+        today_str = args.date
+    else:
+        now = dt.datetime.now()
+        # 00:00 発火 (正午前の実行) は「直前に終わった開催日 = 前日」を報告する
+        target = now.date() - dt.timedelta(days=1) if now.hour < 12 else now.date()
+        today_str = target.isoformat()
     prev_date = (dt.date.fromisoformat(today_str) - dt.timedelta(days=1)).isoformat()
     logging.info("=== night_report start: %s ===", today_str)
 
