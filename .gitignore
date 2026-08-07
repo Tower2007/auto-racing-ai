@@ -29,7 +29,12 @@ data/purchase_log.csv
 *.db
 *.sqlite
 *.sqlite3
-logs/
+# logs/ は基本 ignore。ただし夜次の反省ログは正本 (夜次メール契約 v1 §3) のため
+# commit 対象 (dir ごと除外すると再包含できない git 仕様のため logs/* 形式にする)
+logs/*
+!logs/reflections/
+logs/reflections/*
+!logs/reflections/*.md
 *.log
 
 # Codex / 各 AI の作業中 temp ディレクトリ

@@ -1658,6 +1658,58 @@ def render_criteria_html() -> str:
     )
 
 
+# ─── 今週の反省まとめ (夜次メール契約 v1 §5、2026-08-07) ────────────────
+# night_report.py が logs/reflections/YYYY-MM.md に永続化した日次反省 (契約 §3)
+# を読み返し、直近 N 日分を転記する (契約は「3行要約 or 箇条書き転記」— 転記方式)。
+REFLECTION_DIR = ROOT / "logs" / "reflections"
+
+
+def collect_week_reflections(days: int) -> list[tuple[str, list[str]]]:
+    """直近 days 日の (日付, 反省 bullet 一覧) を古い順で返す。"""
+    today = dt.date.today()
+    dates = [(today - dt.timedelta(days=i)).isoformat()
+             for i in range(days, 0, -1)]
+    months = sorted({d[:7] for d in dates})
+    entries: dict[str, list[str]] = {}
+    for m in months:
+        p = REFLECTION_DIR / f"{m}.md"
+        if not p.exists():
+            continue
+        cur: str | None = None
+        for line in p.read_text(encoding="utf-8").splitlines():
+            if line.startswith("## "):
+                cur = line[3:].strip()
+                continue
+            if cur in dates and line.strip().startswith("- "):
+                entries.setdefault(cur, []).append(line.strip()[2:])
+    return [(d, entries[d]) for d in dates if d in entries]
+
+
+def render_reflections_text(refl: list[tuple[str, list[str]]]) -> str:
+    lines = ["【🪞 今週の反省まとめ (夜次より転記)】", "-" * 60]
+    for d, bullets in refl:
+        lines.append(f"  {d}:")
+        for b in bullets:
+            lines.append(f"    - {b}")
+    lines.append(f"  (正本: logs/reflections/YYYY-MM.md)")
+    return "\n".join(lines)
+
+
+def render_reflections_html(refl: list[tuple[str, list[str]]]) -> str:
+    parts = ['<h3 style="color:#444; margin:18px 0 8px 0;">'
+             '🪞 今週の反省まとめ <span style="font-weight:normal; color:#666;'
+             ' font-size:12px;">(夜次メールより転記 / 正本:'
+             ' logs/reflections/YYYY-MM.md)</span></h3>']
+    for d, bullets in refl:
+        parts.append(f'<p style="margin:6px 0 2px 0; font-size:13px;">'
+                     f'<b>{d}</b></p>')
+        parts.append('<ul style="margin:0 0 4px 0; padding-left:20px;'
+                     ' color:#555; font-size:12px;">')
+        parts.extend(f'<li>{b}</li>' for b in bullets)
+        parts.append('</ul>')
+    return "\n".join(parts)
+
+
 def main() -> None:
     # Windows console (cp932) で絵文字が落ちないようにする
     import sys
@@ -1801,6 +1853,16 @@ def main() -> None:
         if tp_health.get("triggered") and not tp_health.get("flag_exists"):
             write_rt3_stop_flag(tp_health.get("stop_reason", "stop"))
             text += "\n  → data/rt3_stop.flag を書き出しました (三連系購入を停止)。"
+
+    # 今週の反省まとめ (夜次メール契約 v1 §5、2026-08-07)
+    # night_report.py が logs/reflections/YYYY-MM.md に書いた日次反省を転記
+    try:
+        refl_lines = collect_week_reflections(args.days)
+        if refl_lines:
+            text += "\n\n" + render_reflections_text(refl_lines)
+            html = _insert_before_footer(html, render_reflections_html(refl_lines))
+    except Exception as e:
+        text += f"\n\n(今週の反省まとめスキップ: {e})"
 
     # 判定基準 (件名と本文が同一関数から出ることを明記、2026-08-05 P1)
     text += "\n\n" + render_criteria_text()
