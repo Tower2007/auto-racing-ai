@@ -193,17 +193,23 @@ def _sanren_cumulative(detail: pd.DataFrame, tail: int = 8) -> list[dict]:
     return rows[-tail:]
 
 
+# 2026-08-15 100R レビュー結果: n=118 / ROI 89.0% で基準 (>120%) 未達 → 増額なし。
+# ユーザー判断で三連系は「娯楽枠」として継続 (複勝と同じ位置づけ、¥100 据え置き)。
+# 以後は Go/No-Go の判定表示ではなく「娯楽枠の実績」として淡々と出す。
+SANREN_REVIEW_DONE = "2026-08-15"
+SANREN_REVIEW_RESULT = "n=118 / ROI 89.0% < 120% → 増額なし、娯楽枠として継続"
+
+
 def _sanren_verdict(agg: dict) -> tuple[str, str]:
-    """判定基準 (100R / ROI>120%) に対する現状を (mark, text) で返す。閾値は固定。"""
+    """三連系の位置づけを (mark, text) で返す。
+
+    100R レビュー (2026-08-15) で「基準未達 → 娯楽枠継続」が確定済みのため、
+    以後は判定ではなく実績表示。累積 ROI が 100% を超えたら 🟢 で知らせる程度。
+    """
     n, roi = agg["n"], agg["roi"]
-    if n < SANREN_DECISION_MIN_N:
-        return ("ℹ️", f"n={n} < {SANREN_DECISION_MIN_N}R → 判定サンプル未達 "
-                       f"(あと {SANREN_DECISION_MIN_N - n}R)")
-    if roi >= SANREN_DECISION_ROI:
-        return ("🟢", f"n={n} 到達 / ROI {roi:.1f}% ≥ {SANREN_DECISION_ROI:.0f}% "
-                       f"→ 基準クリア")
-    return ("🔴", f"n={n} 到達 / ROI {roi:.1f}% < {SANREN_DECISION_ROI:.0f}% "
-                   f"→ 基準未達")
+    mark = "🟢" if roi >= 100 else "🎲"
+    return (mark, f"娯楽枠 (レビュー済 {SANREN_REVIEW_DONE}: {SANREN_REVIEW_RESULT}) "
+                  f"/ 現在 n={n} ROI {roi:.1f}%")
 
 
 def render_sanren_text(alltime: dict, recent: dict, days: int,
@@ -212,7 +218,7 @@ def render_sanren_text(alltime: dict, recent: dict, days: int,
     mark, verdict = _sanren_verdict(alltime)
     lines = ["", "【🎯 三連系実弾 判定指標 (3連単+3連複 / 全場)】",
              "-" * 60,
-             f"  判定基準 (2026-07-26): 100R / ROI>120% を維持できるか"]
+             f"  100R レビュー済 (2026-08-15): 基準 ROI>120% 未達 → 増額なし、娯楽枠で継続"]
     lines.append(
         f"  全期間: {alltime['n']:>3d} R / 的中 {alltime['hits']:>3d} "
         f"({alltime['hit_rate']:>4.1f}%) / 投資 {yen(alltime['bet'], 8)} / "
@@ -272,7 +278,7 @@ def render_sanren_html(alltime: dict, recent: dict, days: int,
         '<span style="font-weight:normal; color:#666; font-size:13px;">'
         '(3連単+3連複 / 全場)</span></h3>',
         '<p style="margin:0 0 6px 0; color:#555; font-size:12px;">'
-        f'判定基準 (2026-07-26): <b>100R / ROI&gt;120%</b> を維持できるか</p>',
+        f'100R レビュー済 (2026-08-15): 基準 ROI&gt;120% 未達 → <b>増額なし、娯楽枠で継続</b></p>',
         f'<table {TBL}>',
         f'<tr><th {TH}>区分</th><th {TH_R}>R 数</th><th {TH_R}>的中</th>'
         f'<th {TH_R}>投資</th><th {TH_R}>払戻</th><th {TH_R}>損益</th>'
