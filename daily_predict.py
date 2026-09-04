@@ -467,6 +467,26 @@ def align_features(df: pd.DataFrame, meta: dict) -> pd.DataFrame:
 PREDICT_RETRY_MAX = 0          # near-miss retry 廃止 (LEAD_MIN=4 で締切 2 分前到着を優先)
 PREDICT_RETRY_SLEEP_SEC = 30   # 未使用 (PREDICT_RETRY_MAX=0)
 
+# predict_race が空 DataFrame を返す理由のうち「program 取得失敗」を呼び出し側が
+# 区別するためのマーカ (DataFrame.attrs["skip_reason"])。
+SKIP_NO_PROGRAM = "no_program"
+
+
+def _empty_no_program(place_code: int, race_date: str, race_no: int,
+                      why: str) -> pd.DataFrame:
+    """program 取得失敗時の空 DataFrame (attrs["skip_reason"]=SKIP_NO_PROGRAM)。
+
+    2026-09-04 監査 P1: 日跨ぎミッドナイト R7〜 (24:04 = 翌暦日 00:04 発走) が
+    --date なしで翌暦日を対象にし、program 空 → 無音スキップしていた。
+    odds 未公開 (正常な早期 return) と区別して WARN を出せるようにする。
+    """
+    logging.warning("predict_race(%d, %s, %d): program 取得失敗 (%s) — "
+                    "date 不一致 (日跨ぎレースで --date 未指定) の疑い",
+                    place_code, race_date, race_no, why)
+    out = pd.DataFrame()
+    out.attrs["skip_reason"] = SKIP_NO_PROGRAM
+    return out
+
 
 def predict_race(
     client: AutoraceClient, model: lgb.Booster, iso, meta,
@@ -482,10 +502,11 @@ def predict_race(
     try:
         prog = client.get_program(place_code, race_date, race_no)
         if prog.get("result") != "Success":
-            return pd.DataFrame()
+            return _empty_no_program(place_code, race_date, race_no,
+                                     f"result={prog.get('result')!r}")
         body = prog.get("body", {})
         if isinstance(body, list) or not body.get("playerList"):
-            return pd.DataFrame()
+            return _empty_no_program(place_code, race_date, race_no, "playerList なし")
 
         feat = pd.DataFrame()
         for attempt in range(PREDICT_RETRY_MAX + 1):
@@ -1293,15 +1314,24 @@ def main():
         n_eval = 0
         n_nan = 0
         n_below_thr = 0
+        n_noprog = 0  # program 取得失敗 (date 不一致の疑い) — 2026-09-04 監査 P1
         nan_races = []  # (venue, race_no) の list
+        noprog_races = []
         for pc in args.venues:
             venue = VENUE_CODES.get(pc, str(pc))
             logger.info("--- %s (pc=%d) races=%s ---", venue, pc, race_nos)
-            NEAR_MISS_BAND = 0.30  # (参考値、retry 廃止により未使用)
-            NEAR_MISS_RETRIES = 0  # near-miss retry 廃止 (締切 2 分前到着を優先)
             for race_no in race_nos:
                 df = predict_race(client, model, iso, meta, pc, target_date, race_no)
                 if df.empty:
+                    if df.attrs.get("skip_reason") == SKIP_NO_PROGRAM:
+                        # odds 未公開 (正常) とは別物。日跨ぎレースを --date なしで
+                        # 起動すると翌暦日を見に行ってここに落ちる (無音スキップ禁止)
+                        n_noprog += 1
+                        noprog_races.append(f"{venue}_R{race_no}")
+                        logger.warning(
+                            "  R%d program 取得失敗 (date=%s 不一致の疑い: 日跨ぎレースは "
+                            "dynamic_scheduler が --date で開催日を渡す) — skip",
+                            race_no, target_date)
                     continue
                 # 初回 snapshot のみ保存 (retry 分は別行になり persistence 解析を歪めるため)
                 try:
@@ -1311,24 +1341,7 @@ def main():
                 n_eval += 1
                 top1 = df[df["pred_rank"] == 1].copy()
                 top1_ev = float(top1["ev_avg_calib"].iloc[0]) if not top1.empty else float("nan")
-                # near-miss retry: 閾値未達だが近接 → odds drift up で thr 跨ぎ可能性
-                for nm_attempt in range(NEAR_MISS_RETRIES):
-                    if pd.isna(top1_ev):
-                        break  # NaN は predict_race 内部で既に retry 済
-                    if top1_ev >= args.thr:
-                        break  # 閾値到達、retry 不要
-                    if top1_ev < args.thr - NEAR_MISS_BAND:
-                        break  # 大きく未達、drift up で届く可能性低い
-                    car = int(top1["car_no"].iloc[0]) if not top1.empty else 0
-                    logger.info("  R%d 近接未達 (車%d EV=%.2f < %.2f, band %.2f), %d 秒後リトライ (%d/%d)",
-                                race_no, car, top1_ev, args.thr, NEAR_MISS_BAND,
-                                PREDICT_RETRY_SLEEP_SEC, nm_attempt + 1, NEAR_MISS_RETRIES)
-                    time.sleep(PREDICT_RETRY_SLEEP_SEC)
-                    df = predict_race(client, model, iso, meta, pc, target_date, race_no)
-                    if df.empty:
-                        break
-                    top1 = df[df["pred_rank"] == 1].copy()
-                    top1_ev = float(top1["ev_avg_calib"].iloc[0]) if not top1.empty else float("nan")
+                # (near-miss retry は 2026-05-17 に廃止。死蔵ループは 2026-09-04 監査で削除)
                 if pd.isna(top1_ev):
                     n_nan += 1
                     nan_races.append(f"{venue}_R{race_no}")
@@ -1509,9 +1522,11 @@ def main():
         print(text)
 
         n_hit = len(picks)
-        logger.info("サマリ: eval=%d / hit=%d / below_thr=%d / NaN-skip=%d%s",
+        logger.info("サマリ: eval=%d / hit=%d / below_thr=%d / NaN-skip=%d%s / no-program=%d%s",
                     n_eval, n_hit, n_below_thr, n_nan,
-                    f" [{', '.join(nan_races)}]" if nan_races else "")
+                    f" [{', '.join(nan_races)}]" if nan_races else "",
+                    n_noprog,
+                    f" [{', '.join(noprog_races)}]" if noprog_races else "")
         if not picks.empty:
             append_picks_log(picks, time_label)
             logger.info("候補数: %d / 投資 ¥%d", len(picks), len(picks) * 100)

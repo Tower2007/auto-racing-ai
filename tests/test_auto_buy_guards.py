@@ -93,28 +93,75 @@ def test_cap_boundary_exact():
 
 
 def test_build_bets():
-    # 2026-06-26〜 複勝デフォルト OFF: 三連系対象外なら空 list
-    assert auto_buy.build_bets(5, 300, None, include_rt3=False) == []
-    # 複勝 OFF × 三連系 ON: rt3+rf3 のみ (fns なし)
+    # 2026-07-18〜 複勝 (fns) デフォルト ON (AUTO_BUY_INCLUDE_FNS=True、娯楽目的で復活):
+    # 三連系対象外でも複勝 1 点は返る (2026-06-26〜07-18 の「デフォルト OFF → 空 list」は旧仕様)
+    assert auto_buy.build_bets(5, 300, None, include_rt3=False) == [
+        {"type": "fns", "cars": [5], "amount": 300}]
+    # 複勝 OFF (明示) × 三連系対象外: 空 list
+    assert auto_buy.build_bets(5, 300, None, include_rt3=False, include_fns=False) == []
+    # 複勝 OFF (明示) × 三連系 ON: rt3+rf3 のみ (fns なし)
     bets = auto_buy.build_bets(
         5, 300, {"cars_ordered": [5, 6, 7], "cars_sorted": [5, 6, 7]},
-        include_rt3=True)
+        include_rt3=True, include_fns=False)
     assert [b["type"] for b in bets] == ["rt3", "rf3"]
     assert all(b["amount"] == 100 for b in bets)
     # has_rt3=False (伊勢崎・飯塚) は rf3 のみ
     assert [b["type"] for b in auto_buy.build_bets(
         5, 300, {"cars_ordered": [5, 6, 7], "cars_sorted": [5, 6, 7],
-                 "has_rt3": False}, include_rt3=True)] == ["rf3"]
-    # include_fns=True で復活: 複勝先頭 + 三連系
+                 "has_rt3": False}, include_rt3=True, include_fns=False)] == ["rf3"]
+    # 複勝 ON (既定) × 三連系 ON: 複勝先頭 + 三連系
     bets_fns = auto_buy.build_bets(
         5, 300, {"cars_ordered": [5, 6, 7], "cars_sorted": [5, 6, 7]},
-        include_rt3=True, include_fns=True)
+        include_rt3=True)
     assert bets_fns[0] == {"type": "fns", "cars": [5], "amount": 300}
     assert len(bets_fns) == 3
     # 全 OFF (複勝 OFF × 三連系 OFF) は空
     assert auto_buy.build_bets(
         5, 300, {"cars_ordered": [5, 6, 7], "cars_sorted": [5, 6, 7]},
-        include_rt3=False) == []
+        include_rt3=False, include_fns=False) == []
+
+
+def test_skip_duplicate_race_in_same_day_state():
+    """2026-09-04 監査 P2: 当日 state に同一 race の executed/dry_run があれば
+    _run_auto_buy_locked が skip_duplicate で二重発注しない (boat と同型の冪等ガード)。
+    実発注 / メール / state 保存は全てスタブ。"""
+    saved = []
+    orig = {k: getattr(auto_buy, k) for k in (
+        "load_state", "save_state", "today_profit_from_history", "check_guards",
+        "rt3_final_gate_blocks", "_notify", "_run_execute_purchase")}
+    try:
+        st = _state()
+        st["executions"] = [
+            {"race": "iizuka_R7", "amount": 300, "verdict": "executed",
+             "timestamp": "2026-06-01T23:00:00+09:00"},
+            {"race": "iizuka_R8", "amount": 300, "verdict": "skip_daily_cap",
+             "timestamp": "2026-06-01T23:10:00+09:00"},
+        ]
+        auto_buy.load_state = lambda now=None: st
+        auto_buy.save_state = lambda s: saved.append(dict(s))
+        auto_buy.today_profit_from_history = lambda d: 0
+        auto_buy.check_guards = lambda *a, **kw: (True, "ok")
+        auto_buy.rt3_final_gate_blocks = lambda bets: False
+        auto_buy._notify = lambda subject, body: None
+
+        def _forbidden(*a, **kw):
+            raise AssertionError("実発注経路が呼ばれた")
+        auto_buy._run_execute_purchase = _forbidden
+
+        def cand(rno):
+            return {"race_date": "2026-06-01", "place_code": 5,
+                    "venue": "iizuka", "venue_jp": "飯塚", "race_no": rno,
+                    "car_no": 5, "ev": 1.9, "amount": 300,
+                    "bets": [{"type": "fns", "cars": [5], "amount": 300}]}
+        out = auto_buy._run_auto_buy_locked([cand(7), cand(8)], NIGHT, dry_run=True)
+        verdicts = {r["race"]: r["verdict"] for r in out}
+        # R7 は executed 済 → skip_duplicate、R8 は skip 記録しか無い → 再評価 (dry_run)
+        assert verdicts == {"iizuka_R7": "skip_duplicate", "iizuka_R8": "dry_run"}, verdicts
+        assert st["spent_yen"] == 300  # R8 の模擬加算のみ (R7 は加算しない)
+        assert [e["race"] for e in st["executions"]].count("iizuka_R7") == 1
+    finally:
+        for k, v in orig.items():
+            setattr(auto_buy, k, v)
 
 
 def _run_all():

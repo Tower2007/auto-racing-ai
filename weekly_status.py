@@ -219,7 +219,11 @@ def _check_fetch_order_log(out: dict) -> None:
                 (r"\b401\b", "401 Unauthorized"),
                 (r"\b403\b", "403 Forbidden"),
                 (r"cookie.*(expir|invalid|missing|失効|期限切れ)", "cookie 失効"),
-                (r"login.*(fail|require|必要)", "ログイン要求"),
+                # 2026-09-04 監査 P2: scripts/auto_login_autorace.py の正常進行ログ
+                # "[auto_login] ログインが必要 (current URL: ...)" (直後に "login 完了" が続く)
+                # に誤一致して 8/31 に 🔴NG 誤報。[auto_login] プレフィックス行は除外する
+                # (auto_login の真の失敗は Traceback / ERROR / 失敗通知で別途拾う)。
+                (r"^(?!\[auto_login\]).*login.*(fail|require|必要)", "ログイン要求"),
                 (r"^Traceback", "Python traceback"),
                 (r"\bERROR\b", "ERROR ログ"),
             ]

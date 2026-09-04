@@ -21,6 +21,7 @@ boat-racing-ai 版から移植。.env に以下を設定:
 
 from __future__ import annotations
 
+import datetime as dt
 import mimetypes
 import os
 import smtplib
@@ -37,6 +38,21 @@ from dotenv import load_dotenv
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
 TIMEOUT_SEC = 30
+# 送信痕跡ログ (2026-09-04 監査 P2)。pythonw / リダイレクト無しの起動でも
+# 「送ったか・失敗したか」が残るように stdout とは別にファイルへ追記する。
+# 統合監視が ok: "[mail] sent" / fail: "[mail] FAILED" で監視する。
+MAIL_SENT_LOG = Path(__file__).parent / "data" / "mail_sent.log"
+
+
+def _append_mail_log(line: str) -> None:
+    """`YYYY-MM-DD HH:MM:SS <line>` を MAIL_SENT_LOG に追記。件名のみ書き、
+    宛先・認証情報・本文は書かない。失敗しても送信処理に影響させない。"""
+    try:
+        MAIL_SENT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(MAIL_SENT_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{dt.datetime.now():%Y-%m-%d %H:%M:%S} {line}\n")
+    except Exception:
+        pass
 
 
 def _load_config() -> tuple[str, str, list[str]]:
@@ -60,7 +76,26 @@ def send_email(
     recipients: list[str] | None = None,
     attachments: list[str | Path] | None = None,
 ) -> None:
-    """Gmail 経由でメール送信。attachments はファイルパスのリスト。"""
+    """Gmail 経由でメール送信。attachments はファイルパスのリスト。
+
+    成功時は data/mail_sent.log に `[mail] sent <subject>`、失敗時は
+    `[mail] FAILED <subject> <例外型>` を追記してから例外を再送出する。
+    """
+    try:
+        _send_email_impl(subject, body, html, recipients, attachments)
+    except Exception as e:
+        _append_mail_log(f"[mail] FAILED {subject} {type(e).__name__}")
+        raise
+    _append_mail_log(f"[mail] sent {subject}")
+
+
+def _send_email_impl(
+    subject: str,
+    body: str,
+    html: str | None,
+    recipients: list[str] | None,
+    attachments: list[str | Path] | None,
+) -> None:
     user, pwd, default_to = _load_config()
     to_list = recipients or default_to
 

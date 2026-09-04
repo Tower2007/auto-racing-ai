@@ -949,6 +949,19 @@ def _run_auto_buy_locked(candidates: list[dict],
         amount = int(c["amount"])
         ev = float(c.get("ev", 0.0))
         race_label = f"{c.get('venue','?')}_R{c['race_no']}"
+        # レース単位の冪等ガード (2026-09-04 監査 P2、boat auto_buy.process_one と同型):
+        # 当日 state に同一 race の executed/dry_run 記録があれば二重発注しない。
+        # per-race one-shot の二重発火 / 手動再走で同じ R を再評価した場合の防御。
+        # (state は暦日で reset されるため、日跨ぎレースは翌暦日の state で判定される)
+        if any(str(e.get("race", "")) == race_label
+               and e.get("verdict") in ("executed", "dry_run")
+               for e in state.get("executions", [])):
+            reason = "skip_duplicate (当日この R は発注済み: 冪等ガード)"
+            logger.info("[auto_buy] %s skip: %s", race_label, reason)
+            results.append({"race": race_label, "amount": amount,
+                            "verdict": "skip_duplicate",
+                            "timestamp": now.isoformat()})
+            continue
         ok, reason = check_guards(state, now, amount, ev)
         # 2026-07-12 Codex再検証 ②: 候補生成 → mutex 待ち (最大90秒) の間に
         # 三連系停止フラグが立った/バックストップが読めなくなった場合を

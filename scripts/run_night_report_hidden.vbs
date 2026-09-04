@@ -1,6 +1,7 @@
 ' Night report launcher (2026-08-07)
 ' Purpose: run night_report.py WITHOUT a console window (fleet standard).
-' Used by Task Scheduler "AutoraceNightReport" (daily 22:00).
+' Used by Task Scheduler "AutoraceNightReport" (daily 00:00, target = previous day;
+' moved from 22:00 on 2026-08-08 so Sanyo midnight races up to 23:50 are included).
 ' Nightly-mail contract v1: aggregates today's provisional results +
 ' yesterday's confirmed figures, appends reflection to logs/reflections/,
 ' then sends the nightly mail ([mail] sent marker goes to data\night_report.log).

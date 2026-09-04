@@ -61,8 +61,9 @@ backfill.py            # 過去データ一括取得
 daily_ingest.py        # 日次データ収集オーケストレータ(catchup 2)
 daily_predict.py       # 当日対象場の EV ベース買い候補メール送信
                        # (--races / --suppress-noresult-email 対応で 1R 単位呼出可)
-dynamic_scheduler.py   # 各レース発走 LEAD_MIN (現在 5) 分前に daily_predict を
-                       # 1R 単位で起動する schtasks one-shot を毎朝生成
+dynamic_scheduler.py   # 各レース発走 LEAD_MIN 分前 (場別: 伊勢崎/浜松/山陽 4 分・
+                       # 川口/飯塚 3 分) に daily_predict を 1R 単位で起動する
+                       # schtasks one-shot を毎朝生成 (開催日を --date で渡す)
 weekly_status.py       # 週次ステータスメール
 monthly_report.py      # 月次収支レポート(推奨仮想+実購入、Gmail HTML、毎月1日)
 gmail_notify.py        # Gmail SMTP 送信
@@ -89,9 +90,9 @@ reports/               # 各種分析レポート(commit 対象)
 | タスク | 時刻 | 内容 |
 |---|---|---|
 | `AutoraceDailyIngest` | 毎日 06:30 | データ収集 (catchup 2 日) |
-| `AutoraceDynamicScheduler` | 毎日 07:00 | `python dynamic_scheduler.py`: Program/Print ページから各場 R 毎の発走時刻を取得し、各レース発走 `LEAD_MIN` 分前 (現在 4 分前) の `AutoraceDyn_{venue}_R{n}` one-shot を 12 R × 場数ぶん登録(冪等、毎日再生成) |
-| `AutoraceDyn_{venue}_R{n}` | 各レース発走 LEAD_MIN 分前(現在 4 分前、動的) | `python daily_predict.py --venues {pc} --races {n} --suppress-noresult-email`: 1 R 単位で予測、候補ありのみメール送信。near-miss retry 廃止、処理 ~10 秒で締切 ~2 分前に到着 |
-| `AutoraceWeeklyRetrain` | 毎日曜 03:00 | `python scripts/weekly_retrain.py`: 再学習チェーン wrapper。`ml.features`(特徴量parquet再生成) → `ml.walkforward_morning`(校正OOF parquet再生成) → `ml.train_production`(学習+品質ゲート) を順に実行。上流失敗時は学習に進まず中断。**2026-06-14 導入**: 旧 `python -m ml.train_production` 単発は学習入力(parquet)を再生成せず、5/24〜6/14 の4回が同一データ no-op 化しモデルが4/29塩漬けだったのを修正。経緯: memory `project_decisions.md` 2026-06-14。⚠️ 品質ゲートの永久凍結問題(凍結高値AUCを恒久ベースライン化)は未解決、別途 `_should_adopt` 再設計予定 |
+| `AutoraceDynamicScheduler` | 毎日 07:00 | `python dynamic_scheduler.py`: Program/Print ページから各場 R 毎の発走時刻を取得し、各レース発走 `LEAD_MIN` 分前 (場別: 伊勢崎/浜松/山陽 4 分・川口/飯塚 3 分、`dynamic_scheduler.py:LEAD_MIN_VENUE_MAP`) の `AutoraceDyn_{venue}_R{n}` one-shot を実レース数 × 場数ぶん登録(冪等、毎日再生成)。Program/Print が `24:04` 表記で返すミッドナイト日跨ぎ R も +1 日で正しく登録し、8R 開催なら R9〜 は登録しない (2026-09-04) |
+| `AutoraceDyn_{venue}_R{n}` | 各レース発走 LEAD_MIN 分前(場別 3〜4 分前、動的) | `wscript //B scripts/run_predict_hidden.vbs {pc} {n} {label} {date}` → `python daily_predict.py --venues {pc} --races {n} --date {開催日} --suppress-noresult-email`: 1 R 単位で予測、候補ありのみメール送信。near-miss retry 廃止、処理 ~10 秒で締切 ~2 分前に到着。**`--date` は必須級**: 日跨ぎミッドナイト R (00:00 以降発火) で既定の今日日付だと翌暦日になり program 空 → 無音スキップしていた (2026-09-03 飯塚 R7/R8、2026-09-04 修正) |
+| `AutoraceWeeklyRetrain` | 毎日曜 03:00 | `python scripts/weekly_retrain.py`: 再学習チェーン wrapper。`ml.features`(特徴量parquet再生成) → `ml.walkforward_morning`(校正OOF parquet再生成) → `ml.train_production`(学習+品質ゲート) を順に実行。上流失敗時は学習に進まず中断。**2026-06-14 導入**: 旧 `python -m ml.train_production` 単発は学習入力(parquet)を再生成せず、5/24〜6/14 の4回が同一データ no-op 化しモデルが4/29塩漬けだったのを修正。経緯: memory `project_decisions.md` 2026-06-14。品質ゲートの永久凍結問題(凍結高値AUCを恒久ベースライン化)は **2026-06-26 に解消済み** (`ml/train_production.py` の `_should_adopt` 再設計: 現役モデルを候補と同一 val 集合で再採点 + 許容バンド `ADOPT_TOL_AUC` + 鮮度オーバーライド `STALE_DAYS`/`STALE_TOL_AUC`) |
 | `AutoraceWeeklyStatus` | 毎月曜 07:20 | 週次ステータス報告 |
 | `AutoraceMonthlyReport` | 毎月 1 日 08:00 | `python monthly_report.py --send-email`: 前月の月次収支レポート(推奨仮想+実購入+券種別+場別+月次ROI推移+通算)を Gmail 送信。keiba の月次レポートと同枠組み |
 | `AutoraceFetchOrderHistory` | 毎日 02:30 | `python scripts/daily_fetch_order_history.py`: vote.autorace.jp の購入履歴を `--since 2d --detail --cookie-source playwright` で取得し `data/bet_history.csv` / `bet_history_detail.csv` にマージ。失敗時のみ Gmail 通知。**2026-05-08 から Playwright auto-login** に切替(SBI IPO project と同じパターン)。資格情報は `accounts.json`(.gitignore)。実装: `scripts/auto_login_autorace.py`。旧 Firefox cookie 方式は `--cookie-source firefox` で fallback 可。経緯: memory `ml_baseline_findings.md` 2026-05-08 |
@@ -104,8 +105,8 @@ reports/               # 各種分析レポート(commit 対象)
 - 発走時刻取得: `/race_info/Program/Print/{venueKey}/{YYYY-MM-DD}` から R 毎の発走予定時刻を HTML スクレイプ。12 R 全て掲載されるので推定ではなく実時刻ベースで登録。
   - 取得失敗時のみ fallback: Hold/Today の `(nowRaceNo, raceStartTime)` を anchor、`liveEndTime − 5 min` を R12 とした線形補間。`liveStartTime`(放送開始、R1 より約 30 分早い)は更なる fallback。
   - 深夜跨ぎ(R 番号順に時刻が前 R より早くなる)は +1 日として処理。
-- 各レース発走 `LEAD_MIN` 分前 (現在 4 分前、`dynamic_scheduler.py:LEAD_MIN`) で one-shot 発火 → そのレースの 1 R 分だけ predict
-  - LEAD_MIN は 30→15→10→5→2→4 と変遷。2 分前 (2026-05-14〜05-17) では処理+送信で締切ギリギリに到着する問題が発生。4 分前に戻し near-miss retry を廃止することで通知が締切 ~2 分前に安定到着。drift は 5 分前時 (-20%) より軽微と判断。
+- 各レース発走 `LEAD_MIN` 分前 (場別: 伊勢崎/浜松/山陽 4 分・川口/飯塚 3 分、`dynamic_scheduler.py:LEAD_MIN_DEFAULT` / `LEAD_MIN_VENUE_MAP`) で one-shot 発火 → そのレースの 1 R 分だけ predict
+  - LEAD_MIN は 30→15→10→5→2→4→3→2→3→4→場別 と変遷。2 分前 (2026-05-14〜05-17) では処理+送信で締切ギリギリに到着する問題が発生。4 分前に戻し near-miss retry を廃止することで通知が締切 ~2 分前に安定到着。drift は 5 分前時 (-20%) より軽微と判断。2026-06-07〜 三連系購入場 (Playwright 2〜3 点で ~40〜57s) は 4 分前、それ以外は 3 分前 (投票締切は発走 -2:30)。
 - `--suppress-noresult-email`: 候補なしの R はメールスキップ(候補ありの R のみ通知)
 - 当日中止・全 fallback 失敗の場は登録スキップ
 - 冪等: 既存 `AutoraceDyn_*` を全削除してから再登録、同日中の手動再走 OK
@@ -138,6 +139,9 @@ rt3 浜松 ROI 530% / 山陽 ROI 141%、rf3 浜松 ROI 330% / 山陽 ROI 185%。
 直前に厳格ガード (1日上限¥3000 / 当日損失-¥3000停止 / EV異常>10除外 / 連続失敗3回停止)
 を全通過した候補を `execute_purchase.py` で自動投票。state は `data/auto_buy_state.json`
 (atomic write・日次 reset)、**毎回 Gmail 即時通知 (券種・出目・金額を日本語で明記)**。
+state の reset は暦日基準なので、日跨ぎミッドナイト R (00:00 以降発火) は前日の日次 cap
+(`MAX_DAILY_AUTO_YEN`) とは別枠 (翌暦日の枠) で数えられる (仕様、2026-09-04 注記)。
+同一 R の executed/dry_run が当日 state にあれば `skip_duplicate` で二重発注しない (冪等ガード)。
 残高警告: 投票後に確認画面から残高(ポイント+払戻金)を抽出し、合計が
 `AUTO_BUY_LOW_BALANCE_YEN` (デフォルト¥3000) 以下なら警告メール (1日1回、state で重複抑止)。
 2026-05-31 ユーザー要望で **`AUTO_BUY_ANYTIME=True` (デフォルト) = 時間帯制限なし常時発注**。

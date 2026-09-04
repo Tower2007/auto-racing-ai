@@ -2,8 +2,13 @@
 ' Purpose: run daily_predict.py for one race WITHOUT showing a console window.
 '   Old style ("cmd /c ... python daily_predict.py ...") popped a console
 '   window every time a per-race task fired (10+ times/day).
-' Usage: wscript.exe //B run_predict_hidden.vbs <place_code> <race_no> <label>
+' Usage: wscript.exe //B run_predict_hidden.vbs <place_code> <race_no> <label> [<race_date>]
 ' Notes:
+'   - 2026-09-04 audit P1: optional 4th arg = race date (YYYY-MM-DD, the
+'     scheduler's run date), passed to daily_predict as --date. Midnight
+'     races (R7+ listed as 24:04 = next calendar day) fire after 00:00, so
+'     daily_predict's default date (today) was one day off, the program
+'     lookup came back empty and the race was silently skipped.
 '   - Runs in the interactive user session, so auto_buy's Playwright Chrome
 '     (headless=False) still works. Only the cmd console is hidden (Run ..., 0).
 '   - stdout/stderr are appended to data\dynamic_run.log as before.
@@ -11,7 +16,7 @@
 '     to be discarded, so Python failures looked like rc=0 to Task Scheduler.
 '     Capture it and propagate via WScript.Quit (0 only on real success).
 Option Explicit
-Dim sh, fso, proj, pc, rn, label, cmd, rc
+Dim sh, fso, proj, pc, rn, label, rdate, dateArg, cmd, rc
 Set sh = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 ' project root = parent of this script's folder (scripts\..)
@@ -19,8 +24,12 @@ proj = fso.GetParentFolderName(fso.GetParentFolderName(WScript.ScriptFullName))
 pc = WScript.Arguments(0)
 rn = WScript.Arguments(1)
 label = WScript.Arguments(2)
+rdate = ""
+If WScript.Arguments.Count > 3 Then rdate = WScript.Arguments(3)
+dateArg = ""
+If rdate <> "" Then dateArg = " --date " & rdate
 cmd = "cmd /c chcp 65001 >nul && cd /d """ & proj & """ && " & _
-      "python daily_predict.py --venues " & pc & " --races " & rn & _
+      "python daily_predict.py --venues " & pc & " --races " & rn & dateArg & _
       " --suppress-noresult-email --time-label """ & label & """" & _
       " >> data\dynamic_run.log 2>&1"
 ' 0 = hidden window, True = wait for completion -> rc = child exit code

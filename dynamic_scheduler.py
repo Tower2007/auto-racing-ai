@@ -67,7 +67,12 @@ PROJECT_DIR = str(ROOT)
 #   (headless=False) には影響しない。実コマンド組立・dynamic_run.log への
 #   redirect は scripts/run_predict_hidden.vbs 側 (project root は VBS が自己解決)。
 VBS_WRAPPER = ROOT / "scripts" / "run_predict_hidden.vbs"
-CMD_TEMPLATE = 'wscript.exe //B "{vbs}" {pc} {race_no} "{label}"'
+# 2026-09-04 監査 P1: 第4引数で開催日 {date} (このスケジューラの実行日) を渡す。
+#   日跨ぎミッドナイト (飯塚/山陽の R7〜 は Program/Print 上 24:04 = 翌暦日 00:04)
+#   の one-shot は 00:00 以降に発火するため、daily_predict 側の既定
+#   `dt.date.today()` が翌暦日になり program 取得が空 → 無音スキップしていた
+#   (2026-09-03 00:25 iizuka_R7 date=2026-09-03 eval=0)。vbs が --date に渡す。
+CMD_TEMPLATE = 'wscript.exe //B "{vbs}" {pc} {race_no} "{label}" {date}'
 
 
 def setup_logging() -> None:
@@ -132,14 +137,32 @@ def cleanup_stale_tasks() -> int:
     return deleted
 
 
-def parse_hhmm(s: str | None) -> dt.time | None:
+def parse_hhmm_ex(s: str | None) -> tuple[dt.time, int] | None:
+    """'HH:MM' → (time, day_offset)。不正値は None。
+
+    Program/Print はミッドナイト開催の日跨ぎ R を '24:04' のように 24 時以降表記で
+    返す。2026-09-04 監査 P3: 従来はこれが None に落ちて R7〜 が推定補間
+    (30 分刻み) に置き換わり、8R 開催なのに R9-R12 の幽霊タスクまで登録されていた。
+    h>=24 は (h-24, +1 日) として扱う (day_offset は 0 or 1)。
+    """
     if not s or ":" not in s:
         return None
     try:
-        h, m = s.split(":", 1)
-        return dt.time(int(h), int(m))
+        h_str, m_str = s.split(":", 1)
+        h, m = int(h_str), int(m_str)
     except Exception:
         return None
+    if h < 0 or h >= 48 or not (0 <= m < 60):
+        return None
+    day_offset, h = divmod(h, 24)
+    return dt.time(h, m), day_offset
+
+
+def parse_hhmm(s: str | None) -> dt.time | None:
+    """'HH:MM' → time。'24:04' は 00:04 に丸める (日付の繰り上げは呼び出し側が
+    「前 R より早い / end <= start なら +1 日」で吸収する)。"""
+    parsed = parse_hhmm_ex(s)
+    return parsed[0] if parsed else None
 
 
 def derive_anchor(info: dict) -> tuple[int, dt.time | None]:
@@ -199,14 +222,17 @@ def build_exact_race_starts(
 ) -> dict[int, dt.datetime]:
     """{race_no: 'HH:MM'} → {race_no: datetime}。
     R 番号順に走査し、前 R より早い時刻が出たら +1 日(深夜跨ぎ対策)。
+    '24:04' 表記 (parse_hhmm_ex の day_offset=1) もそのまま +1 日として扱う。
     """
     out: dict[int, dt.datetime] = {}
     day_offset = 0
     prev: dt.datetime | None = None
     for rn in sorted(times_hhmm.keys()):
-        t = parse_hhmm(times_hhmm[rn])
-        if t is None:
+        parsed = parse_hhmm_ex(times_hhmm[rn])
+        if parsed is None:
             continue
+        t, t_offset = parsed
+        day_offset = max(day_offset, t_offset)
         cand = dt.datetime.combine(today + dt.timedelta(days=day_offset), t)
         if prev is not None and cand <= prev:
             day_offset += 1
@@ -275,14 +301,19 @@ def main() -> int:
         race_starts = build_exact_race_starts(exact_times, today)
 
         if race_starts:
+            last_r = max(race_starts)
             logging.info(
-                "pc=%d (%s) Program/Print から R 毎発走時刻取得: R1=%s, R12=%s (%d R)",
+                "pc=%d (%s) Program/Print から R 毎発走時刻取得: R1=%s, R%d=%s (%d R)",
                 pc, venue_key,
                 race_starts.get(1).strftime("%H:%M") if 1 in race_starts else "?",
-                race_starts.get(RACES_PER_DAY).strftime("%H:%M")
-                if RACES_PER_DAY in race_starts else "?",
+                last_r, race_starts[last_r].strftime("%H:%M"),
                 len(race_starts),
             )
+            if last_r < RACES_PER_DAY:
+                # ミッドナイト 8R 開催など。実レース数で打ち切り、R9〜 は推定補間しない
+                # (2026-09-04 監査 P3: 幽霊タスク R9-R12 対策)
+                logging.info("pc=%d (%s) Program/Print は R%d まで — R%d 以降は登録しない "
+                             "(推定補間なし)", pc, venue_key, last_r, last_r + 1)
 
         # 取得できなかった R 用の anchor + interval fallback を準備
         anchor_r, anchor_time = derive_anchor(info)
@@ -313,6 +344,10 @@ def main() -> int:
             if race_no in race_starts:
                 race_start = race_starts[race_no]
                 source = "exact"
+            elif race_starts:
+                # Program/Print が取れている場は実レース数で打ち切る (推定補間しない)
+                skipped_other += 1
+                continue
             elif anchor_time is not None:
                 race_start = estimate_race_start(today, anchor_r, anchor_time,
                                                  race_no, interval)
@@ -331,6 +366,7 @@ def main() -> int:
             label = f"{venue_short}_R{race_no}"
             command = CMD_TEMPLATE.format(
                 vbs=VBS_WRAPPER, pc=pc, race_no=race_no, label=label,
+                date=today.isoformat(),
             )
 
             if register_one_shot(task_name, fire_at, command):
