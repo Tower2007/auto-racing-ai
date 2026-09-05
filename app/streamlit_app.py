@@ -911,6 +911,153 @@ _CAR_COLORS = {
 }
 
 
+# ── 見た目ヘルパー (2026-09-06: 素の st.dataframe → 車番チップ + バー + 的中ハイライトの HTML カード) ──
+_PRED_MARKS = ["◎", "○", "▲"]
+
+
+def car_chip(n: int, size: int = 22) -> str:
+    """公式車番色の丸チップ (1白 2黒 3赤 4青 5黄 6緑 7橙 8桃)。"""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return f'<span style="color:#aaa;">{n}</span>'
+    bg, fg = _CAR_COLORS.get(n, ("#7f8c8d", "#ffffff"))
+    border = "1px solid #bbb" if n == 1 else "1px solid rgba(0,0,0,.45)"
+    return (
+        f'<span style="display:inline-block;width:{size}px;height:{size}px;line-height:{size}px;'
+        f'border-radius:50%;background:{bg};color:{fg};font-weight:900;font-size:{int(size * 0.6)}px;'
+        f'text-align:center;{border};box-shadow:0 1px 2px rgba(0,0,0,.5);margin:0 1px;'
+        f'vertical-align:middle;">{n}</span>'
+    )
+
+
+def combo_chips(combo: str) -> str:
+    """買い目文字列 ("4-7", "4>7>2", "4") を車番チップ + 区切りに変換。"""
+    out, num = [], ""
+    for ch in str(combo):
+        if ch.isdigit():
+            num += ch
+        else:
+            if num:
+                out.append(car_chip(int(num), 20))
+                num = ""
+            sep = "→" if ch == ">" else ("=" if ch == "=" else "-")
+            out.append(f'<span style="color:#9aa4ae;margin:0 2px;font-weight:700;">{sep}</span>')
+    if num:
+        out.append(car_chip(int(num), 20))
+    return "".join(out) if out else f'<span style="color:#aaa;">{combo}</span>'
+
+
+def render_top3_html(rows: list[tuple[int, float | None, float | None]],
+                     ev_thr: float | None = None) -> str:
+    """予想 top3 カード。rows = [(car, pred, ev)]。pred は横バー、EV は閾値以上で金バッジ。"""
+    parts = ['<div style="display:flex;flex-direction:column;gap:5px;margin-top:4px;">']
+    for i, (car, pred, ev) in enumerate(rows[:3]):
+        mark = _PRED_MARKS[i] if i < len(_PRED_MARKS) else "△"
+        mark_color = "#ffd54f" if i == 0 else ("#90caf9" if i == 1 else "#b0bec5")
+        if pred is None or pd.isna(pred):
+            bar = '<span style="color:#888;font-size:12px;">pred —</span>'
+        else:
+            pct = max(0.0, min(100.0, float(pred) * 100))
+            grad = ("linear-gradient(90deg,#ff8f00,#ffd600)" if i == 0
+                    else "linear-gradient(90deg,#1e88e5,#64b5f6)")
+            bar = (
+                f'<div style="flex:1;height:12px;background:#2a3038;border-radius:6px;overflow:hidden;">'
+                f'<div style="width:{pct:.1f}%;height:100%;background:{grad};border-radius:6px;"></div></div>'
+                f'<span style="min-width:44px;text-align:right;font-family:Consolas,monospace;'
+                f'font-size:13px;font-weight:700;">{pct:.1f}%</span>'
+            )
+        ev_badge = ""
+        if ev is not None and not pd.isna(ev):
+            hot = ev_thr is not None and float(ev) >= ev_thr
+            style = ("background:linear-gradient(90deg,#f9a825,#ffd600);color:#000;font-weight:900;"
+                     if hot else "background:#37474f;color:#cfd8dc;")
+            ev_badge = (f'<span style="{style}padding:1px 7px;border-radius:10px;font-size:12px;'
+                        f'font-family:Consolas,monospace;margin-left:6px;">EV {float(ev):.2f}</span>')
+        parts.append(
+            f'<div style="display:flex;align-items:center;gap:8px;">'
+            f'<span style="color:{mark_color};font-weight:900;width:16px;">{mark}</span>'
+            f'{car_chip(car, 24)}{bar}{ev_badge}</div>'
+        )
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def render_bets_html(rows: list[dict]) -> str:
+    """買い目カード。rows = [{券種, 買い目, オッズ, 結果, 払戻}] (既存 dataframe 行と同じキー)。
+    的中行は緑ハイライト + 払戻を金色、外れは減光、未確定は青の ⏳。"""
+    if not rows:
+        return '<div style="color:#888;font-size:13px;">買い目なし</div>'
+    head = (
+        '<div style="display:grid;grid-template-columns:64px 1fr 74px 1fr 78px;gap:6px;'
+        'padding:2px 8px;color:#8a97a5;font-size:11px;letter-spacing:.5px;">'
+        '<span>券種</span><span>買い目</span><span>オッズ</span><span>結果</span>'
+        '<span style="text-align:right;">払戻</span></div>'
+    )
+    parts = ['<div style="display:flex;flex-direction:column;gap:3px;margin-top:4px;">', head]
+    for r in rows:
+        res = str(r.get("結果", "—"))
+        pay = str(r.get("払戻", "—"))
+        if res.startswith("🏆") or res.startswith("○"):
+            bg, border = "rgba(46,204,113,.13)", "#2ecc71"
+            res_html = (f'<span style="color:#2ecc71;font-weight:900;">⭕ 的中'
+                        + (' <span style="font-size:11px;">🏆 大配当</span>' if res.startswith("🏆") else "")
+                        + "</span>")
+            pay_html = f'<span style="color:#ffd54f;font-weight:900;font-size:15px;">{pay}</span>'
+        elif res.startswith("✗"):
+            bg, border = "rgba(231,76,60,.07)", "#5d3a3a"
+            detail = res[1:].strip()
+            res_html = (f'<span style="color:#ef9a9a;">❌'
+                        + (f' <span style="font-size:11px;color:#b0bec5;">{detail}</span>' if detail else "")
+                        + "</span>")
+            pay_html = f'<span style="color:#78909c;">{pay}</span>'
+        else:
+            bg, border = "rgba(52,152,219,.08)", "#3d5a75"
+            res_html = '<span style="color:#90caf9;">⏳ 結果待ち</span>'
+            pay_html = '<span style="color:#78909c;">—</span>'
+        parts.append(
+            f'<div style="display:grid;grid-template-columns:64px 1fr 74px 1fr 78px;gap:6px;'
+            f'align-items:center;padding:5px 8px;border-radius:6px;background:{bg};'
+            f'border-left:3px solid {border};font-size:13px;">'
+            f'<span style="font-weight:700;">{r.get("券種", "")}</span>'
+            f'<span>{combo_chips(r.get("買い目", ""))}</span>'
+            f'<span style="font-family:Consolas,monospace;color:#cfd8dc;">{r.get("オッズ", "—")}</span>'
+            f'{res_html}'
+            f'<span style="text-align:right;">{pay_html}</span></div>'
+        )
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def render_race_dots(races: list[int], outcome: dict[int, bool],
+                     next_race: int | None = None,
+                     recommended: set[int] | None = None) -> str:
+    """R1〜Rn の結果ドット列 (⭕緑 / ❌赤 / 🔥次 / 💎推奨 / 未走グレー)。一目で流れが分かる。"""
+    recommended = recommended or set()
+    dots = []
+    for r in races:
+        if r in outcome:
+            if outcome[r]:
+                style, label = "background:#2ecc71;color:#083;", "⭕"
+            else:
+                style, label = "background:#4a2b2b;color:#ef9a9a;", "❌"
+        elif next_race is not None and r == next_race:
+            style, label = ("background:linear-gradient(135deg,#ff6f00,#ffd600);color:#000;"
+                            "box-shadow:0 0 8px rgba(255,214,0,.7);"), "🔥"
+        elif r in recommended:
+            style, label = "background:#6a1b9a;color:#fff;box-shadow:0 0 6px rgba(186,104,200,.8);", "💎"
+        else:
+            style, label = "background:#2a3038;color:#607d8b;", ""
+        dots.append(
+            f'<div style="display:flex;flex-direction:column;align-items:center;gap:2px;">'
+            f'<span style="width:28px;height:28px;border-radius:50%;display:flex;align-items:center;'
+            f'justify-content:center;font-size:13px;{style}">{label}</span>'
+            f'<span style="font-size:10px;color:#8a97a5;">R{r}</span></div>'
+        )
+    return ('<div style="display:flex;gap:6px;flex-wrap:wrap;margin:6px 0 10px 0;">'
+            + "".join(dots) + "</div>")
+
+
 def _autorace_bike_svg(num: int) -> str:
     """オートレース車両 SVG (実車準拠 2026-06-11 改訂)。
 
@@ -1665,27 +1812,20 @@ tick();
             with c1:
                 st.markdown(f"**予想 top 3** ({source_label})")
                 if info["df"] is not None:
-                    cols_show = ["car_no", "pred_calib"]
-                    if "ev_avg_calib" in info["df"].columns:
-                        cols_show.append("ev_avg_calib")
-                    top3 = info["df"].head(3)[cols_show].copy()
-                    top3["car_no"] = top3["car_no"].astype(int)
-                    top3["pred_calib"] = top3["pred_calib"].round(3)
-                    rename_map = {"car_no": "車", "pred_calib": "pred"}
-                    if "ev_avg_calib" in top3.columns:
-                        top3["ev_avg_calib"] = top3["ev_avg_calib"].round(2)
-                        rename_map["ev_avg_calib"] = "EV"
-                    top3 = top3.rename(columns=rename_map)
-                    st.dataframe(top3, hide_index=True, width="stretch")
+                    _t3 = info["df"].head(3)
+                    _has_ev = "ev_avg_calib" in _t3.columns
+                    _rows = [(int(rr["car_no"]), rr["pred_calib"],
+                              rr["ev_avg_calib"] if _has_ev else None)
+                             for _, rr in _t3.iterrows()]
+                    st.markdown(render_top3_html(_rows, ev_thr=recommend_thr),
+                                unsafe_allow_html=True)
                 else:
-                    st.dataframe(
-                        pd.DataFrame({"車": top_cars, "順位": ["◎ 本命", "○ 対抗", "▲ 単穴"][:len(top_cars)]}),
-                        hide_index=True, width="stretch",
-                    )
+                    st.markdown(render_top3_html([(c, None, None) for c in top_cars]),
+                                unsafe_allow_html=True)
             with c2:
                 n_bets = len(selected_bets)
                 st.markdown(f"**買い目** ({fmt_yen(bet_amount)} × {n_bets} = {fmt_yen(bet_amount*n_bets)})")
-                st.dataframe(pd.DataFrame(result_rows), hide_index=True, width="stretch")
+                st.markdown(render_bets_html(result_rows), unsafe_allow_html=True)
 
     # ── ヒーローカードを最上段に充填 ──
     n_settled = sum(1 for info in live_data.values() if info["has_result"])
@@ -1699,6 +1839,14 @@ tick();
             st.progress(
                 n_settled / len(races),
                 text=f"進捗: {n_settled} / {len(races)} レース確定 ／ 投票残 {len(races) - n_settled} R",
+            )
+            # R1〜Rn の結果ドット列 (⭕/❌/🔥次/💎推奨)
+            st.markdown(
+                render_race_dots(
+                    [int(x) for x in races], dict(settled_seq), next_race_no,
+                    {int(x) for x in recommended_pending_races},
+                ),
+                unsafe_allow_html=True,
             )
         # 🌡 今日のムード + 連続的中/連敗ストリーク
         mood_emoji, mood_text = today_mood(profit, n_settled)
@@ -1751,6 +1899,8 @@ tick();
                     f"💰 当日収支 {profit_emoji}",
                     fmt_yen(profit),
                     delta=f"ROI {roi*100:.1f}%" if settled_cost else None,
+                    # ROI<100% は赤 (delta は数値符号で色が決まるので inverse で反転)
+                    delta_color="normal" if roi >= 1 else "inverse",
                 )
                 st.caption(
                     f"投資 {fmt_yen(settled_cost)} → 払戻 {fmt_yen(settled_refund)}"
@@ -1842,6 +1992,7 @@ if not is_live_mode:
 races = sorted(day_preds["race_no"].unique())
 mode_badge = "📡 ライブ予想" if is_live_mode else "📼 リプレイ"
 st.markdown(f"### {mode_badge}  📅 {target_date} {venue_label} ({len(races)} レース)")
+replay_hero = st.empty()  # ループ後に「この日の成績」を上段へ充填
 
 grand_cost = 0
 grand_refund = 0
@@ -1903,26 +2054,42 @@ for r in races:
         c1, c2 = st.columns([1, 2])
         with c1:
             st.markdown("**予測 top 3**")
-            top3_df = race_preds.head(3)[["car_no", "pred_calib"]].copy()
-            top3_df["car_no"] = top3_df["car_no"].astype(int)
-            top3_df["pred_calib"] = top3_df["pred_calib"].round(3)
-            top3_df.columns = ["車", "pred"]
-            st.dataframe(top3_df, hide_index=True, width="stretch")
+            st.markdown(render_top3_html(
+                [(int(rr["car_no"]), rr["pred_calib"], None)
+                 for _, rr in race_preds.head(3).iterrows()]),
+                unsafe_allow_html=True)
         with c2:
             n_bets = len(selected_bets)
             st.markdown(f"**買い目** ({fmt_yen(bet_amount)} × {n_bets} = {fmt_yen(bet_amount*n_bets)})")
-            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+            st.markdown(render_bets_html(rows), unsafe_allow_html=True)
 
 # 1日サマリ
 st.markdown("---")
 if show_results:
     profit = grand_refund - grand_cost
     roi = grand_refund / grand_cost if grand_cost else 0
-    cols = st.columns(4)
-    cols[0].metric("投資合計", fmt_yen(grand_cost))
-    cols[1].metric("払戻合計", fmt_yen(grand_refund))
-    cols[2].metric("収支", fmt_yen(profit), delta=f"{(roi-1)*100:+.1f}%")
-    cols[3].metric("ROI", f"{roi*100:.1f}%")
+    # 上段ヒーロー: この日の成績 + 結果ドット列 + ムード (ライブの「本日の戦況」と対になる)
+    with replay_hero.container():
+        st.markdown("#### 🏁 この日の成績")
+        _outcome = {int(s["race"]): s["refund"] > 0 for s in race_summaries}
+        st.markdown(render_race_dots([int(x) for x in races], _outcome),
+                    unsafe_allow_html=True)
+        _me, _mt = today_mood(profit, len(race_summaries))
+        _best = max(race_summaries, key=lambda s: s["refund"]) if race_summaries else None
+        st.markdown(f'<div style="font-size:15px;margin:0 0 8px 0;">{_me} <b>この日の調子:</b> {_mt}</div>',
+                    unsafe_allow_html=True)
+        cols = st.columns(4)
+        _pe = "🟢" if profit > 0 else ("🔴" if profit < 0 else "⚪")
+        # ROI<100% は赤にする (delta の数値符号で色が決まるため inverse で反転)
+        cols[0].metric(f"💰 収支 {_pe}", fmt_yen(profit), delta=f"ROI {roi*100:.1f}%",
+                       delta_color="normal" if roi >= 1 else "inverse")
+        cols[1].metric("🎯 的中R", f"{sum(1 for v in _outcome.values() if v)} / {len(_outcome)}")
+        cols[2].metric("🏆 最大払戻",
+                       fmt_yen(_best["refund"]) if _best and _best["refund"] > 0 else "—",
+                       delta=(f"R{_best['race']}" if _best and _best["refund"] > 0 else None),
+                       delta_color="off")
+        cols[3].metric("💸 払戻合計", fmt_yen(grand_refund),
+                       delta=f"投資 {fmt_yen(grand_cost)}", delta_color="off")
 
     # レース別収支グラフ
     st.markdown("### レース別 当日収支")
