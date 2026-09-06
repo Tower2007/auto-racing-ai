@@ -52,3 +52,16 @@ THREE_POINT_POLICY_PAIRS: frozenset[tuple[int, str]] = frozenset(
 # 下回ったら三連系購入を停止する (実装: src/backstop.py、sticky フラグ方式)。
 # ポリシー変更 (THREE_POINT_POLICY の場の廃止/追加) ではリセットされない。
 THREE_POINT_BACKSTOP_LOSS_YEN: int = -10_000
+
+
+# ── 発火時 EV の drift 割引係数 (案A、2026-09-06 導入) ──────────────────────────
+# 発走 -4 分の複勝オッズは締切までの late money で本命側に縮む (=発火時 EV は
+# 系統的に過大)。odds_ts の 7 時点スナップ (7/5〜9/5, 最人気車 n=1331) で
+# ratio_med = odds(-4min)/odds(確定) = 1.0938、>1.0 率 59.4% (8/8 再測定 60.1% と不動)。
+# 1/ratio_med を発火時 EV に掛けて「確定 EV の中央値推定」に補正する。
+# 実効閾値: 複勝 1.50 → 1.64 相当、三連系 1.80 → 1.97 相当。
+# 実績検証 (shadow_picks × payouts 複勝): 補正で落ちる 1.50-1.64 帯は ROI 89%、
+# 補正後 ROI 98.8% → 101.4% (n=242→191)。効果は +2〜3pt の見込み (控除率の壁は越えない)。
+# 再測定: scripts/ev_drift_curve.py --thr 1.50 --snapshots (レポート reports/ev_drift_curve_*.md)。
+# 1.0 にすれば旧挙動 (割引なし) に戻る。
+FIRE_EV_DISCOUNT: float = 0.9143

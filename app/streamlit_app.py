@@ -28,6 +28,10 @@ from sklearn.isotonic import IsotonicRegression
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 sys.path.insert(0, str(ROOT))  # daily_predict / src を import 可能に
+try:
+    from src.strategy_config import FIRE_EV_DISCOUNT  # 発火時 EV の drift 割引 (2026-09-06)
+except Exception:
+    FIRE_EV_DISCOUNT = 1.0
 RACE_KEY = ["race_date", "place_code", "race_no"]
 
 # JST 固定 (Streamlit Cloud は UTC なので明示変換が必須)
@@ -321,7 +325,8 @@ def fetch_live_day(date_str: str, pc: int) -> dict:
                             (_omax > ODDS_MAX_CAP)
                             | ((_omin > 0) & (_omax / _omin > ODDS_RATIO_CAP))
                         )
-                        _ev_raw = feat["pred_calib"] * (_omin + _omax) / 2
+                        # daily_predict と同じ drift 割引 (メールとアプリの EV を一致させる)
+                        _ev_raw = feat["pred_calib"] * (_omin + _omax) / 2 * FIRE_EV_DISCOUNT
                         feat["ev_avg_calib"] = _ev_raw.where(~_anomalous, _np.nan)
                         feat["pred_rank"] = feat["pred"].rank(method="min", ascending=False)
                         feat = feat.sort_values("pred_calib", ascending=False)

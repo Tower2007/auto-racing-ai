@@ -117,6 +117,10 @@ reports/               # 各種分析レポート(commit 対象)
 - 動的方式に置換。`AutoraceMorningPredict` / `NoonPredict` / `EveningPredict` は disable を経て **2026-08-06 に削除済み** (3 つとも Disabled のまま 3 ヶ月無発火を確認の上で schtasks /Delete)
 
 戦略仕様: `docs/ev_strategy_findings.md` 参照(thr=1.50、中間モデル、複勝 top-1)。
+**発火時 EV の drift 割引 (2026-09-06 案A)**: `src/strategy_config.py:FIRE_EV_DISCOUNT`
+(=0.9143) を EV に掛けてから閾値判定 (実効 複勝 1.64 / 三連系 1.97 相当)。根拠は
+`reports/ev_drift_curve_2026-09-06.md` (n=1331 で >1.0率 59.4%、永久保留バンドと判明し
+実績帯別 ROI でも 1.50-1.64 帯のみ 89% と劣後)。アプリのライブ EV も同係数。
 EV 閾値は 2026-05-31 の `scripts/ev_threshold_sweep.py` (walk-forward 25ヶ月) で
 2.00 (ROI効率185%・〜1本/日) も検討したが、総利益(¥68,510 > ¥60,930)と賭け機会
 (〜2.5本/日)を優先して **1.50 を維持** (ROI 136%・全25ヶ月プラス)。

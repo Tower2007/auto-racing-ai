@@ -119,6 +119,7 @@ EXPECTED_VOTES_CSV = DATA / "expected_votes.csv"  # 場×R別 typical 票数 →
 # 購入対象は src/strategy_config.py の THREE_POINT_POLICY が正本 (監査 P1-3 対策)。
 # 2026-07-11: 飯塚(5) を RF3 から除外 (実弾 0/17)。設定変更は strategy_config で。
 from src.strategy_config import (  # noqa: E402
+    FIRE_EV_DISCOUNT,
     RT3_ELIGIBLE_PLACES, RF3_ELIGIBLE_PLACES,
 )
 # 全場・全期間 絶対損失バックストップ (-¥10,000, sticky)。2026-07-11 監査 P2。
@@ -551,7 +552,10 @@ def predict_race(
                 (odds_max > ODDS_MAX_CAP)
                 | ((odds_min > 0) & (odds_max / odds_min > ODDS_RATIO_CAP))
             )
-            ev_raw = feat["pred_calib"] * (odds_min + odds_max) / 2
+            # 2026-09-06 案A: 発火時 EV に drift 割引 (FIRE_EV_DISCOUNT=0.9143、
+            # 確定 EV の中央値推定)。実効閾値 複勝 1.64 / 三連系 1.97 相当。
+            # 根拠: reports/ev_drift_curve_2026-09-06.md、係数の正本は strategy_config。
+            ev_raw = feat["pred_calib"] * (odds_min + odds_max) / 2 * FIRE_EV_DISCOUNT
             feat["ev_avg_calib"] = ev_raw.where(~anomalous, np.nan)
             feat["pred_rank"] = feat["pred"].rank(method="min", ascending=False)
 
@@ -944,6 +948,8 @@ def append_shadow_log(top1: pd.DataFrame, time_label: str, thr: float):
 
     各 top-1 候補に対して、複数の仮想条件での buy/skip を記録:
       - drift 補正: close_ev_est = fire_ev * 0.70 / 0.80
+      ※ 2026-09-06 以降の fire_ev は FIRE_EV_DISCOUNT (x0.9143) 適用後の値
+        (= 実際の購入判定に使った EV)。それ以前の行は割引なしの生値。
       - 代替閾値: thr=1.80 / 2.00
     後日の結果照合で、どの条件が最適かを評価する。
     """
