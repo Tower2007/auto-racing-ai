@@ -396,3 +396,8 @@ date,place_code,place_name,race_no,bet_amount,refund_amount,profit
 2026-09-12,5,iizuka,1,100,100,0
 2026-09-12,5,iizuka,2,100,100,0
 2026-09-12,6,sanyou,7,100,0,-100
+2026-09-13,3,isesaki,2,200,790,590
+2026-09-13,3,isesaki,4,200,100,-100
+2026-09-13,3,isesaki,5,200,100,-100
+2026-09-13,4,hamamatsu,4,300,0,-300
+2026-09-13,5,iizuka,1,100,130,30
