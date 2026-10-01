@@ -454,3 +454,6 @@ date,place_code,place_name,race_no,bet_amount,refund_amount,profit
 2026-09-29,3,isesaki,6,100,370,270
 2026-09-29,3,isesaki,7,100,0,-100
 2026-09-29,6,sanyou,8,100,120,20
+2026-09-30,6,sanyou,5,100,110,10
+2026-09-30,6,sanyou,8,100,130,30
+2026-09-30,6,sanyou,9,100,170,70
