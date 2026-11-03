@@ -1186,6 +1186,46 @@ def append_rt3_paper(ref: dict) -> None:
         logging.warning("rt3_paper.csv append failed: %s", e)
 
 
+# 自動発注が「処理できなかった」とみなす verdict (候補メールを手動購入用に送る)。
+#   failed    : 投票失敗 (AUTO-BUY 失敗メールはあるが購入ボタンが無い)
+#   skip_lock : 先行プロセス実行中で今回の発注をスキップ (専用の通知メールが無い)
+# check_guards の skip (日次上限・損失停止など) は意図した見送りで、AUTO-BUY skip
+# メールが出るため対象外。skip_abandoned_* は専用の警告メールがあるため対象外。
+AUTO_BUY_UNHANDLED_VERDICTS = frozenset({"failed", "skip_lock"})
+
+
+def candidate_mail_decision(n_picks: int, auto_buy_enabled: bool, dry_run: bool,
+                            send_always: bool, n_candidates: int,
+                            verdicts: list[dict] | None,
+                            auto_buy_error: bool) -> tuple[bool, str]:
+    """買い候補メールを送るか (send, reason) を返す (2026-11-03)。
+
+    自動発注が全候補を処理した R では、AUTO-BUY メール (投票完了/失敗/skip) と
+    重複するため送らない。自動発注が動かなかった/処理しきれなかった時だけ、
+    手動購入ボタン付きの候補メールを fallback として送る。
+    """
+    if n_picks == 0:
+        return True, "候補なし (suppress-noresult-email 側で判定)"
+    if send_always:
+        return True, "AUTO_BUY_SEND_CANDIDATE_MAIL=True (従来どおり毎回送信)"
+    if not auto_buy_enabled:
+        return True, "自動発注 OFF"
+    if dry_run:
+        return True, "自動発注 DRY-RUN (実投票なし)"
+    if auto_buy_error:
+        return True, "自動発注処理で例外"
+    if n_candidates < n_picks:
+        return True, f"自動発注の対象外の候補あり ({n_picks - n_candidates}件)"
+    verdicts = verdicts or []
+    if len(verdicts) < n_candidates:
+        return True, f"自動発注の結果が不足 ({len(verdicts)}/{n_candidates})"
+    bad = [v for v in verdicts if v.get("verdict") in AUTO_BUY_UNHANDLED_VERDICTS]
+    if bad:
+        return True, "自動発注できず: " + ", ".join(
+            f"{v.get('race')}={v.get('verdict')}" for v in bad)
+    return False, "自動発注が全候補を処理済み (AUTO-BUY メールで通知済)"
+
+
 # ─── メイン ───────────────────────────────────────────────────
 
 def _notify_fatal(target_date: str, time_label: str, err: Exception) -> None:
@@ -1419,8 +1459,14 @@ def main():
 
         # ─── 夜間限定 自動投票 (Phase 1、AUTO_BUY_ENABLED=False の間は no-op) ───
         # click-to-buy を壊さず、寝てる時間帯のみガード付きで自動投票。
+        _ab_enabled = _ab_dry = _ab_send_always = _ab_error = False
+        _ab_candidates: list = []
+        _ab_verdicts: list | None = None
         try:
             import auto_buy
+            _ab_enabled = bool(auto_buy.AUTO_BUY_ENABLED)
+            _ab_dry = bool(auto_buy.AUTO_BUY_DRY_RUN)
+            _ab_send_always = bool(getattr(auto_buy, "AUTO_BUY_SEND_CANDIDATE_MAIL", True))
             if auto_buy.AUTO_BUY_ENABLED and not picks.empty:
                 rt3_map = {
                     (int(r["place_code"]), int(r["race_no"])): r
@@ -1452,11 +1498,14 @@ def main():
                         "bets": bets,
                         "amount": sum(int(b["amount"]) for b in bets),
                     })
+                _ab_candidates = candidates
                 verdicts = auto_buy.run_auto_buy(candidates)
+                _ab_verdicts = verdicts
                 logger.info("[auto_buy] %d 候補処理 (dry_run=%s): %s",
                             len(candidates), auto_buy.AUTO_BUY_DRY_RUN,
                             [v.get("verdict") for v in verdicts])
         except Exception as e:
+            _ab_error = True
             logger.error("[auto_buy] 自動投票処理エラー(継続): %s", e)
             logger.error(traceback.format_exc())
 
@@ -1465,7 +1514,14 @@ def main():
         BUY_TTL_SEC = 240  # 4 分
         ngrok_url = None
         buy_app_pid = None
-        if not picks.empty:
+        # 買い候補メールを送るか (自動発注が全候補を処理済みなら送らない、2026-11-03)
+        send_candidate_mail, candidate_mail_reason = candidate_mail_decision(
+            len(picks), _ab_enabled, _ab_dry, _ab_send_always,
+            len(_ab_candidates), _ab_verdicts, _ab_error)
+        logger.info("買い候補メール: %s (%s)",
+                    "送信" if send_candidate_mail else "送らない", candidate_mail_reason)
+        # buy_app + ngrok は候補メールの 1-click 購入ボタン用。メールを送らない時は起動しない
+        if not picks.empty and send_candidate_mail:
             # buy_app が未起動ならバックグラウンドで起動
             try:
                 import urllib.request as _ur
@@ -1547,6 +1603,10 @@ def main():
             logger.info("--suppress-noresult-email: 候補なしのため送信スキップ")
             return
 
+        if not picks.empty and not send_candidate_mail:
+            logger.info("買い候補メール送信スキップ: %s", candidate_mail_reason)
+            return
+
         try:
             from gmail_notify import send_email
         except Exception as e:
@@ -1563,6 +1623,9 @@ def main():
     subject = f"[autorace] {target_date} {time_label} {n}候補"
     if n == 0:
         subject = f"[autorace] {target_date} {time_label} 候補なし"
+    elif _ab_enabled and not _ab_dry and not _ab_send_always:
+        # 自動発注が動いているのに候補メールを送る = 自動で処理できなかった R
+        subject = f"[autorace] ⚠️自動発注できず {target_date} {time_label} {n}候補 (手動購入可)"
     try:
         send_email(subject=subject, body=text, html=html)
         logger.info("メール送信完了: %s", subject)

@@ -92,6 +92,9 @@ AUTO_BUY_INCLUDE_RT3 = _env_bool("AUTO_BUY_INCLUDE_RT3", False)
 #   ※ これは収益判断ではなく娯楽判断。三連系 100R レビューの評価は券種別に
 #     集計するため複勝復活で汚染されない (kill-switch も rt3/rf3 のみ対象)。
 AUTO_BUY_INCLUDE_FNS = _env_bool("AUTO_BUY_INCLUDE_FNS", True)
+# 2026-11-03: 自動発注が全候補を処理できた R では daily_predict の「買い候補」メールを
+# 送らない (AUTO-BUY の投票完了/skip メールと重複するため)。True で従来どおり毎回送る。
+AUTO_BUY_SEND_CANDIDATE_MAIL = _env_bool("AUTO_BUY_SEND_CANDIDATE_MAIL", False)
 # 時間帯ガードを無視して常時自動発注するか (2026-05-31 ユーザー要望でデフォ True)。
 # False にすると下の AUTO_BUY_HOUR_START/END の夜間限定に戻る。
 AUTO_BUY_ANYTIME = _env_bool("AUTO_BUY_ANYTIME", True)
