@@ -161,7 +161,7 @@ docs/ev_strategy_findings.md の停止条件①〜④ (①初期下振れ ROI<50
 ≤-¥5000 / ③drift逆転 / ④失格率増加) を週次評価。①② 発動で `data/rt3_stop.flag`
 を書き出し、`daily_predict.rt3_buy_active()` がこれを参照して三連系まとめ買い(購入)
 を自動停止 (複勝・参考メール表示は継続)。auto_buy の三連系も同フラグで停止。
-n<10 はノイズ規律で評価保留。再開は `data/rt3_stop.flag` 削除。
+n<10 はノイズ規律で評価保留。再開は `data/rt3_stop.flag` 削除 **+ `src/strategy_config.py:THREE_POINT_KILLSWITCH_SINCE` を再開日に更新** (①② は再開日以降の購入だけで評価。更新しないと過去の累計損失で次の週次に即再停止する。⑤ バックストップ -¥10,000 は全期間のまま)。2026-09-28 に②発動 (現役累計 -¥5,890) → 2026-11-03 ユーザー判断で再開 (旧フラグは `data/rt3_stop.flag.resumed-2026-11-03` に退避)。
 場ごとに開催形態(通常/ナイター/ミッドナイト)が変わっても `liveStartTime` / `liveEndTime`
 で自動追従するため取り逃がしなし。賭け運用は **auto_buy Phase 1 による自動投票が本稼働中**
 (上記「自動投票 Phase 1」節。ToS グレーをユーザー承知の上で進行)。click-to-buy による

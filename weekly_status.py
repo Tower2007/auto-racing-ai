@@ -366,6 +366,7 @@ RT3_BET_TYPES = ("rt3", "rf3")
 # 「現役場の rt3/rf3 全て」だと廃止済みの組 (例: 伊勢崎 rt3) の損益が混入する。
 from src.strategy_config import (  # noqa: E402
     THREE_POINT_BUY_PLACES, THREE_POINT_POLICY_PAIRS,
+    THREE_POINT_KILLSWITCH_SINCE,
 )
 from src.backstop import enforce_backstop  # noqa: E402  (条件⑤ バックストップ)
 RT3_PLACES = tuple(sorted(THREE_POINT_BUY_PLACES))   # 現在: (3, 4, 6) 伊勢崎・浜松・山陽
@@ -455,8 +456,18 @@ def check_3point_health() -> dict:
         for pc, bt in zip(df["place_code"], df["bet_type_code"])
     ]
     sub = df[pd.Series(pair_ok, index=df.index)].copy()
+    # ①② は再開基準日以降の購入だけで評価 (strategy_config, 2026-11-03)。
+    # ⑤ バックストップは上で全期間評価済み (ここの絞り込みとは無関係)。
+    since = THREE_POINT_KILLSWITCH_SINCE
+    if since:
+        sub = sub[pd.to_datetime(sub["date"], errors="coerce")
+                  >= pd.Timestamp(since)]
+        out["since"] = since
     if sub.empty:
-        out["conditions"].append(("-", "INFO", "三連系の購入実績なし — 未評価"))
+        out["conditions"].append((
+            "-", "INFO",
+            "三連系の購入実績なし — 未評価"
+            + (f" (再開基準日 {since} 以降)" if since else "")))
         return out
 
     out["n_picks"] = int(
@@ -469,11 +480,13 @@ def check_3point_health() -> dict:
     n = out["n_picks"]
     roi = out["roi"]
 
+    _since_note = f" (再開基準日 {since} 以降)" if since else ""
     # ② 絶対損失停止 (n 問わず)
     if out["profit"] <= RT3_ABS_LOSS_STOP:
         out["conditions"].append((
             "②", "NG",
-            f"絶対損失停止: 累積損失 ¥{out['profit']:,} ≤ ¥{RT3_ABS_LOSS_STOP:,}"))
+            f"絶対損失停止: 累積損失 ¥{out['profit']:,} ≤ ¥{RT3_ABS_LOSS_STOP:,}"
+            + _since_note))
         out["triggered"] = True
         out["stop_reason"] = f"②絶対損失 ¥{out['profit']:,}"
 
