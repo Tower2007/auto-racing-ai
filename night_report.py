@@ -29,6 +29,20 @@ EV 乖離分析 / AI 振り返り (API 無ければテンプレ) / MD レポー�
 全レース確定後の 00:00 実行に変更。日付が跨いでいるので、実行時刻が
 正午より前なら「前日」をレポート対象にする (00:00 発火 → 直前に終わった
 開催日を報告)。--date 指定時はそちらが優先。
+
+2026-11-11 改修 (メール ROI 整合監査 C-3/C-4/C-8):
+  - 暫定精算で返還 (欠車 absent・競走不成立) と特払を払戻に数える。以前は
+    的中だけを見ており 11/06 山陽 R3 の返還 ¥300 を損失扱いにしていた
+    (暫定 ¥-900 / 確定 ¥-600)。返還は「的中」には数えない。
+  - 対象日の集計を race_date 基準にする。auto_buy_state は購入時刻の日付で
+    記録されるため、前日開催のミッドナイト R (例: 飯塚 R8 00:27 発売) が翌日の
+    state に入り、翌晩の「本日」に結果待ちで混入していた (11/10 夜次 ⏳残1)。
+    発売時刻が 05:00 前の発注は前日開催とみなして本日から外し、
+    「前日確定」欄 (bet_history) に任せる。00:00 時点で未発走の当日ミッドナイト R
+    (dynamic_scheduler が 00:00 以降に登録した R) は本文に明示し、翌晩の前日確定で補正。
+    auto_buy_state の記録日付・当日上限の計上・本タスクの発火時刻は変えていない。
+  - 件名/文言: 発注ゼロは「購入なし」、収支 ±0 は ⚪ / 「収支トントン」、
+    累積は「〜YYYY-MM-DD 取込分」と締め日を明記。件名の外形は維持。
 """
 
 from __future__ import annotations
@@ -53,6 +67,11 @@ ODDS_TS_DIR = DATA / "odds_ts"
 REPORT_DIR = DATA / "reports"
 REFLECTION_DIR = ROOT / "logs" / "reflections"
 LOG_FILE = DATA / "night_report.log"
+DYN_SCHED_LOG = DATA / "dynamic_scheduler.log"
+
+# 発売時刻がこれより前 (0:00〜4:59) の発注は「前日開催のミッドナイト R」とみなす。
+# オートの昼開催は 10 時台開始、ミッドナイトは 0 時台で終わるので 5 時で区切れる。
+MIDNIGHT_CUTOFF_HOUR = 5
 
 VENUE_PC = {"kawaguchi": 2, "isesaki": 3, "hamamatsu": 4, "iizuka": 5,
             "sanyou": 6}
@@ -116,26 +135,53 @@ def parse_bets_desc(desc: str) -> list[dict]:
     return out
 
 
-def load_today_executions(today: str) -> tuple[list[dict], int]:
-    """当日の実発注 (verdict=executed) と発注失敗数。"""
+def exec_race_date(timestamp: str | None, fallback: str) -> str:
+    """発注記録の発売時刻から開催日 (race_date) を推定する。
+
+    0:00〜MIDNIGHT_CUTOFF_HOUR 前の発注は前日開催のミッドナイト R。
+    timestamp が無い/読めない場合は fallback (state の date) を返す。
+    """
+    if not timestamp:
+        return fallback
+    try:
+        ts = dt.datetime.fromisoformat(str(timestamp))
+    except ValueError:
+        return fallback
+    d = ts.date()
+    if ts.hour < MIDNIGHT_CUTOFF_HOUR:
+        d -= dt.timedelta(days=1)
+    return d.isoformat()
+
+
+def load_today_executions(today: str) -> tuple[list[dict], int, list[str]]:
+    """対象日 (race_date=today) の実発注 (verdict=executed)、発注失敗数、
+    および state に入っているが前日開催 (ミッドナイト) と判定した発注のラベル。
+
+    auto_buy_state は購入時刻の日付で 1 日分を持つため、前日開催の深夜 R が
+    混ざる。それらは本日の暫定精算から外す (前日確定欄 = bet_history で計上済み)。
+    """
     if not STATE_FILE.exists():
-        return [], 0
+        return [], 0, []
     try:
         st = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except Exception as e:
         logging.warning("auto_buy_state 読込失敗: %s", e)
-        return [], 0
+        return [], 0, []
     if st.get("date") != today:
-        return [], 0
-    execs, failed = [], 0
+        return [], 0, []
+    execs, failed, carried = [], 0, []
     for e in st.get("executions", []):
         v = e.get("verdict")
+        venue_short, _, rno = str(e.get("race", "")).rpartition("_R")
+        pc = VENUE_PC.get(venue_short)
+        if exec_race_date(e.get("timestamp"), today) != today:
+            if v == "executed" and pc is not None:
+                carried.append(f"{VENUE_JP.get(pc, '?')} R{rno}")
+            continue
         if v == "failed":
             failed += 1
         if v != "executed":
             continue
-        venue_short, _, rno = str(e.get("race", "")).rpartition("_R")
-        pc = VENUE_PC.get(venue_short)
         if pc is None or not rno.isdigit():
             continue
         execs.append({
@@ -144,7 +190,36 @@ def load_today_executions(today: str) -> tuple[list[dict], int]:
             "bets": parse_bets_desc(e.get("bets", "")),
             "desc": e.get("bets", ""),
         })
-    return execs, failed
+    return execs, failed, carried
+
+
+def load_after_midnight_races(today: str) -> list[str]:
+    """対象日に dynamic_scheduler が 0:00 以降の発火で登録した R (ミッドナイト後半)。
+
+    00:00 の夜次時点では未発走のため本メールに含められない。発注があれば
+    翌日の state に入り、翌晩の「前日確定」(bet_history) で計上される。
+    """
+    out: list[str] = []
+    if not DYN_SCHED_LOG.exists():
+        return out
+    pat = re.compile(r"registered AutoraceDyn_([a-z]+)_R(\d+) @ (\d{2}):(\d{2})")
+    try:
+        for line in DYN_SCHED_LOG.read_text(encoding="utf-8",
+                                            errors="replace").splitlines():
+            if not line.startswith(today):
+                continue
+            m = pat.search(line)
+            if not m or int(m.group(3)) >= MIDNIGHT_CUTOFF_HOUR:
+                continue
+            pc = VENUE_PC.get(m.group(1))
+            if pc is None:
+                continue
+            label = f"{VENUE_JP[pc]} R{int(m.group(2))}"
+            if label not in out:
+                out.append(label)
+    except Exception as e:
+        logging.warning("dynamic_scheduler.log 読込失敗: %s", e)
+    return out
 
 
 def load_shadow_today(today: str) -> dict[tuple[int, int], dict]:
@@ -224,7 +299,48 @@ def fetch_refunds(pcs: set[int], today: str) -> dict[tuple[int, int], dict]:
     return out
 
 
+def settle_bet_detail(bet: dict, ri: dict) -> tuple[int, str]:
+    """RaceRefund の refundInfo で 1 買い目を精算。(払戻額, 種別) を返す。
+
+    種別: hit (的中) / henkan (返還) / tokubarai (特払) / miss (外れ)。
+    応答構造 (2026-11-11 実応答で確認、検算用に scratchpad へ保存):
+      - refundInfo["absent"]: 欠車の車番リスト。買い目に欠車を含めば全額返還
+        (11/06 山陽 R3: absent=[6] → 複勝 6号・三連単 6→8→2・三連複 2=6=8 が返還)
+      - refundInfo[券種]["typeCode"] == 3 / typeName "不成立": その券種は全額返還
+        (6/27 伊勢崎 R4・5/21 山陽 R8)
+      - typeName に「特払」: 的中者なしの特払い。list の refund (100 円あたり) を
+        全購入者に払う (実例未確認。投票履歴側 tokubaraiAmount と同じ扱いの推定)
+    確定側 (fetch_order_history → bet_history) は hit + henkan + tokubarai を
+    払戻に数えており、暫定もそれに揃える。
+    """
+    def section(key):
+        d = ri.get(key)
+        return d if isinstance(d, dict) else {}
+
+    sec = section(bet["type"])
+    if sec.get("typeCode") == 3 or "不成立" in str(sec.get("typeName", "")):
+        return bet["amount"], "henkan"
+    absent = ri.get("absent") or []
+    try:
+        absent_set = {int(c) for c in absent}
+    except (TypeError, ValueError):
+        absent_set = set()
+    if absent_set & set(bet["cars"]):
+        return bet["amount"], "henkan"
+    if "特払" in str(sec.get("typeName", "")):
+        lst = sec.get("list") or []
+        try:
+            per100 = int(lst[0].get("refund") or 0) if lst else 0
+        except (TypeError, ValueError, AttributeError):
+            per100 = 0
+        if per100 > 0:
+            return per100 * bet["amount"] // 100, "tokubarai"
+    r = settle_bet(bet, ri)
+    return r, ("hit" if r > 0 else "miss")
+
+
 def settle_bet(bet: dict, ri: dict) -> int:
+    """的中払戻のみ (返還・特払は settle_bet_detail が扱う)。"""
     def entries(key):
         d = ri.get(key)
         return d.get("list", []) if isinstance(d, dict) else []
@@ -261,7 +377,7 @@ def actual_top3(ri: dict) -> list[int] | None:
 
 def evaluate_today(today: str) -> tuple[dict, int]:
     """当日実発注の暫定精算 + shadow/確定オッズの付与。"""
-    execs, n_failed = load_today_executions(today)
+    execs, n_failed, carried = load_today_executions(today)
     refunds = fetch_refunds({e["pc"] for e in execs}, today) if execs else {}
     shadow = load_shadow_today(today)
     final_odds = load_final_fns_odds(today)
@@ -296,16 +412,19 @@ def evaluate_today(today: str) -> tuple[dict, int]:
                 b["refund"] = None
                 bt_totals[b["type"]]["pending"] += 1
             continue
+        ex["hit"] = False
         for b in ex["bets"]:
-            r = settle_bet(b, ri)
+            r, kind = settle_bet_detail(b, ri)
             b["refund"] = r
+            b["refund_kind"] = kind
             ex["refund_yen"] += r
             t = bt_totals[b["type"]]
             t["stake"] += b["amount"]
             t["payout"] += r
             t["n"] += 1
-            if r > 0:
+            if kind == "hit":
                 t["hits"] += 1
+                ex["hit"] = True
         total_stake_settled += ex["bet_yen"]
         total_payout += ex["refund_yen"]
 
@@ -315,7 +434,7 @@ def evaluate_today(today: str) -> tuple[dict, int]:
         "date": today,
         "execs": execs, "n": len(execs),
         "n_settled": len(settled), "n_pending": n_pending,
-        "n_hit": sum(1 for e in settled if e["refund_yen"] > 0),
+        "n_hit": sum(1 for e in settled if e.get("hit")),
         "stake": total_stake_settled, "payout": total_payout,
         "profit": profit,
         "roi": (total_payout / total_stake_settled * 100
@@ -326,6 +445,10 @@ def evaluate_today(today: str) -> tuple[dict, int]:
             "sanren": [bt_totals["rt3"]["hits"] + bt_totals["rf3"]["hits"],
                        bt_totals["rt3"]["n"] + bt_totals["rf3"]["n"]],
         },
+        # 前日開催のミッドナイト R (本日 state に入っていたが本日集計から除外)
+        "carried_prev": carried,
+        # 00:00 時点で未発走の当日ミッドナイト R (翌晩の前日確定で計上)
+        "after_midnight": load_after_midnight_races(today),
     }, n_failed
 
 
@@ -382,16 +505,28 @@ def generate_reflection(today: dict, prev: dict | None, cum: dict | None) -> str
         return _template_reflection(today, prev, cum) + f"\n(API error: {e})"
 
 
+def yen_signed(v: int) -> str:
+    """符号付き金額。0 は ¥±0 (「¥+0 でプラス」の誤読防止)。"""
+    return "¥±0" if v == 0 else f"¥{v:+,}"
+
+
+def profit_tone(v: int) -> str:
+    return "プラス" if v > 0 else ("マイナス" if v < 0 else "収支トントン")
+
+
 def _template_reflection(today: dict, prev: dict | None,
                          cum: dict | None) -> str:
     out = []
     if today["n"] == 0:
         out.append("本日は自動発注なし (候補が EV 閾値に届かず)。選別が正常に絞った日。")
+    elif today["n_settled"] == 0:
+        out.append(f"本日の発注 {today['n']}R は全て結果待ち。明晩の前日確定で補正。")
     else:
-        tone = "プラス" if today["profit"] >= 0 else "マイナス"
+        tone = profit_tone(today["profit"])
+        tone_txt = tone if tone == "収支トントン" else f"で{tone}"
         out.append(
             f"本日 (暫定) {today['n_hit']}/{today['n_settled']}R 的中、"
-            f"収支 ¥{today['profit']:+,} で{tone}。"
+            f"収支 {yen_signed(today['profit'])} {tone_txt}。"
             + (f"結果待ち {today['n_pending']}R は明晩の確定で補正。"
                if today["n_pending"] else "")
         )
@@ -417,12 +552,13 @@ def _template_reflection(today: dict, prev: dict | None,
                        f"{len(crossed)}/{len(drifts)} 件。drift の既知問題、"
                        f"件数が常態化するなら発火時 EV の割引補正を検討。")
     if cum:
+        until = f"〜{cum['last']} 取込分"
         if cum["roi"] >= 110:
-            out.append(f"累積 ROI {cum['roi']:.1f}% でエッジ持続中。")
+            out.append(f"累積 ROI {cum['roi']:.1f}% ({until}) でエッジ持続中。")
         elif cum["roi"] >= 100:
-            out.append(f"累積 ROI {cum['roi']:.1f}% でぎりぎりプラス圏。")
+            out.append(f"累積 ROI {cum['roi']:.1f}% ({until}) でぎりぎりプラス圏。")
         else:
-            out.append(f"累積 ROI {cum['roi']:.1f}% (確定 {cum['n']}R)。"
+            out.append(f"累積 ROI {cum['roi']:.1f}% (確定 {cum['n']}R、{until})。"
                        f"控除率の壁の下、想定レンジ内かは週次で確認。")
     return "\n".join(out)
 
@@ -456,7 +592,7 @@ def _anthropic_reflection(today: dict, prev: dict | None, cum: dict | None,
 【レース詳細】
 {chr(10).join(races)}
 
-【累積 (確定分)】
+【累積 (確定分、実弾・全券種)】
 {f"- {cum['first']} 〜 {cum['last']} / {cum['n']}R / 収支 ¥{cum['profit']:+,} (ROI {cum['roi']:.1f}%)" if cum else "- なし"}
 
 次の3点に触れてください:
@@ -489,7 +625,7 @@ def persist_reflection(today_str: str, reflection: str, today: dict) -> Path:
     with path.open("a", encoding="utf-8") as f:
         f.write(f"\n{heading}\n")
         f.write(f"- 発注 {today['n']}R / 暫定 的中 {today['n_hit']}/"
-                f"{today['n_settled']}R / 暫定収支 ¥{today['profit']:+,}\n")
+                f"{today['n_settled']}R / 暫定収支 {yen_signed(today['profit'])}\n")
         for ln in reflection.splitlines():
             if ln.strip():
                 f.write(f"- {ln.strip()}\n")
@@ -515,8 +651,16 @@ def render_md(today: dict, n_failed: int, prev: dict | None, prev_date: str,
     lines.append(f"- 発注: {today['n']}R" + (f" / 発注失敗 {n_failed}" if n_failed else ""))
     lines.append(f"- 的中: {today['n_hit']} / {today['n_settled']}R"
                  + (f" (結果待ち {today['n_pending']}R)" if today['n_pending'] else ""))
-    lines.append(f"- 収支: ¥{today['profit']:+,} (暫定 ROI {today['roi']:.1f}%)")
+    if today["n"] == 0:
+        lines.append("- 収支: 購入なし")
+    elif today["n_settled"] == 0:
+        lines.append("- 収支: 全て結果待ち")
+    else:
+        lines.append(f"- 収支: {yen_signed(today['profit'])} "
+                     f"(暫定 ROI {today['roi']:.1f}%、返還・特払込み)")
     lines.append("- ※ 確定値は翌 02:30 取得、明晩のメールで補正")
+    for note in _scope_notes(today):
+        lines.append(f"- ※ {note}")
     lines.append("")
     lines.append("## 券種別 内訳 (暫定)")
     for bt in ("fns", "rt3", "rf3"):
@@ -532,17 +676,18 @@ def render_md(today: dict, n_failed: int, prev: dict | None, prev_date: str,
     if prev:
         lines.append(f"## 前日確定 ({prev_date})")
         lines.append(f"- {prev['n']}R / ¥{prev['bet']:,} → ¥{prev['refund']:,} / "
-                     f"収支 ¥{prev['profit']:+,} (ROI {prev['roi']:.1f}%)")
+                     f"収支 {yen_signed(prev['profit'])} (ROI {prev['roi']:.1f}%)")
         lines.append("")
     if cum:
-        lines.append("## 累積実績 (確定分)")
-        lines.append(f"- 期間: {cum['first']} 〜 {cum['last']} ({cum['days']}日)")
+        lines.append("## 累積実績 (確定分・実弾・全券種)")
+        lines.append(f"- 期間: {cum['first']} 〜 {cum['last']} 取込分 ({cum['days']}日)")
         lines.append(f"- 通算: {cum['n']}R / 収支 ¥{cum['profit']:+,} "
                      f"(ROI {cum['roi']:.1f}%) / 勝日 {cum['win_days']}/{cum['days']}")
         lines.append("")
     lines.append("## 本日レース内訳")
     for e in today["execs"]:
-        flag = "⏳" if e["pending"] else ("⭕" if e["refund_yen"] > 0 else "❌")
+        flag = "⏳" if e["pending"] else ("⭕" if e.get("hit") else
+                                          ("↩️" if e["refund_yen"] > 0 else "❌"))
         lines.append(f"### {flag} {e['venue_jp']} R{e['race_no']}")
         lines.append(f"- 買い目: {e['desc']}")
         if e.get("pred_calib") is not None:
@@ -553,7 +698,9 @@ def render_md(today: dict, n_failed: int, prev: dict | None, prev_date: str,
         if e["top3"]:
             lines.append(f"- 着順: {'-'.join(map(str, e['top3']))}")
         if not e["pending"]:
-            lines.append(f"- 払戻: ¥{e['refund_yen']:,}")
+            kinds = {b.get("refund_kind") for b in e["bets"]} - {"hit", "miss", None}
+            extra = "".join(f" ({_KIND_JP[k]}含む)" for k in sorted(kinds))
+            lines.append(f"- 払戻: ¥{e['refund_yen']:,}{extra}")
         lines.append("")
     lines.append("## 振り返り")
     lines.append(reflection)
@@ -562,8 +709,28 @@ def render_md(today: dict, n_failed: int, prev: dict | None, prev_date: str,
     return "\n".join(lines)
 
 
+_KIND_JP = {"henkan": "返還", "tokubarai": "特払"}
+
+
+def _scope_notes(today: dict) -> list[str]:
+    """本日集計の範囲 (日跨ぎ) の注記。"""
+    notes = []
+    if today.get("carried_prev"):
+        prev_day = (dt.date.fromisoformat(today["date"])
+                    - dt.timedelta(days=1)).isoformat()
+        notes.append(f"前日 ({prev_day}) 開催のミッドナイト分 {len(today['carried_prev'])}R "
+                     f"({', '.join(today['carried_prev'])}) は本日に含めず、"
+                     f"前日確定欄で計上")
+    if today.get("after_midnight"):
+        notes.append(f"本日開催で 00:00 以降に発走するミッドナイト "
+                     f"{len(today['after_midnight'])}R "
+                     f"({', '.join(today['after_midnight'])}) は本メール時点で未発走 "
+                     f"→ 発注があれば結果待ち扱いで、明晩の前日確定欄で計上")
+    return notes
+
+
 def _html_summary_card(today: dict, n_failed: int) -> list[str]:
-    color = _GREEN if today["profit"] >= 0 else _RED
+    color = _GREEN if today["profit"] > 0 else (_RED if today["profit"] < 0 else "#555")
     h = [f'<div style="{_S_CARD}">',
          f'<h2 style="{_S_H2}margin-top:0">本日サマリ <span style="font-size:12px;'
          f'color:#666;font-weight:normal;">(暫定 — 確定は翌02:30、明晩補正)</span></h2>',
@@ -584,11 +751,15 @@ def _html_summary_card(today: dict, n_failed: int) -> list[str]:
          f'<td style="{_S_TD_NUM}">¥{today["payout"]:,}</td></tr>',
          f'<tr><td style="{_S_TD}">収支</td>'
          f'<td style="{_S_TD_NUM}color:{color};font-weight:bold;">'
-         f'¥{today["profit"]:+,}</td></tr>',
-         f'<tr><td style="{_S_TD}">暫定 ROI</td>'
+         f'{yen_signed(today["profit"]) if today["n_settled"] else "—"}</td></tr>',
+         f'<tr><td style="{_S_TD}">暫定 ROI (返還・特払込み)</td>'
          f'<td style="{_S_TD_NUM}color:{color};font-weight:bold;">'
-         f'{today["roi"]:.1f}%</td></tr>',
-         '</table></div>']
+         + (f'{today["roi"]:.1f}%' if today["n_settled"] else "—")
+         + '</td></tr>',
+         '</table>']
+    for note in _scope_notes(today):
+        h.append(f'<p style="font-size:12px;color:#e65100;margin:4px 0;">※ {note}</p>')
+    h.append('</div>')
     return h
 
 
@@ -621,7 +792,7 @@ def _html_bet_type_section(today: dict) -> list[str]:
 def _html_confirmed_section(prev: dict | None, prev_date: str,
                             cum: dict | None) -> list[str]:
     h = [f'<div style="{_S_CARD}">',
-         f'<h2 style="{_S_H2}margin-top:0">確定実績 (bet_history)</h2>',
+         f'<h2 style="{_S_H2}margin-top:0">確定実績 (bet_history・実弾・全券種)</h2>',
          f'<table style="{_S_TABLE}">',
          f'<tr><th style="{_S_TH}">区分</th><th style="{_S_TH}">R</th>'
          f'<th style="{_S_TH}">収支</th><th style="{_S_TH}">ROI</th></tr>']
@@ -630,11 +801,11 @@ def _html_confirmed_section(prev: dict | None, prev_date: str,
         h.append(f'<tr><td style="{_S_TD}">前日確定 ({prev_date})</td>'
                  f'<td style="{_S_TD_NUM}">{prev["n"]}</td>'
                  f'<td style="{_S_TD_NUM}color:{c};font-weight:bold;">'
-                 f'¥{prev["profit"]:+,}</td>'
+                 f'{yen_signed(prev["profit"])}</td>'
                  f'<td style="{_S_TD_NUM}">{prev["roi"]:.1f}%</td></tr>')
     if cum:
         c = _GREEN if cum["profit"] >= 0 else _RED
-        h.append(f'<tr><td style="{_S_TD}">累積 {cum["first"]}〜 '
+        h.append(f'<tr><td style="{_S_TD}">累積 {cum["first"]}〜{cum["last"]} 取込分 '
                  f'({cum["days"]}日, 勝日{cum["win_days"]})</td>'
                  f'<td style="{_S_TD_NUM}">{cum["n"]}</td>'
                  f'<td style="{_S_TD_NUM}color:{c};font-weight:bold;">'
@@ -696,8 +867,13 @@ def _html_race_table(today: dict) -> list[str]:
         if ex["pending"]:
             return (f'<td style="{_S_TD}color:#e65100;font-size:11px;">'
                     f'⏳ {label}</td>')
-        hit = (b.get("refund") or 0) > 0
-        icon, color = ("⭕", _GREEN) if hit else ("❌", _RED)
+        kind = b.get("refund_kind")
+        if kind == "hit":
+            icon, color = "⭕", _GREEN
+        elif kind in _KIND_JP:
+            icon, color = f"↩️{_KIND_JP[kind]}", "#555"
+        else:
+            icon, color = "❌", _RED
         return (f'<td style="{_S_TD}color:{color};font-size:11px;">'
                 f'{icon} {label}<br>¥{b.get("refund") or 0:,}</td>')
 
@@ -726,9 +902,36 @@ def _html_reflection_section(reflection: str) -> list[str]:
             'logs/reflections/YYYY-MM.md</p>']
 
 
+def day_flag(today: dict) -> str:
+    """件名・見出しの旗。購入なし/結果待ちのみ/±0 を 🟢🔴 にしない (2026-11-11)。"""
+    if today["n"] == 0:
+        return "⚪"
+    if today["n_settled"] == 0:
+        return "⏳"
+    if today["profit"] > 0:
+        return "🟢"
+    if today["profit"] < 0:
+        return "🔴"
+    return "⚪"
+
+
+def build_subject(today_str: str, today: dict, n_failed: int) -> str:
+    """件名。外形 `[autorace] 🌙 夜次 <日付> ...` は維持。"""
+    head = f"[autorace] 🌙 夜次 {today_str} {day_flag(today)} "
+    failed_tag = f" ⚠️失敗{n_failed}" if n_failed else ""
+    if today["n"] == 0:
+        return head + "購入なし" + failed_tag
+    pending_tag = f" ⏳残{today['n_pending']}" if today["n_pending"] else ""
+    if today["n_settled"] == 0:
+        return head + f"結果待ち {today['n']}R" + failed_tag
+    return (head + f"暫定ROI={today['roi']:.0f}% "
+            f"({today['n_hit']}/{today['n_settled']}) "
+            f"{yen_signed(today['profit'])}{pending_tag}{failed_tag}")
+
+
 def render_html(today: dict, n_failed: int, prev: dict | None, prev_date: str,
                 cum: dict | None, reflection: str) -> str:
-    flag = "🟢" if today["roi"] >= 100 else "🔴"
+    flag = day_flag(today)
     h = [f'<div style="{_S_BODY}">',
          f'<h1>🌙 オートレース 夜次レポート {today["date"]} {flag}</h1>']
     h += _html_summary_card(today, n_failed)
@@ -779,13 +982,7 @@ def main() -> int:
     md = render_md(today, n_failed, prev, prev_date, cum, reflection)
     html = render_html(today, n_failed, prev, prev_date, cum, reflection)
 
-    flag = "🟢" if today["roi"] >= 100 else "🔴"
-    pending_tag = f" ⏳残{today['n_pending']}" if today["n_pending"] else ""
-    failed_tag = f" ⚠️失敗{n_failed}" if n_failed else ""
-    subject = (f"[autorace] 🌙 夜次 {today_str} {flag} "
-               f"暫定ROI={today['roi']:.0f}% "
-               f"({today['n_hit']}/{today['n_settled']}) "
-               f"¥{today['profit']:+,}{pending_tag}{failed_tag}")
+    subject = build_subject(today_str, today, n_failed)
 
     if args.dry_run:
         print("--- DRY RUN ---")

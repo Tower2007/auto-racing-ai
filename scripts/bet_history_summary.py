@@ -220,7 +220,7 @@ def render_sanren_text(alltime: dict, recent: dict, days: int,
              "-" * 60,
              f"  100R レビュー済 (2026-08-15): 基準 ROI>120% 未達 → 増額なし、娯楽枠で継続"]
     lines.append(
-        f"  全期間: {alltime['n']:>3d} R / 的中 {alltime['hits']:>3d} "
+        f"  全期間 (返還込み): {alltime['n']:>3d} R / 的中 {alltime['hits']:>3d} "
         f"({alltime['hit_rate']:>4.1f}%) / 投資 {yen(alltime['bet'], 8)} / "
         f"払戻 {yen(alltime['refund'], 8)} / "
         f"損益 {yen(alltime['profit'], 9, signed=True)} / "
@@ -283,7 +283,7 @@ def render_sanren_html(alltime: dict, recent: dict, days: int,
         f'<tr><th {TH}>区分</th><th {TH_R}>R 数</th><th {TH_R}>的中</th>'
         f'<th {TH_R}>投資</th><th {TH_R}>払戻</th><th {TH_R}>損益</th>'
         f'<th {TH_R}>ROI</th></tr>',
-        f'<tr><td {TD_L}><b>全期間</b></td>'
+        f'<tr><td {TD_L}><b>全期間</b> (返還込み)</td>'
         f'<td {TD_R}>{alltime["n"]:,}</td>'
         f'<td {TD_R}>{alltime["hits"]:,} ({alltime["hit_rate"]:.1f}%)</td>'
         f'<td {TD_R}>¥{alltime["bet"]:,}</td>'
@@ -341,7 +341,7 @@ def render_text(days: int, recent: dict, venues: list[dict],
                 bet_types: list[dict], alltime: dict,
                 period_label: str, alltime_label: str) -> str:
     lines: list[str] = []
-    lines.append(f"【💰 実購入損益】 {period_label}")
+    lines.append(f"【💰 実購入損益 [実弾・全券種・レース日基準]】 {period_label}")
     lines.append("-" * 60)
 
     # ① 直近 N 日 全体
@@ -417,7 +417,7 @@ def render_html(days: int, recent: dict, venues: list[dict],
     parts.append(
         '<h3 style="color:#444; margin:18px 0 8px 0;">'
         f'💰 実購入損益 <span style="font-weight:normal; color:#666; font-size:13px;">'
-        f'({period_label})</span></h3>'
+        f'[実弾・全券種・レース日基準] ({period_label})</span></h3>'
     )
 
     # ① 直近 N 日 + ④ 全期間: 1 つのまとめ表
@@ -524,7 +524,7 @@ def build_summary(days: int) -> tuple[str, str] | None:
 
     alltime_agg = _agg(summary)
     alltime_label = (
-        f"{summary['date'].min().isoformat()} 〜 {summary['date'].max().isoformat()}"
+        f"{summary['date'].min().isoformat()} 〜 {summary['date'].max().isoformat()} 取込分"
     )
     today = dt.date.today()
     period_label = (

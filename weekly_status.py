@@ -418,13 +418,13 @@ def check_3point_health() -> dict:
         if bs.get("active"):
             out["conditions"].append((
                 "⑤", "NG",
-                f"全場バックストップ発動中 (sticky): 全場累積 "
+                f"全場バックストップ発動中 (sticky): 全場累積 (返還除く・停止判定用) "
                 + (f"¥{profit_all:,}" if profit_all is not None else "—")
                 + f" ≤ ¥{thr:,} — 解除は data/rt3_backstop_stop.flag を人間が削除"))
         elif profit_all is not None:
             out["conditions"].append((
                 "⑤", "OK",
-                f"全場バックストップ OK: 全場・全期間累積 ¥{profit_all:,} "
+                f"全場バックストップ OK: 全場・全期間累積 (返還除く・停止判定用) ¥{profit_all:,} "
                 f"> ¥{thr:,}"))
         else:
             out["conditions"].append((

@@ -15,6 +15,12 @@ Windows Task Scheduler から毎日呼ばれるバッチ。データ蓄積に専
   python daily_ingest.py                # default: --catchup 2 (昨日+一昨日)
   python daily_ingest.py --catchup 7    # 直近7日分
   python daily_ingest.py --date 2026-04-27  # 特定日のみ
+
+対象日の窓 (2026-11-11 変更): --catchup N は「最低 N 日」。manifest 上で 5 場とも
+完了 (ok/no_race) した最後の日 (= 前回成功日) の翌日まで遡って窓を広げる
+(上限 MAX_BACKFILL_DAYS)。固定の 2 日窓だと PC 停止などで 2 日以上空いた日が
+永久欠損になる (10/14 が実例: 10/15〜16 に実行が無く、10/17 の窓は 10/15〜16)。
+取込済みの日は manifest で skip されるので広げても重複取込はしない。
 """
 
 from __future__ import annotations
@@ -31,6 +37,42 @@ from ingest_day import ingest_one_day
 
 ROOT = Path(__file__).resolve().parent
 LOG_FILE = ROOT / "data" / "daily_ingest.log"
+MANIFEST_CSV = ROOT / "data" / "ingest_manifest.csv"
+MAX_BACKFILL_DAYS = 31
+
+
+def last_complete_date(manifest_csv: Path = MANIFEST_CSV,
+                       n_venues: int = len(VENUE_CODES)) -> dt.date | None:
+    """manifest 上で全場の最終 status が ok/no_race の日のうち最新の日 (前回成功日)。"""
+    if not manifest_csv.exists():
+        return None
+    import csv
+    last: dict[tuple[str, str], str] = {}
+    with open(manifest_csv, "r", encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            last[(row.get("race_date", ""), row.get("place_code", ""))] = row.get("status", "")
+    done: dict[str, int] = {}
+    for (d, _pc), st in last.items():
+        if st in ("ok", "no_race"):
+            done[d] = done.get(d, 0) + 1
+    full = [d for d, n in done.items() if n >= n_venues]
+    if not full:
+        return None
+    try:
+        return dt.date.fromisoformat(max(full))
+    except ValueError:
+        return None
+
+
+def target_dates(today: dt.date, catchup: int,
+                 last_done: dt.date | None) -> list[str]:
+    """昨日〜(N 日前 と 前回成功日の翌日 の古い方) を古い順で返す (上限 MAX_BACKFILL_DAYS)。"""
+    start = today - dt.timedelta(days=catchup)
+    if last_done is not None:
+        start = min(start, last_done + dt.timedelta(days=1))
+    start = max(start, today - dt.timedelta(days=MAX_BACKFILL_DAYS))
+    n = (today - start).days
+    return [(today - dt.timedelta(days=i)).isoformat() for i in range(n, 0, -1)]
 
 
 def setup_logging() -> None:
@@ -54,7 +96,8 @@ def main() -> int:
     p.add_argument("--date", type=str, default=None,
                    help="YYYY-MM-DD 形式の特定日。指定すれば catchup は無視。")
     p.add_argument("--catchup", type=int, default=2,
-                   help="N 日前まで遡って未取得日を埋める (default: 2)")
+                   help="最低 N 日前まで遡る (default: 2)。前回成功日の翌日が"
+                        "それより古ければそこまで広げる")
     args = p.parse_args()
 
     setup_logging()
@@ -65,9 +108,8 @@ def main() -> int:
         dates = [args.date]
     else:
         today = dt.date.today()
-        # 1 日前 〜 N 日前
-        dates = [(today - dt.timedelta(days=i)).isoformat() for i in range(1, args.catchup + 1)]
-        dates.reverse()  # 古い日から処理
+        # 1 日前 〜 max(N 日前, 前回成功日の翌日) (古い日から処理)
+        dates = target_dates(today, args.catchup, last_complete_date())
 
     logger.info("=== daily_ingest start: dates=%s ===", dates)
 

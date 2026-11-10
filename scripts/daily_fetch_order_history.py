@@ -11,6 +11,12 @@ Firefox cookie が daily 失効する問題を Playwright auto-login で回避�
 
 ログ: data/fetch_order_history.log (追記)
 
+取得窓 (2026-11-11 変更): --since 省略時は「前回成功日から」。ログの最後の
+`END exit=0` の日付 L から今日までを取る (最低 2 日、上限 31 日)。
+固定の 2 日窓だと PC 停止などで 2 日以上空いた日が永久欠損になる
+(10/14 が実例: 10/14 実行の次が 10/17 実行で、窓 10/15〜10/17 から 10/14 が漏れた)。
+merge_csv はキーで上書きするので窓を広げても重複行はできない。
+
 使い方:
   python scripts/daily_fetch_order_history.py
   python scripts/daily_fetch_order_history.py --since 7d  # キャッチアップ
@@ -22,6 +28,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -39,6 +46,35 @@ def append_log(text: str) -> None:
             f.write("\n")
 
 
+MIN_SINCE_DAYS = 2
+MAX_SINCE_DAYS = 31
+
+
+def last_success_date(log_file: Path = LOG_FILE) -> dt.date | None:
+    """fetch_order_history.log の最後の `=== <ts> END exit=0 ===` の日付。"""
+    if not log_file.exists():
+        return None
+    last = None
+    pat = re.compile(r"^=== (\d{4}-\d{2}-\d{2})T\S* END exit=0 ===")
+    with log_file.open("r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            m = pat.match(line)
+            if m:
+                last = m.group(1)
+    try:
+        return dt.date.fromisoformat(last) if last else None
+    except ValueError:
+        return None
+
+
+def default_since(today: dt.date, last_ok: dt.date | None) -> str:
+    """前回成功日 L から今日までを覆う --since (L 当日分は L の実行時点で未確定のため含める)。"""
+    days = MIN_SINCE_DAYS
+    if last_ok is not None:
+        days = max(days, (today - last_ok).days)
+    return f"{min(days, MAX_SINCE_DAYS)}d"
+
+
 def notify_failure(subject: str, body: str) -> None:
     """Gmail で失敗通知 (失敗しても黙って諦める)。"""
     try:
@@ -51,13 +87,15 @@ def notify_failure(subject: str, body: str) -> None:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--since", default="2d",
-                   help="直近 N 日 (default: 2d、前日+前々日を冪等再取得)")
+    p.add_argument("--since", default=None,
+                   help="直近 N 日 (省略時: 前回成功日から。最低 2d、前日+前々日を冪等再取得)")
     p.add_argument("--cookie-source", default="playwright",
                    choices=["chrome", "firefox", "edge", "env", "playwright"])
     p.add_argument("--no-detail", action="store_true",
                    help="券種別 pack 詳細を取らない (default: 取る)")
     args = p.parse_args()
+    if args.since is None:
+        args.since = default_since(dt.date.today(), last_success_date())
 
     cmd = [
         sys.executable, str(FETCH_SCRIPT),

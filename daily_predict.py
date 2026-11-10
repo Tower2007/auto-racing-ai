@@ -183,11 +183,17 @@ def recommended_bet_yen(place_code: int, race_no: int) -> int:
 
 
 def cumulative_performance() -> dict | None:
-    """data/daily_predict_picks.csv + payouts.csv から累積運用成績を集計。
+    """data/daily_predict_picks.csv + payouts.csv から推奨 (仮想) の累積成績を集計。
+
+    **仮想値** (推奨した複勝 top1 を ¥100 均一で買ったとみなす)。実購入ではない。
+    2026-11-11: メール上で「本番運用累積成績」と表示され実弾と誤読されていたため、
+    表示を「推奨(仮想)」に改め、実購入の通算 (bet_history.csv、全券種・実円) を
+    ``actual`` キーで同じ枠に並べる (月次レポートの 2 本立て表記に揃えた)。
 
     戻り値 dict:
       start_date, end_date, n_total, n_settled, n_pending,
-      n_hits, hit_rate, cost, payout, profit, roi
+      n_hits, hit_rate, cost, payout, profit, roi,
+      actual: {n, bet, refund, profit, roi(%), first, last} | None
     データ無ければ None。
     """
     try:
@@ -203,10 +209,32 @@ def cumulative_performance() -> dict | None:
         summary["start_date"] = audit["race_date"].min().date()
         summary["end_date"] = audit["race_date"].max().date()
         summary["ehi"] = calculate_ehi(7)
+        summary["actual"] = _actual_cumulative()
         return summary
     except Exception as e:
         logging.warning("cumulative_performance() 失敗: %s", e)
         return None
+
+
+def _actual_cumulative() -> dict | None:
+    """実購入 (bet_history.csv、全券種・実円) の通算。失敗・データ無しは None。"""
+    try:
+        from bet_history_summary import load_summary, _agg  # noqa: WPS433
+        df = load_summary()
+        if df is None or df.empty:
+            return None
+        a = _agg(df)
+        a["first"] = df["date"].min().isoformat()
+        a["last"] = df["date"].max().isoformat()
+        return a
+    except Exception as e:  # noqa: BLE001
+        logging.warning("実購入通算の集計失敗: %s", e)
+        return None
+
+
+VIRTUAL_CUM_LABEL = "推奨(仮想) 複勝top1 ¥100均一 累積"
+VIRTUAL_CUM_NOTE = "※ 仮想値。買わなかった推奨を含み、実際の購入額・三連系は含まない"
+ACTUAL_CUM_LABEL = "実購入 通算 (実弾・全券種・実円)"
 
 
 def render_cumulative_text(perf: dict) -> str:
@@ -221,12 +249,21 @@ def render_cumulative_text(perf: dict) -> str:
         lines.append(f"🛡️ Edge Health Index (7d): {ehi['ehi']} {ehi['emoji']} {ehi['status']}")
     
     if perf.get("n_total", 0) > 0:
-        lines.append(f"📊 本番運用累積成績 (運用開始 {perf['start_date']}〜{perf['end_date']})")
+        lines.append(f"📊 {VIRTUAL_CUM_LABEL} (推奨 {perf['start_date']}〜{perf['end_date']})")
         lines.append(
             f"   戦績: {perf['n_hits']} 勝 / {perf['n_settled']} 確定 = {perf['hit_rate']*100:.1f}%"
             f" / 累積¥{perf['profit']:+,.0f} / ROI {perf['roi']*100:.1f}%"
         )
-        lines.append(f"   未確定: {perf['n_pending']} 件 (本日分など、結果待ち)")
+        lines.append(f"   未確定: {perf['n_pending']} 件 (本日分・結果未取込の日など)")
+        lines.append(f"   {VIRTUAL_CUM_NOTE}")
+
+    act = perf.get("actual")
+    if act and act.get("n", 0) > 0:
+        lines.append(f"💰 {ACTUAL_CUM_LABEL} ({act['first']}〜{act['last']} 取込分)")
+        lines.append(
+            f"   {act['n']} R / 投資 ¥{act['bet']:,} / 払戻 ¥{act['refund']:,}"
+            f" / 損益 ¥{act['profit']:+,} / ROI {act['roi']:.1f}%"
+        )
     
     lines.append("================================================")
     return "\n".join(lines)
@@ -252,16 +289,31 @@ def render_cumulative_html(perf: dict) -> str:
         profit_color = "#2e7d32" if perf["profit"] >= 0 else "#c62828"
         perf_html = (
             f'<div style="font-weight:bold; color:#1565c0; margin-bottom:6px;">'
-            f'📊 本番運用累積成績 '
+            f'📊 {VIRTUAL_CUM_LABEL} '
             f'<span style="color:#666; font-weight:normal; font-size:11px;">'
-            f'({perf["start_date"]}〜{perf["end_date"]})</span></div>'
+            f'(推奨 {perf["start_date"]}〜{perf["end_date"]})</span></div>'
             f'<div>戦績: <b>{perf["n_hits"]}</b> 勝 / <b>{perf["n_settled"]}</b> 確定 = '
             f'<b>{perf["hit_rate"]*100:.1f}%</b>'
             f' &nbsp;|&nbsp; 累積収支: <b style="color:{profit_color};">'
             f'¥{perf["profit"]:+,.0f}</b>'
             f' &nbsp;|&nbsp; ROI <b>{perf["roi"]*100:.1f}%</b></div>'
             f'<div style="color:#888; font-size:11px; margin-top:4px;">'
-            f'未確定: {perf["n_pending"]} 件 (本日分など結果待ち)</div>'
+            f'未確定: {perf["n_pending"]} 件 (本日分・結果未取込の日など) / '
+            f'{VIRTUAL_CUM_NOTE}</div>'
+        )
+
+    act = perf.get("actual")
+    if act and act.get("n", 0) > 0:
+        a_color = "#2e7d32" if act["profit"] >= 0 else "#c62828"
+        perf_html += (
+            f'<div style="font-weight:bold; color:#1565c0; margin:10px 0 6px 0;">'
+            f'💰 {ACTUAL_CUM_LABEL} '
+            f'<span style="color:#666; font-weight:normal; font-size:11px;">'
+            f'({act["first"]}〜{act["last"]} 取込分)</span></div>'
+            f'<div>{act["n"]} R &nbsp;|&nbsp; 投資 ¥{act["bet"]:,} &nbsp;|&nbsp; '
+            f'払戻 ¥{act["refund"]:,} &nbsp;|&nbsp; 損益 '
+            f'<b style="color:{a_color};">¥{act["profit"]:+,}</b>'
+            f' &nbsp;|&nbsp; ROI <b>{act["roi"]:.1f}%</b></div>'
         )
 
     if not ehi_html and not perf_html:

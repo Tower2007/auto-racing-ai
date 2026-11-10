@@ -216,7 +216,10 @@ race_no, car_no, pred, ev, odds, sent_at)。
 
 ### 週次監査
 `scripts/picks_audit.py` が `daily_predict_picks.csv` × `payouts.csv` を join、
-hit / 実払戻 / ROI を集計。`weekly_status.py` から呼ばれて月曜の週次メールに同梱。
+hit / 実払戻 / ROI を集計。
+**仮想値** (推奨した複勝 top1 を ¥100 均一で買ったとみなす)。(race, car) で重複除去し、
+払戻行が空の不成立レースは除外 (統合監視 csv_pnl_join と同定義、2026-11-11)。
+実購入 (bet_history、全券種・実円) とは別物で、メールでは両者を並べて表示する。`weekly_status.py` から呼ばれて月曜の週次メールに同梱。
 
 ### 確認できる数字
 - 通知候補数 / 決着済 / 結果未取得

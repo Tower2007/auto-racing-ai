@@ -35,15 +35,25 @@ def load_picks() -> pd.DataFrame:
         return df
     df["race_date"] = pd.to_datetime(df["race_date"])
     df["sent_at"] = pd.to_datetime(df["sent_at"])
-    # 同レース・同車番・同バッチでの重複 append(再実行 / 手動 dry-run)を除去。
+    # 同レース・同車番の重複 append(再実行 / 手動 dry-run / 別バッチ名での再通知)を除去。
     # 最初に通知された行を採用(後続はオッズ更新後の再記録扱い)。
-    key = ["race_date", "place_code", "race_no", "car_no", "batch"]
+    # 2026-11-11: キーから batch を外した。5/28 山陽 R4/R5 が単独バッチと
+    # 複数 R バッチ "4,6" の両方に記録され二重計上されていた (統合監視の
+    # csv_pnl_join は (race, car) で重複除去しており件数が食い違っていた)。
+    key = ["race_date", "place_code", "race_no", "car_no"]
     df = df.sort_values("sent_at").drop_duplicates(subset=key, keep="first").reset_index(drop=True)
     return df
 
 
 def attach_results(picks: pd.DataFrame) -> pd.DataFrame:
-    """実払戻と紐付け、has_result(結果データあり?) と hit/payout を付与。"""
+    """実払戻と紐付け、has_result(結果データあり?) と hit/payout を付与。
+
+    決着 (has_result) = そのレースに複勝 (fns) の払戻行 (車番あり) が 1 行以上ある。
+    場・日の結果は取込済みなのに複勝払戻行が空のレース (= 競走不成立。全額返還) は
+    損益に意味が無いので **行ごと除外** する (2026-11-11、統合監視 csv_pnl_join と同定義。
+    以前は「場・日の結果あり」で決着扱いにして不成立を外れ (-¥100) に数えていた)。
+    場・日の結果が未取込のレースは従来どおり「結果未取得」。
+    """
     if picks.empty:
         return picks
 
@@ -65,6 +75,9 @@ def attach_results(picks: pd.DataFrame) -> pd.DataFrame:
     pay = pd.read_csv(pay_p, low_memory=False)
     pay["race_date"] = pd.to_datetime(pay["race_date"])
     fns = pay[pay["bet_type"] == "fns"][RACE_KEY + ["car_no_1", "refund"]]
+    # 不成立レースの払戻行は車番が空 (refund 0) — 決着判定にも払戻にも使わない
+    fns = fns[fns["car_no_1"].notna()]
+    settled_races = set(map(tuple, fns[RACE_KEY].drop_duplicates().values.tolist()))
     fns = fns.groupby(RACE_KEY + ["car_no_1"], as_index=False)["refund"].sum()
 
     out = picks.merge(
@@ -72,11 +85,26 @@ def attach_results(picks: pd.DataFrame) -> pd.DataFrame:
         on=RACE_KEY + ["car_no"], how="left",
     )
     out["payout"] = out["payout"].fillna(0)
-    out["has_result"] = [
+    day_done = [
         (d.date(), pc) in res_set for d, pc in zip(out["race_date"], out["place_code"])
     ]
+    out["has_result"] = [
+        (d, pc, rn) in settled_races
+        for d, pc, rn in zip(out["race_date"], out["place_code"], out["race_no"])
+    ]
+    # 場・日の結果は取込済みなのに複勝払戻が無い = 不成立 → 除外
+    keep = [not (dd and not hr) for dd, hr in zip(day_done, out["has_result"])]
+    out = out[keep].reset_index(drop=True)
     out["hit"] = ((out["payout"] > 0) & out["has_result"]).astype(int)
     return out
+
+
+def period_label(days: int | None) -> str:
+    """監査の期間ラベル (送信時刻 sent_at 基準。当日の送信分も含む)。"""
+    if not days:
+        return "全期間"
+    start = (pd.Timestamp.now().normalize() - pd.Timedelta(days=days)).date()
+    return f"直近 {days} 日: 送信 {start} 〜 現在"
 
 
 def filter_period(audit: pd.DataFrame, days: int | None) -> pd.DataFrame:
@@ -143,10 +171,12 @@ def by_venue(audit: pd.DataFrame) -> pd.DataFrame:
 
 def render_text(audit: pd.DataFrame, days: int | None) -> str:
     s = summarize(audit)
-    period = f"直近 {days} 日" if days else "全期間"
+    period = period_label(days)
     lines = [
-        f"📋 通知候補 監査({period})",
+        f"📋 通知候補 監査 [仮想・複勝top1 ¥100均一・送信時刻基準] ({period})",
         "=" * 50,
+        "  ※ 推奨した複勝を ¥100 で買ったとみなした仮想値。"
+        "実購入 (購入額・三連系込み) は「実購入損益」節",
     ]
     if s["n_total"] == 0:
         lines.append("通知された候補はありません。")
@@ -187,14 +217,19 @@ def render_text(audit: pd.DataFrame, days: int | None) -> str:
 
 def render_html(audit: pd.DataFrame, days: int | None) -> str:
     s = summarize(audit)
-    period = f"直近 {days} 日" if days else "全期間"
+    period = period_label(days)
     BORDER = '"border-collapse:collapse; border-color:#bbb; font-family:Arial,sans-serif; font-size:13px;"'
     TH = '"background:#e8e8e8; padding:6px 10px; border:1px solid #bbb; text-align:center;"'
     TD = '"padding:6px 10px; border:1px solid #ddd; text-align:right;"'
     TD_L = '"padding:6px 10px; border:1px solid #ddd; text-align:left;"'
 
     parts = [
-        f'<h3 style="color:#444; margin:18px 0 8px 0;">📋 通知候補 監査({period})</h3>',
+        f'<h3 style="color:#444; margin:18px 0 8px 0;">📋 通知候補 監査 '
+        f'<span style="font-weight:normal; color:#666; font-size:13px;">'
+        f'[仮想・複勝top1 ¥100均一・送信時刻基準] ({period})</span></h3>',
+        '<p style="margin:0 0 6px 0; color:#555; font-size:12px;">'
+        '推奨した複勝を ¥100 で買ったとみなした仮想値。実購入 (購入額・三連系込み) は'
+        '「実購入損益」節を参照。</p>',
     ]
     if s["n_total"] == 0:
         parts.append(
