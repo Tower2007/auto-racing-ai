@@ -1,5 +1,32 @@
 # CHANGELOG
 
+## 2026-11-12 (2) — ログオン時の救済登録・未発火検知・週次 schtasks 判定・損失停止の明記 (総合検証 指摘4・5・7・8)
+
+- **指摘4 ログオン時の再登録が全件 Access denied**: `AutoraceDynSchedulerOnLogon` (Interactive) は
+  本体 `AutoraceDynamicScheduler` (Password 型) が作った `AutoraceDyn_*` を削除も上書きもできず、
+  7/19 以降すべて空振り (rc=0・無通知) だった。`dynamic_scheduler.py` に登録成功マーカー
+  `data/dynamic_scheduler_state.json` と起動時判定 (`startup_gate`) を追加:
+  当日マーカーあり → 何もしない / 07:00 前 → 本体に任せる / 07:00 以降でマーカーなし → 登録 (救済)。
+  両タスクは同一コマンドで区別できないため時刻とマーカーで振る舞いを決める。
+  通常名が Access denied (英/日の文言) のときは、同名タスクの StartBoundary が同じ発火時刻なら既存を使い、
+  そうでなければ別名 `<通常名>_alt` を XML で登録 (EndBoundary 発火+2h・DeleteExpiredTaskAfter PT1H)。
+  判別できない失敗・別名でも失敗した R が 1 件でもあれば exit 2 + 要確認メール (マーカーは書かない)。
+  ログ行は通常名で `registered AutoraceDyn_<場>_R<n> @ HH:MM (..., alt=...)` と書く (夜次が読む形式を維持)。
+- **指摘5 未ログオン時の未発火を検知**: `night_report.load_unfired_races` が dynamic_scheduler.log の登録 R と
+  daily_predict.log / dynamic_run.log の起動 R を突合し、未発火があれば件名 `⚠️未発火N` と本文注記
+  (PC 未ログオンの可能性) を出す。発火予定 + 3 分が未到来の R (0 時以降のミッドナイト等) は数えない。
+  実ログで 10/30 浜松 R1〜R9 の 9 件を検出することを確認。発火の仕組み (Interactive 登録) は変えていない。
+- **指摘7 週次の常時 WARN**: `weekly_status.check_schtasks_health` を `evaluate_schtasks_rows` に分離。
+  実行中 (0x41301) を正常扱い、監視対象を現行の定期タスク (完全一致) に更新 (削除済み Morning/Noon/
+  EveningPredict を外し NightReport・OddsPrerace・OddsTsCollector・MonthlyReport・DynSchedulerOnLogon を追加)、
+  OddsPrerace の 0x800710E0 (稼働中への多重起動拒否) を正常扱い、NumberOfMissedRuns > 0 を
+  「取りこぼし n 回」として NG に数える (PowerShell の Get-ScheduledTaskInfo を読み取りで実行)。
+- **指摘8 当日損失停止**: 当日中は発動しないことを CLAUDE.md とコードのコメントに明記。判定は不変。
+  当日上限が損失停止の閾値 (絶対値) を超える設定なら `run_auto_buy` 起動時に警告ログ
+  (`auto_buy.config_warnings`、メールなし)。既定 (¥3,000 / −¥3,000) では出ない。
+- テスト追加: `test_dynamic_scheduler_rescue.py` (10)、`test_night_unfired.py` (5)、
+  `test_weekly_schtasks_health.py` (7)、`test_auto_buy_config_warnings.py` (3)。
+
 ## 2026-11-12 — 自動発注に「結果不明 (uncertain)」判定を追加 (統合監視 総合検証 指摘1・2)
 
 - **指摘1 タイムアウトで例外落ち**: `auto_buy._run_execute_purchase` がタイムアウト時だけ

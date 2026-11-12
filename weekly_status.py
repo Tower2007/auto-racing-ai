@@ -699,36 +699,122 @@ def check_schtasks_health() -> dict:
         except Exception as e:
             out["warnings"].append(f"schtasks snapshot 保存失敗: {e}")
 
-        # Dyn_* one-shot は数が多く、定常監視は親タスクのみ対象にする
-        keep_prefixes = (
-            "AutoraceDailyIngest",
-            "AutoraceDynamicScheduler",
-            "AutoraceFetchOrderHistory",
-            "AutoraceDailyOrderHistory",  # 旧名互換
-            "AutoraceWeeklyRetrain",
-            "AutoraceWeeklyStatus",
-            "AutoraceMorningPredict",
-            "AutoraceNoonPredict",
-            "AutoraceEveningPredict",
-        )
+        rows = []
         for _, row in df.iterrows():
             raw_name = str(row[name_col]).strip().lstrip("\\")
-            if not raw_name.startswith(keep_prefixes):
-                continue
             try:
                 rc = int(row[result_col])
             except (ValueError, TypeError):
                 rc = -1
             last_run = str(row[last_run_col]) if last_run_col else ""
-            entry = {"name": raw_name, "result": rc, "last_run": last_run}
-            out["tasks"].append(entry)
-            if rc != 0 and rc != 267011:  # 267011 = まだ実行されていない (allowed)
-                out["ng_count"] += 1
+            rows.append((raw_name, rc, last_run))
+        missed = query_missed_runs()
+        if missed is None:
+            out["warnings"].append("取りこぼし回数 (NumberOfMissedRuns) 取得失敗")
+            missed = {}
+        evaluated = evaluate_schtasks_rows(rows, missed)
+        out["tasks"] = evaluated["tasks"]
+        out["ng_count"] = evaluated["ng_count"]
     except FileNotFoundError:
         out["warnings"].append("schtasks 未検出")
     except Exception as e:
         out["warnings"].append(f"schtasks 例外: {e}")
     return out
+
+
+# ── schtasks 健全性の判定 (2026-11-12 監査 指摘7) ─────────────────────────────
+# 旧実装は「実行中の自分自身 (AutoraceWeeklyStatus, LastResult 0x41301)」を NG に
+# 数え、9/7 以降の週次が毎週「schtasks NG 1 件」の WARN になっていた。また削除済みの
+# Morning/Noon/EveningPredict を監視し、NightReport 等の現行タスクと取りこぼし
+# (NumberOfMissedRuns) を見ていなかった。
+# 監視対象は現行の定期タスク (完全一致)。AutoraceDyn_* の個別 one-shot と、
+# UI 常駐 (StreamlitApp / BuyApp) は対象外。
+SCHTASKS_MONITORED = (
+    "AutoraceDailyIngest",
+    "AutoraceDynamicScheduler",
+    "AutoraceDynSchedulerOnLogon",
+    "AutoraceFetchOrderHistory",
+    "AutoraceDailyOrderHistory",     # 旧名互換
+    "AutoraceNightReport",
+    "AutoraceOddsPrerace",
+    "AutoraceOddsTsCollector",
+    "AutoraceOddsTsCollectorOnLogon",
+    "AutoraceWeeklyRetrain",
+    "AutoraceWeeklyStatus",
+    "AutoraceMonthlyReport",
+)
+SCHTASKS_RC_RUNNING = 0x41301        # 267009: 実行中
+SCHTASKS_RC_NOT_YET_RUN = 0x41303    # 267011: まだ実行されていない
+SCHTASKS_RC_OK = {0, SCHTASKS_RC_RUNNING, SCHTASKS_RC_NOT_YET_RUN}
+# タスク別に正常とみなす追加コード。OddsPrerace は 07:05 と ログオン時の 2 トリガーで、
+# 稼働中への多重起動は 0x800710E0 (要求拒否 = IgnoreNew) になる (正常)。
+SCHTASKS_RC_OK_EXTRA = {"AutoraceOddsPrerace": {0x800710E0}}
+
+
+def evaluate_schtasks_rows(rows: list[tuple[str, int, str]],
+                           missed: dict[str, int]) -> dict:
+    """(タスク名, LastResult, 前回実行) の行と取りこぼし回数から健全性を判定する。
+
+    監視対象外 (削除済み・AutoraceDyn_*・UI 常駐) は見ない。同名の重複行
+    (トリガー数ぶん出る) は最初の 1 行だけ使う。NG = 結果コード異常 または
+    取りこぼし > 0 (タスク単位で 1 件)。
+    """
+    out = {"tasks": [], "ng_count": 0}
+    seen: set[str] = set()
+    for name, rc, last_run in rows:
+        name = str(name).strip().lstrip("\\")
+        if name not in SCHTASKS_MONITORED or name in seen:
+            continue
+        seen.add(name)
+        # schtasks は 0x800710E0 を負の 10 進 (-2147020576) で出すことがあるため 32bit に正規化
+        rc_u = rc & 0xFFFFFFFF if isinstance(rc, int) else rc
+        ok_codes = SCHTASKS_RC_OK | SCHTASKS_RC_OK_EXTRA.get(name, set())
+        rc_ok = rc_u in ok_codes
+        n_missed = int(missed.get(name, 0) or 0)
+        ok = rc_ok and n_missed == 0
+        out["tasks"].append({"name": name, "result": rc, "last_run": last_run,
+                             "missed": n_missed, "ok": ok,
+                             "running": rc_u == SCHTASKS_RC_RUNNING,
+                             "not_yet_run": rc_u == SCHTASKS_RC_NOT_YET_RUN})
+        if not ok:
+            out["ng_count"] += 1
+    return out
+
+
+def query_missed_runs() -> dict[str, int] | None:
+    """Autorace* (AutoraceDyn_* 除く) の NumberOfMissedRuns を読み取りで取得。失敗は None。"""
+    ps = ("Get-ScheduledTask -TaskName 'Autorace*' | "
+          "Where-Object { $_.TaskName -notlike 'AutoraceDyn_*' } | "
+          "ForEach-Object { $i = $_ | Get-ScheduledTaskInfo; "
+          "'{0}|{1}' -f $_.TaskName, $i.NumberOfMissedRuns }")
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=60,
+            encoding="utf-8", errors="replace",
+            # 窓なし起動 (pythonw から呼ばれても黒いコンソール窓を出さない)
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    out: dict[str, int] = {}
+    for line in (proc.stdout or "").splitlines():
+        name, _, n = line.strip().partition("|")
+        if name and n.strip().lstrip("-").isdigit():
+            out[name] = int(n.strip())
+    return out
+
+
+def _schtasks_mark(t: dict) -> str:
+    if not t.get("ok", t.get("result") == 0):
+        return "🔴"
+    if t.get("running"):
+        return "▶️"
+    if t.get("not_yet_run") or t.get("result") == SCHTASKS_RC_NOT_YET_RUN:
+        return "⏳"
+    return "✅"
 
 
 def check_ngrok_health(days: int = 7) -> dict:
@@ -1187,8 +1273,10 @@ def render_health_text(bh: dict, st: dict, ehi: dict | None = None,
         lines.append("")
         lines.append(f"  schtasks Autorace* {len(st['tasks'])} 件 / NG {st['ng_count']} 件")
         for t in st["tasks"]:
-            mark = "✅" if t["result"] == 0 else ("⏳" if t["result"] == 267011 else "🔴")
-            lines.append(f"    {mark} {t['name']:34s} rc={t['result']:>6} last_run={t['last_run']}")
+            mark = _schtasks_mark(t)
+            miss = f" 取りこぼし {t['missed']} 回" if t.get("missed") else ""
+            lines.append(f"    {mark} {t['name']:34s} rc={t['result']:>6} "
+                         f"last_run={t['last_run']}{miss}")
         if st.get("snapshot_path"):
             lines.append(f"  (raw snapshot: {st['snapshot_path']})")
     for w in st.get("warnings", []):
@@ -1327,11 +1415,13 @@ def render_health_html(bh: dict, st: dict, ehi: dict | None = None,
         for i, t in enumerate(st["tasks"]):
             alt = ' style="background:#fafafa;"' if i % 2 == 1 else ""
             rc = t["result"]
-            mark = "✅" if rc == 0 else ("⏳" if rc == 267011 else "🔴")
-            color = "#2e7d32" if rc == 0 else ("#888" if rc == 267011 else "#c62828")
+            mark = _schtasks_mark(t)
+            color = "#c62828" if mark == "🔴" else ("#888" if mark == "⏳" else "#2e7d32")
+            miss = (f'<br><span style="color:#c62828">取りこぼし {t["missed"]} 回</span>'
+                    if t.get("missed") else "")
             parts.append(
                 f"<tr{alt}>"
-                f'<td style={TD}>{mark} {t["name"]}</td>'
+                f'<td style={TD}>{mark} {t["name"]}{miss}</td>'
                 f'<td style={TD_R}><span style="color:{color}">{rc}</span></td>'
                 f'<td style={TD_R}>{t["last_run"]}</td>'
                 f"</tr>"

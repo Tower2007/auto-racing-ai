@@ -90,7 +90,8 @@ reports/               # 各種分析レポート(commit 対象)
 | タスク | 時刻 | 内容 |
 |---|---|---|
 | `AutoraceDailyIngest` | 毎日 06:30 | データ収集 (catchup 2 日 = 最低 2 日。manifest 上の前回成功日の翌日まで自動で遡る、上限 31 日。2026-11-11) |
-| `AutoraceDynamicScheduler` | 毎日 07:00 | `python dynamic_scheduler.py`: Program/Print ページから各場 R 毎の発走時刻を取得し、各レース発走 `LEAD_MIN` 分前 (場別: 伊勢崎/浜松/山陽 4 分・川口/飯塚 3 分、`dynamic_scheduler.py:LEAD_MIN_VENUE_MAP`) の `AutoraceDyn_{venue}_R{n}` one-shot を実レース数 × 場数ぶん登録(冪等、毎日再生成)。Program/Print が `24:04` 表記で返すミッドナイト日跨ぎ R も +1 日で正しく登録し、8R 開催なら R9〜 は登録しない (2026-09-04) |
+| `AutoraceDynamicScheduler` | 毎日 07:00 | `python dynamic_scheduler.py`: Program/Print ページから各場 R 毎の発走時刻を取得し、各レース発走 `LEAD_MIN` 分前 (場別: 伊勢崎/浜松/山陽 4 分・川口/飯塚 3 分、`dynamic_scheduler.py:LEAD_MIN_VENUE_MAP`) の `AutoraceDyn_{venue}_R{n}` one-shot を実レース数 × 場数ぶん登録(冪等、毎日再生成)。Program/Print が `24:04` 表記で返すミッドナイト日跨ぎ R も +1 日で正しく登録し、8R 開催なら R9〜 は登録しない (2026-09-04)。**登録成功マーカー** `data/dynamic_scheduler_state.json` (日付・件数・登録 R 一覧) を全件登録できた時だけ書く。1 R でも登録できなければ exit 2 + 要確認メール「動的タスク登録 失敗 NR」(2026-11-12) |
+| `AutoraceDynSchedulerOnLogon` | ログオン時 | 本体と同じ `python dynamic_scheduler.py` (引数なし・Interactive)。**救済登録** (2026-11-12): 当日マーカーあり → 「本日は登録済み」で何もしない / マーカーなし & 07:00 前 → 本体に任せて何もしない (前日ミッドナイトの未発火タスクも消さない) / マーカーなし & 07:00 以降 (= 本体が飛んだ) → これから発火する R だけ登録。本体 (Password 型) が作った同名タスクは Interactive からは消せず Access denied になるため、同名・同発火時刻で登録済みなら既存を使い、それ以外は別名 `AutoraceDyn_{venue}_R{n}_alt` で XML 登録 (EndBoundary 発火+2h・DeleteExpiredTaskAfter 1h で自動失効)。以前は Access denied で全件空振り・rc=0・無通知だった (7/19〜) |
 | `AutoraceDyn_{venue}_R{n}` | 各レース発走 LEAD_MIN 分前(場別 3〜4 分前、動的) | `wscript //B scripts/run_predict_hidden.vbs {pc} {n} {label} {date}` → `python daily_predict.py --venues {pc} --races {n} --date {開催日} --suppress-noresult-email`: 1 R 単位で予測。**買い候補メールは自動発注が全候補を処理できた R では送らない** (AUTO-BUY の投票完了/skip メールと重複するため、2026-11-03)。自動発注が `failed` / `skip_lock` / 例外 / 対象外候補ありの時だけ「⚠️自動発注できず (手動購入可)」件名で 1-click 購入ボタン付きの候補メールを送り、その時だけ buy_app + ngrok を起動する。判定は `daily_predict.candidate_mail_decision`、従来どおり毎回送るには `.env` で `AUTO_BUY_SEND_CANDIDATE_MAIL=1`。near-miss retry 廃止、処理 ~10 秒で締切 ~2 分前に到着。**`--date` は必須級**: 日跨ぎミッドナイト R (00:00 以降発火) で既定の今日日付だと翌暦日になり program 空 → 無音スキップしていた (2026-09-03 飯塚 R7/R8、2026-09-04 修正) |
 | `AutoraceWeeklyRetrain` | 毎日曜 03:00 | `python scripts/weekly_retrain.py`: 再学習チェーン wrapper。`ml.features`(特徴量parquet再生成) → `ml.walkforward_morning`(校正OOF parquet再生成) → `ml.train_production`(学習+品質ゲート) を順に実行。上流失敗時は学習に進まず中断。**2026-06-14 導入**: 旧 `python -m ml.train_production` 単発は学習入力(parquet)を再生成せず、5/24〜6/14 の4回が同一データ no-op 化しモデルが4/29塩漬けだったのを修正。経緯: memory `project_decisions.md` 2026-06-14。品質ゲートの永久凍結問題(凍結高値AUCを恒久ベースライン化)は **2026-06-26 に解消済み** (`ml/train_production.py` の `_should_adopt` 再設計: 現役モデルを候補と同一 val 集合で再採点 + 許容バンド `ADOPT_TOL_AUC` + 鮮度オーバーライド `STALE_DAYS`/`STALE_TOL_AUC`) |
 | `AutoraceWeeklyStatus` | 毎月曜 07:20 | 週次ステータス報告 |
@@ -141,6 +142,9 @@ rt3 浜松 ROI 530% / 山陽 ROI 141%、rf3 浜松 ROI 330% / 山陽 ROI 185%。
 自動投票 Phase 1 (2026-05-31 導入、`auto_buy.py`): 機会損失対策の自動発注。
 `AUTO_BUY_ENABLED` (デフォルト OFF) が True の時のみ、daily_predict のメール送信
 直前に厳格ガード (1日上限¥3000 / 当日損失-¥3000停止 / EV異常>10除外 / 連続失敗3回停止)
+(**当日損失停止は当日中は発動しない**: 当日損益を翌 02:30 取得の bet_history から出すため当日は常に 0。
+当日の最大損失は当日上限で抑えられる。上限が損失停止の閾値の絶対値を超える設定だと
+`run_auto_buy` 起動時に警告ログを出す (`auto_buy.config_warnings`、メールなし、2026-11-12))
 を全通過した候補を `execute_purchase.py` で自動投票。state は `data/auto_buy_state.json`
 (atomic write・日次 reset)、**毎回 Gmail 即時通知 (券種・出目・金額を日本語で明記)**。
 state の reset は暦日基準なので、日跨ぎミッドナイト R (00:00 以降発火) は前日の日次 cap

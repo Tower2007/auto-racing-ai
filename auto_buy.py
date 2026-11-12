@@ -103,6 +103,10 @@ AUTO_BUY_ANYTIME = _env_bool("AUTO_BUY_ANYTIME", True)
 AUTO_BUY_HOUR_START = _env_int("AUTO_BUY_HOUR_START", 22)
 AUTO_BUY_HOUR_END = _env_int("AUTO_BUY_HOUR_END", 6)
 MAX_DAILY_AUTO_YEN = _env_int("MAX_DAILY_AUTO_YEN", 3000)
+# 当日損失停止。注意 (2026-11-12 監査 指摘8): 当日損益は bet_history.csv (翌 02:30 取得)
+# から出すため、**当日中は発動しない** (当日の行がまだ無く常に 0)。当日の最大損失は
+# 当日上限 MAX_DAILY_AUTO_YEN で抑えられる (損失 ≤ 当日の投資額)。上限が閾値の絶対値を
+# 超える設定だと上限では損失を抑えきれないため、run_auto_buy 起動時に警告ログを出す。
 DAILY_LOSS_STOP_YEN = _env_int("DAILY_LOSS_STOP_YEN", -3000)
 EV_ANOMALY_CAP = _env_float("EV_ANOMALY_CAP", 10.0)
 CONSECUTIVE_FAILURES_STOP = _env_int("CONSECUTIVE_FAILURES_STOP", 3)
@@ -174,6 +178,10 @@ def today_profit_from_history(today: str) -> int:
 
     レース結果取得は翌 02:30 のため intraday は 0 / 部分的になりうる
     (安全ベルト用途、主ガードは spent 上限)。
+    2026-11-12 確認: 当日の行は翌 02:30 まで存在しないので実際は常に 0 で、
+    当日損失停止 (DAILY_LOSS_STOP_YEN) は当日中は発動しない。当日の最大損失は
+    当日上限 (MAX_DAILY_AUTO_YEN) で抑えられる。判定ロジックは変えていない
+    (発注経路にネットワーク取得を足さないため)。
     """
     if not BET_HISTORY_CSV.exists():
         return 0
@@ -196,6 +204,24 @@ def today_profit_from_history(today: str) -> int:
 
 
 # ─── ガード (純粋関数、tests から直接呼ぶ) ────────────────────────
+
+def config_warnings(max_daily_yen: int = MAX_DAILY_AUTO_YEN,
+                    loss_stop_yen: int = DAILY_LOSS_STOP_YEN) -> list[str]:
+    """設定の組み合わせの警告 (2026-11-12 監査 指摘8)。発注判定には使わない。
+
+    当日損失停止は当日中は発動しない (today_profit_from_history 参照) ため、当日の
+    最大損失を抑えるのは当日上限だけ。上限が損失停止の閾値 (絶対値) を超えると、
+    上限では損失停止の水準まで抑えきれない。
+    """
+    warns = []
+    if max_daily_yen > abs(loss_stop_yen):
+        warns.append(
+            f"当日上限 MAX_DAILY_AUTO_YEN=¥{max_daily_yen:,} が当日損失停止 "
+            f"DAILY_LOSS_STOP_YEN=¥{loss_stop_yen:,} の絶対値を超えています。"
+            f"当日損失停止は当日中は発動しない (損益は翌 02:30 取得) ため、"
+            f"当日の損失は最大 ¥{max_daily_yen:,} まで膨らみ得ます")
+    return warns
+
 
 def check_guards(
     state: dict,
@@ -824,6 +850,12 @@ def run_auto_buy(candidates: list[dict],
         return []
     if not any(c.get("bets") for c in candidates):
         return []
+    # 設定ずれの警告 (ログのみ、発注判定には影響しない。2026-11-12 監査 指摘8)
+    try:
+        for w in config_warnings():
+            logger.warning("[auto_buy] 設定警告: %s", w)
+    except Exception:  # noqa: BLE001
+        pass
     # ── 「発注結果不明」sticky フラグ検査 (2026-07-12 Codex再々検証 ③) ──
     # 過去の run が WAIT_ABANDONED を検知して書いたフラグが残っている間は、
     # 人間が照合・削除するまで以後の全 run の発注を停止する

@@ -16,9 +16,13 @@ schtasks /SC ONCE one-shot を一括登録する。
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
+import os
+import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -242,7 +246,9 @@ def build_exact_race_starts(
     return out
 
 
-def register_one_shot(task_name: str, fire_at: dt.datetime, command: str) -> bool:
+def register_one_shot_ex(task_name: str, fire_at: dt.datetime,
+                         command: str) -> tuple[bool, str]:
+    """schtasks /Create /SC ONCE で登録。(成功, 失敗時のエラー文言)。"""
     sd = fire_at.strftime("%Y/%m/%d")
     st = fire_at.strftime("%H:%M")
     try:
@@ -254,19 +260,227 @@ def register_one_shot(task_name: str, fire_at: dt.datetime, command: str) -> boo
         )
     except Exception as e:
         logging.warning("register exception %s: %s", task_name, e)
-        return False
+        return False, f"exception: {e}"
     if r.returncode == 0:
-        return True
-    logging.warning("register failed %s: %s", task_name, r.stderr.strip() or r.stdout.strip())
-    return False
+        return True, ""
+    err = (r.stderr or "").strip() or (r.stdout or "").strip() or f"rc={r.returncode}"
+    logging.warning("register failed %s: %s", task_name, err)
+    return False, err
+
+
+def register_one_shot(task_name: str, fire_at: dt.datetime, command: str) -> bool:
+    return register_one_shot_ex(task_name, fire_at, command)[0]
+
+
+# ── ログオン時の救済登録 (2026-11-12 監査 指摘4) ─────────────────────────────
+# 07:00 の本体タスク (AutoraceDynamicScheduler, LogonType=Password) が作った
+# AutoraceDyn_* を、ログオン時タスク (AutoraceDynSchedulerOnLogon, Interactive) は
+# 削除も上書きもできず全件 Access denied で空振りしていた (7/19〜、rc=0・無通知)。
+# 両タスクは同一コマンド・引数なしで区別できないため、時刻とマーカーで振る舞いを決める:
+#   - 当日の登録成功マーカーあり → 「本日は登録済み」で何もしない
+#   - マーカーなし & 定時 (07:00) 前 → 本体に任せて何もしない
+#     (前日のミッドナイト R の未発火タスクを消さない)
+#   - マーカーなし & 定時以降 → 通常登録 (本体の定時実行もここ)。本体が 07:00 を
+#     逃した日のログオン時実行は救済登録になる
+# 通常名が Access denied で上書きできない R は、同名タスクが既に同じ発火時刻で
+# 登録済みなら登録済みとみなし、そうでなければ別名 (通常名 + ALT_SUFFIX、
+# `^AutoraceDyn_` に一致) で XML 登録する (EndBoundary + DeleteExpiredTaskAfter で自動失効)。
+# 1 件でも登録できなければ非 0 終了 + 要確認メール。全件登録できたらマーカーを書く。
+STATE_FILE = DATA / "dynamic_scheduler_state.json"
+MAIN_SCHEDULE_TIME = dt.time(7, 0)     # 本体 AutoraceDynamicScheduler の定時
+# 「定時前」の判定は定時の 5 分前まで。本体の起動時刻が時計のずれで 07:00 より僅かに
+# 前と読まれると、その日の登録が丸ごと行われなくなるため余裕を持たせる。
+GATE_OPEN_TIME = dt.time(6, 55)
+ALT_SUFFIX = "_alt"
+ALT_END_AFTER = dt.timedelta(hours=2)  # 別名タスクのトリガー失効 = 発火 + 2 時間
+ALT_DELETE_EXPIRED_AFTER = "PT1H"      # 失効後 1 時間でタスク自体を削除
+_ACCESS_DENIED_MARKERS = ("access is denied", "access denied",
+                          "アクセスが拒否", "アクセス拒否")
+
+
+def _now() -> dt.datetime:
+    """現在時刻 (テストで差し替える)。"""
+    return dt.datetime.now()
+
+
+def is_access_denied(text: str | None) -> bool:
+    """schtasks のエラー文言が Access denied か (英語/日本語)。判別不能は False。"""
+    t = (text or "").lower()
+    return any(m.lower() in t for m in _ACCESS_DENIED_MARKERS)
+
+
+def load_marker(today: dt.date, path: Path | None = None) -> dict | None:
+    """当日の登録成功マーカー。無い/別日/壊れている場合は None。"""
+    p = path or STATE_FILE
+    try:
+        st = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return st if isinstance(st, dict) and st.get("date") == today.isoformat() else None
+
+
+def write_marker(today: dt.date, now: dt.datetime, races: list[dict],
+                 path: Path | None = None) -> None:
+    """登録成功マーカーを atomic に書く (失敗はログのみ)。"""
+    p = path or STATE_FILE
+    body = {"date": today.isoformat(),
+            "written_at": now.isoformat(timespec="seconds"),
+            "n_registered": len(races), "races": races}
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(p.parent), suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(body, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, p)
+    except Exception as e:  # noqa: BLE001
+        logging.warning("登録マーカー書き込み失敗: %s", e)
+
+
+def startup_gate(now: dt.datetime, marker: dict | None) -> str | None:
+    """登録処理に進まない理由 (進むなら None)。"""
+    if marker is not None:
+        return (f"本日は登録済み (マーカー {marker.get('written_at')}、"
+                f"{marker.get('n_registered')} 件) — 何もしない")
+    if now.time() < GATE_OPEN_TIME:
+        return (f"定時 {MAIN_SCHEDULE_TIME.strftime('%H:%M')} 前で登録記録なし — "
+                f"本体の定時実行に任せて何もしない")
+    return None
+
+
+def existing_task_start(task_name: str) -> dt.datetime | None:
+    """既存タスクのトリガー開始時刻 (StartBoundary)。無い/読めなければ None。"""
+    try:
+        r = subprocess.run(
+            ["schtasks", "/Query", "/TN", task_name, "/XML"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    m = re.search(r"<StartBoundary>([^<]+)</StartBoundary>", r.stdout or "")
+    if not m:
+        return None
+    try:
+        return dt.datetime.fromisoformat(m.group(1).strip()).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
+def build_alt_task_xml(fire_at: dt.datetime, command: str) -> str:
+    """別名タスクの XML (Interactive・自動失効付き)。command は CMD_TEMPLATE の展開結果。"""
+    from xml.sax.saxutils import escape
+    exe, _, args = command.partition(" ")
+    start = fire_at.replace(second=0, microsecond=0)
+    end = start + ALT_END_AFTER
+    return f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>AutoraceDyn rescue (dynamic_scheduler)</Description></RegistrationInfo>
+  <Triggers>
+    <TimeTrigger>
+      <StartBoundary>{start.isoformat()}</StartBoundary>
+      <EndBoundary>{end.isoformat()}</EndBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>false</StartWhenAvailable>
+    <DeleteExpiredTaskAfter>{ALT_DELETE_EXPIRED_AFTER}</DeleteExpiredTaskAfter>
+    <ExecutionTimeLimit>PT30M</ExecutionTimeLimit>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author">
+    <Exec><Command>{escape(exe)}</Command><Arguments>{escape(args)}</Arguments></Exec>
+  </Actions>
+</Task>
+"""
+
+
+def register_alt_task(task_name: str, fire_at: dt.datetime,
+                      command: str) -> tuple[bool, str]:
+    """別名タスクを XML で登録。(成功, エラー文言)。"""
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(suffix=".xml")
+        with os.fdopen(fd, "w", encoding="utf-16") as f:
+            f.write(build_alt_task_xml(fire_at, command))
+        r = subprocess.run(
+            ["schtasks", "/Create", "/TN", task_name, "/XML", tmp, "/F"],
+            capture_output=True, text=True, encoding="cp932", errors="replace",
+        )
+    except Exception as e:  # noqa: BLE001
+        return False, f"exception: {e}"
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    if r.returncode == 0:
+        return True, ""
+    return False, ((r.stderr or "").strip() or (r.stdout or "").strip()
+                   or f"rc={r.returncode}")
+
+
+def register_race(task_name: str, fire_at: dt.datetime,
+                  command: str) -> tuple[str, str, str]:
+    """1 R を登録。(status, 実際のタスク名, エラー)。
+
+    status: "registered" (通常名) / "existing" (同名・同時刻で登録済み) /
+            "registered_alt" (別名) / "failed"。
+    Access denied 以外の失敗 (判別不能を含む) は別名を試さず failed。
+    """
+    ok, err = register_one_shot_ex(task_name, fire_at, command)
+    if ok:
+        return "registered", task_name, ""
+    if not is_access_denied(err):
+        return "failed", task_name, err
+    ex = existing_task_start(task_name)
+    if ex is not None and abs((ex - fire_at.replace(second=0, microsecond=0))
+                              .total_seconds()) < 60:
+        return "existing", task_name, ""
+    alt = task_name + ALT_SUFFIX
+    ok2, err2 = register_alt_task(alt, fire_at, command)
+    if ok2:
+        return "registered_alt", alt, ""
+    return "failed", task_name, f"{err} / 別名 {alt}: {err2}"
+
+
+def notify_failures(today: dt.date, failed: list[str]) -> None:
+    """登録できなかった R の要確認メール (送信失敗はログのみ)。"""
+    try:
+        from gmail_notify import send_email
+        send_email(
+            subject=(f"[autorace] ⚠️ 動的タスク登録 失敗 {len(failed)}R "
+                     f"{today.isoformat()} (要確認)"),
+            body=("dynamic_scheduler が次の R の発火タスクを登録できませんでした。\n"
+                  "これらの R は予測・自動発注が行われません。\n\n"
+                  + "\n".join(f"  - {x}" for x in failed)
+                  + "\n\nログ: data/dynamic_scheduler.log\n"
+                  "対処: タスクスケジューラで AutoraceDyn_* の状態を確認し、"
+                  "必要なら AutoraceDynamicScheduler を手動実行してください。"))
+    except Exception as e:  # noqa: BLE001
+        logging.error("登録失敗メール送信失敗: %s", e)
 
 
 def main() -> int:
     setup_logging()
-    today = dt.date.today()
-    now = dt.datetime.now()
+    now = _now()
+    today = now.date()
     logging.info("=== dynamic_scheduler start: %s (now=%s) ===",
                  today.isoformat(), now.strftime("%H:%M:%S"))
+
+    # ログオン時実行の空振り防止 / 定時前の誤登録防止 (2026-11-12 監査 指摘4)
+    skip_reason = startup_gate(now, load_marker(today))
+    if skip_reason:
+        logging.info("%s", skip_reason)
+        return 0
 
     cleanup_stale_tasks()
 
@@ -280,11 +494,16 @@ def main() -> int:
     if not schedule:
         logging.info("Hold/Today 開催なし — 何も登録しない")
         logging.info("=== dynamic_scheduler done: registered=0 ===")
+        # マーカーは書かない: fetch_today_schedule は取得失敗でも {} を返すため、
+        # 「開催なし」と通信エラーを区別できない。書くとその日の再実行・救済が
+        # すべて「登録済み」で止まる。開催なしの日に再実行されても害は無い。
         return 0
 
     registered = 0
     skipped_past = 0
     skipped_other = 0
+    marker_races: list[dict] = []   # マーカーに残す登録 R 一覧
+    failed: list[str] = []          # 登録できなかった R (救済後も)
 
     for pc in sorted(schedule.keys()):
         info = schedule[pc]
@@ -369,14 +588,33 @@ def main() -> int:
                 date=today.isoformat(),
             )
 
-            if register_one_shot(task_name, fire_at, command):
-                logging.info("registered %s @ %s (race=%s, lead=%dm, %s)",
-                             task_name, fire_at.strftime("%H:%M"),
-                             race_start.strftime("%H:%M"), lead_min, source)
-                registered += 1
+            status, actual_name, err = register_race(task_name, fire_at, command)
+            if status == "failed":
+                failed.append(f"{label} (発火 {fire_at.strftime('%m/%d %H:%M')}): "
+                              f"{err[:200]}")
+                continue
+            # ログ行は通常名で書く (night_report が "registered AutoraceDyn_<場>_R<n> @ HH:MM"
+            # を読む)。別名・登録済みの区別は括弧内に残す。
+            note = {"registered": "",
+                    "existing": ", 同名タスク登録済み (Access denied のため既存を使用)",
+                    "registered_alt": f", alt={actual_name}"}[status]
+            logging.info("registered %s @ %s (race=%s, lead=%dm, %s%s)",
+                         task_name, fire_at.strftime("%H:%M"),
+                         race_start.strftime("%H:%M"), lead_min, source, note)
+            registered += 1
+            marker_races.append({"race": label, "task": actual_name,
+                                 "fire_at": fire_at.isoformat(timespec="minutes"),
+                                 "status": status})
 
-    logging.info("=== dynamic_scheduler done: registered=%d skipped_past=%d skipped_other=%d ===",
-                 registered, skipped_past, skipped_other)
+    logging.info("=== dynamic_scheduler done: registered=%d skipped_past=%d skipped_other=%d"
+                 " failed=%d ===", registered, skipped_past, skipped_other, len(failed))
+    if failed:
+        # 救済後も登録できなかった R がある → マーカーを書かず (次回ログオン時に再試行)、
+        # 非 0 終了 + 要確認メール (2026-11-12 監査 指摘4)
+        logging.error("登録できなかった R: %d 件 — %s", len(failed), "; ".join(failed))
+        notify_failures(today, failed)
+        return 2
+    write_marker(today, now, marker_races)
     return 0
 
 

@@ -221,6 +221,67 @@ def load_uncertain_executions(today: str) -> list[str]:
     return out
 
 
+# ── 未発火の検知 (2026-11-12 監査 指摘5) ───────────────────────────────────
+# AutoraceDyn_* は Interactive 登録のため、未ログオン中は発火しない (10/30 浜松
+# R1〜R9 が 14:50 ログオンまで未発火、検知経路なし)。発火の仕組みは変えず、
+# 登録 R (dynamic_scheduler.log) と起動 R (daily_predict の start 行) を突合して知らせる。
+PREDICT_LOGS = (DATA / "daily_predict.log", DATA / "dynamic_run.log")
+UNFIRED_GRACE = dt.timedelta(minutes=3)   # 発火直後で起動ログ未出力の R は数えない
+_RE_REGISTERED = re.compile(
+    r"registered AutoraceDyn_([a-z]+)_R(\d+) @ (\d{2}):(\d{2})")
+_RE_PREDICT_START = re.compile(
+    r"daily_predict start: date=(\S+) venues=\S+ time=([a-z]+)_R(\d+)\b")
+
+
+def load_unfired_races(today: str, now: dt.datetime | None = None) -> list[str]:
+    """対象日に登録されたのに daily_predict が起動していない R のラベル一覧。
+
+    発火予定時刻 (+猶予) が now より後の R (0 時以降のミッドナイト等) は数えない。
+    ログが読めない場合は空 (夜次の他の集計には影響させない)。
+    """
+    now = now or dt.datetime.now()
+    day = dt.date.fromisoformat(today)
+    registered: dict[tuple[str, int], dt.datetime] = {}
+    try:
+        for line in DYN_SCHED_LOG.read_text(encoding="utf-8",
+                                            errors="replace").splitlines():
+            if not line.startswith(today):
+                continue
+            m = _RE_REGISTERED.search(line)
+            if not m:
+                continue
+            h, mi = int(m.group(3)), int(m.group(4))
+            d = day + dt.timedelta(days=1) if h < MIDNIGHT_CUTOFF_HOUR else day
+            registered[(m.group(1), int(m.group(2)))] = dt.datetime.combine(
+                d, dt.time(h, mi))
+    except Exception as e:  # noqa: BLE001
+        logging.warning("dynamic_scheduler.log 読込失敗 (未発火検知): %s", e)
+        return []
+    if not registered:
+        return []
+    fired: set[tuple[str, int]] = set()
+    for p in PREDICT_LOGS:
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if "daily_predict start" not in line:
+                        continue
+                    m = _RE_PREDICT_START.search(line)
+                    if m and m.group(1) == today:
+                        fired.add((m.group(2), int(m.group(3))))
+        except FileNotFoundError:
+            continue
+        except Exception as e:  # noqa: BLE001
+            logging.warning("%s 読込失敗 (未発火検知): %s", p.name, e)
+    out = []
+    for (venue, rno), fire_at in sorted(registered.items(), key=lambda kv: kv[1]):
+        if fire_at + UNFIRED_GRACE > now or (venue, rno) in fired:
+            continue
+        pc = VENUE_PC.get(venue)
+        out.append(f"{VENUE_JP.get(pc, venue)} R{rno} ({fire_at.strftime('%H:%M')} 発火予定)")
+    return out
+
+
 def load_after_midnight_races(today: str) -> list[str]:
     """対象日に dynamic_scheduler が 0:00 以降の発火で登録した R (ミッドナイト後半)。
 
@@ -477,6 +538,8 @@ def evaluate_today(today: str) -> tuple[dict, int]:
         "carried_prev": carried,
         # 結果不明の自動発注 (暫定精算に含めない。成立有無は bet_history が正)
         "uncertain": load_uncertain_executions(today),
+        # 登録済みなのに起動しなかった R (未ログオン等)。未到来の R は含まない
+        "unfired": load_unfired_races(today),
         # 00:00 時点で未発走の当日ミッドナイト R (翌晩の前日確定で計上)
         "after_midnight": load_after_midnight_races(today),
     }, n_failed
@@ -760,6 +823,10 @@ def _scope_notes(today: dict) -> list[str]:
         notes.append(f"自動発注 結果不明 {len(today['uncertain'])}R "
                      f"({', '.join(today['uncertain'])}): 成立を確認できず本日の暫定集計に"
                      f"含めない。公式の投票履歴で要確認 (成立分は明晩の前日確定欄で計上)")
+    if today.get("unfired"):
+        notes.append(f"未発火 {len(today['unfired'])}R ({', '.join(today['unfired'])}): "
+                     f"発火タスクは登録済みだが予測・自動発注が起動していない。"
+                     f"PC が未ログオンだった可能性 (発火タスクはログオン中のみ動く)")
     return notes
 
 
@@ -955,6 +1022,8 @@ def build_subject(today_str: str, today: dict, n_failed: int) -> str:
     failed_tag = f" ⚠️失敗{n_failed}" if n_failed else ""
     if today.get("uncertain"):
         failed_tag += f" ❓結果不明{len(today['uncertain'])}"
+    if today.get("unfired"):
+        failed_tag += f" ⚠️未発火{len(today['unfired'])}"
     if today["n"] == 0:
         return head + "購入なし" + failed_tag
     pending_tag = f" ⏳残{today['n_pending']}" if today["n_pending"] else ""
@@ -1010,7 +1079,8 @@ def main() -> int:
     prev = confirmed_summary(prev_date)
     cum = confirmed_summary(None)
 
-    if today["n"] == 0 and prev is None and not today.get("uncertain"):
+    if (today["n"] == 0 and prev is None and not today.get("uncertain")
+            and not today.get("unfired")):
         logging.info("当日発注なし・前日確定なし — メールなし (契約 §1 非開催)")
         return 0
 
