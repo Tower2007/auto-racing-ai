@@ -460,6 +460,19 @@ def _in_slot(start_time: str | None, slot: str) -> bool:
     return lo <= start_time < hi
 
 
+# 直近の fetch_today_schedule 呼び出しの失敗理由 (成功・開催なしなら None)
+LAST_SCHEDULE_FETCH_ERROR: str | None = None
+
+
+def fetch_today_schedule_ex(client: AutoraceClient) -> tuple[dict[int, dict], str | None]:
+    """fetch_today_schedule と同じ結果に、失敗理由 (成功なら None) を添えて返す。
+
+    戻り値 ({}, None) は「取得に成功し、開催なし」、({}, 理由) は「取得失敗」(2026-11-12)。
+    """
+    sched = fetch_today_schedule(client)
+    return sched, LAST_SCHEDULE_FETCH_ERROR
+
+
 def fetch_today_schedule(client: AutoraceClient) -> dict[int, dict]:
     """Hold/Today から place_code 別の開催情報を返す。
 
@@ -470,14 +483,24 @@ def fetch_today_schedule(client: AutoraceClient) -> dict[int, dict]:
 
     raceStartTime は nowRaceNo が指すレースの実発走時刻('HH:MM')。
     liveStartTime(放送開始)とは別物で約30分遅い。動的発火時刻計算に必須。
+
+    取得失敗でも {} を返す (既存の呼び出し元のため不変)。失敗か「開催なし」かを
+    区別したい呼び出し元は fetch_today_schedule_ex を使う (2026-11-12)。
     """
+    global LAST_SCHEDULE_FETCH_ERROR
+    LAST_SCHEDULE_FETCH_ERROR = None
     try:
         resp = client.get_today_hold()
     except Exception as e:
         logging.warning("Hold/Today 取得失敗: %s", e)
+        LAST_SCHEDULE_FETCH_ERROR = f"Hold/Today 取得失敗: {e}"
         return {}
-    body = resp.get("body", {}) or {}
+    body = (resp.get("body", {}) or {}) if isinstance(resp, dict) else None
+    if not isinstance(body, dict) or not isinstance(body.get("today", []), list):
+        LAST_SCHEDULE_FETCH_ERROR = "Hold/Today 応答の形式が想定外 (body.today が list でない)"
     today_list = body.get("today", []) if isinstance(body, dict) else []
+    if not isinstance(today_list, list):
+        today_list = []
     out: dict[int, dict] = {}
     for h in today_list:
         pc = h.get("placeCode")
@@ -991,6 +1014,25 @@ def append_picks_log(picks: pd.DataFrame, time_label: str):
     new = picks[cols].copy()
     new["batch"] = time_label
     new["sent_at"] = dt.datetime.now().isoformat(timespec="seconds")
+    # 同じ R・同じ車が既に記録済みなら追記しない (二重発火・手動再走で推奨 (仮想) の
+    # 集計が重複しないように。2026-11-12)。読めない場合は従来どおり追記する。
+    try:
+        if PRODUCTION_LOG.exists() and PRODUCTION_LOG.stat().st_size > 0:
+            old = pd.read_csv(PRODUCTION_LOG, usecols=["race_date", "place_code",
+                                                       "race_no", "car_no"])
+            seen = {(str(a), int(b), int(c), int(d)) for a, b, c, d in
+                    old.itertuples(index=False, name=None)}
+            keep = [(str(r.race_date), int(r.place_code), int(r.race_no),
+                     int(r.car_no)) not in seen for r in new.itertuples()]
+            if not all(keep):
+                logging.getLogger("daily_predict").info(
+                    "picks 記録: 既に記録済みの %d 行を追記しない (重複防止)",
+                    len(keep) - sum(keep))
+            new = new[keep]
+            if new.empty:
+                return
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger("daily_predict").warning("picks 重複確認失敗 (追記は継続): %s", e)
     write_header = not PRODUCTION_LOG.exists() or PRODUCTION_LOG.stat().st_size == 0
     new.to_csv(PRODUCTION_LOG, mode="a", header=write_header, index=False)
 
@@ -1360,6 +1402,16 @@ def main():
                            "(解除は data/rt3_backstop_stop.flag を人間が削除)")
     except Exception as e:  # noqa: BLE001
         logger.warning("[backstop] 評価失敗 (継続): %s", e)
+
+    # 前回送れなかった自動発注の重要通知 (失敗・結果不明・連続失敗停止) を再送 (2026-11-12)
+    try:
+        import auto_buy as _ab_resend
+        if _ab_resend.AUTO_BUY_ENABLED:
+            n = _ab_resend.resend_pending_notifications()
+            if n:
+                logger.info("[auto_buy] 未送信だった通知を %d 件再送", n)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[auto_buy] 通知の再送処理失敗 (継続): %s", e)
 
     try:
         model, iso, meta = load_production()

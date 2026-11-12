@@ -480,6 +480,22 @@ if st.button("✅ 購入する", type="primary", width="stretch"):
                              note=result.stdout[-200:])
         with st.expander("実行ログ"):
             st.code(result.stdout)
+    elif result.returncode == 4:
+        # execute_purchase の EXIT_UNCERTAIN (= auto_buy.EXECUTE_EXIT_UNCERTAIN):
+        # 「投票する」押下後に確認が取れず終了 = 成立している可能性がある (2026-11-12)。
+        # 表示のみ変更。トークンは従来どおり (reserve 済みのため再利用はできない)。
+        st.markdown(
+            '<div class="fail-banner">⚠️ 結果不明 (投票履歴を確認)<br>'
+            '<span style="font-size:14px;">「投票する」を押した後に成立確認が取れませんでした。'
+            '公式の投票履歴で成立有無を確認してください。成立していた場合、'
+            '買い直さないでください。</span></div>',
+            unsafe_allow_html=True,
+        )
+        if not dry_run:
+            bt.mark_failed(payload, sig=sig,
+                           note="uncertain (exit=4): " + result.stderr[-180:])
+        with st.expander("詳細"):
+            st.code(result.stderr or result.stdout or "(no output)")
     else:
         st.markdown(
             f'<div class="fail-banner">❌ 投票失敗 (exit={result.returncode})</div>',

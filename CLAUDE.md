@@ -90,16 +90,17 @@ reports/               # 各種分析レポート(commit 対象)
 | タスク | 時刻 | 内容 |
 |---|---|---|
 | `AutoraceDailyIngest` | 毎日 06:30 | データ収集 (catchup 2 日 = 最低 2 日。manifest 上の前回成功日の翌日まで自動で遡る、上限 31 日。2026-11-11) |
-| `AutoraceDynamicScheduler` | 毎日 07:00 | `python dynamic_scheduler.py`: Program/Print ページから各場 R 毎の発走時刻を取得し、各レース発走 `LEAD_MIN` 分前 (場別: 伊勢崎/浜松/山陽 4 分・川口/飯塚 3 分、`dynamic_scheduler.py:LEAD_MIN_VENUE_MAP`) の `AutoraceDyn_{venue}_R{n}` one-shot を実レース数 × 場数ぶん登録(冪等、毎日再生成)。Program/Print が `24:04` 表記で返すミッドナイト日跨ぎ R も +1 日で正しく登録し、8R 開催なら R9〜 は登録しない (2026-09-04)。**登録成功マーカー** `data/dynamic_scheduler_state.json` (日付・件数・登録 R 一覧) を全件登録できた時だけ書く。1 R でも登録できなければ exit 2 + 要確認メール「動的タスク登録 失敗 NR」(2026-11-12) |
+| `AutoraceDynamicScheduler` | 毎日 07:00 | `python dynamic_scheduler.py`: Program/Print ページから各場 R 毎の発走時刻を取得し、各レース発走 `LEAD_MIN` 分前 (場別: 伊勢崎/浜松/山陽 4 分・川口/飯塚 3 分、`dynamic_scheduler.py:LEAD_MIN_VENUE_MAP`) の `AutoraceDyn_{venue}_R{n}` one-shot を実レース数 × 場数ぶん登録(冪等、毎日再生成)。Program/Print が `24:04` 表記で返すミッドナイト日跨ぎ R も +1 日で正しく登録し、8R 開催なら R9〜 は登録しない (2026-09-04)。**登録成功マーカー** `data/dynamic_scheduler_state.json` (日付・件数・登録 R 一覧) を全件登録できた時だけ書く。1 R でも登録できなければ exit 2 + 要確認メール「動的タスク登録 失敗 NR」(2026-11-12)。API クライアントの初期化失敗・開催一覧 (Hold/Today) の取得失敗も exit 1 + 要確認メール (マーカーなし = 次回ログオン時に再試行)。取得に成功して開催 0 件なら開催なし確定としてマーカーを書く (`daily_predict.fetch_today_schedule_ex` で失敗と開催なしを区別) |
 | `AutoraceDynSchedulerOnLogon` | ログオン時 | 本体と同じ `python dynamic_scheduler.py` (引数なし・Interactive)。**救済登録** (2026-11-12): 当日マーカーあり → 「本日は登録済み」で何もしない / マーカーなし & 07:00 前 → 本体に任せて何もしない (前日ミッドナイトの未発火タスクも消さない) / マーカーなし & 07:00 以降 (= 本体が飛んだ) → これから発火する R だけ登録。本体 (Password 型) が作った同名タスクは Interactive からは消せず Access denied になるため、同名・同発火時刻で登録済みなら既存を使い、それ以外は別名 `AutoraceDyn_{venue}_R{n}_alt` で XML 登録 (EndBoundary 発火+2h・DeleteExpiredTaskAfter 1h で自動失効)。以前は Access denied で全件空振り・rc=0・無通知だった (7/19〜) |
 | `AutoraceDyn_{venue}_R{n}` | 各レース発走 LEAD_MIN 分前(場別 3〜4 分前、動的) | `wscript //B scripts/run_predict_hidden.vbs {pc} {n} {label} {date}` → `python daily_predict.py --venues {pc} --races {n} --date {開催日} --suppress-noresult-email`: 1 R 単位で予測。**買い候補メールは自動発注が全候補を処理できた R では送らない** (AUTO-BUY の投票完了/skip メールと重複するため、2026-11-03)。自動発注が `failed` / `skip_lock` / 例外 / 対象外候補ありの時だけ「⚠️自動発注できず (手動購入可)」件名で 1-click 購入ボタン付きの候補メールを送り、その時だけ buy_app + ngrok を起動する。判定は `daily_predict.candidate_mail_decision`、従来どおり毎回送るには `.env` で `AUTO_BUY_SEND_CANDIDATE_MAIL=1`。near-miss retry 廃止、処理 ~10 秒で締切 ~2 分前に到着。**`--date` は必須級**: 日跨ぎミッドナイト R (00:00 以降発火) で既定の今日日付だと翌暦日になり program 空 → 無音スキップしていた (2026-09-03 飯塚 R7/R8、2026-09-04 修正) |
 | `AutoraceWeeklyRetrain` | 毎日曜 03:00 | `python scripts/weekly_retrain.py`: 再学習チェーン wrapper。`ml.features`(特徴量parquet再生成) → `ml.walkforward_morning`(校正OOF parquet再生成) → `ml.train_production`(学習+品質ゲート) を順に実行。上流失敗時は学習に進まず中断。**2026-06-14 導入**: 旧 `python -m ml.train_production` 単発は学習入力(parquet)を再生成せず、5/24〜6/14 の4回が同一データ no-op 化しモデルが4/29塩漬けだったのを修正。経緯: memory `project_decisions.md` 2026-06-14。品質ゲートの永久凍結問題(凍結高値AUCを恒久ベースライン化)は **2026-06-26 に解消済み** (`ml/train_production.py` の `_should_adopt` 再設計: 現役モデルを候補と同一 val 集合で再採点 + 許容バンド `ADOPT_TOL_AUC` + 鮮度オーバーライド `STALE_DAYS`/`STALE_TOL_AUC`) |
 | `AutoraceWeeklyStatus` | 毎月曜 07:20 | 週次ステータス報告 |
 | `AutoraceMonthlyReport` | 毎月 1 日 08:00 | `python monthly_report.py --send-email`: 前月の月次収支レポート(推奨仮想+実購入+券種別+場別+月次ROI推移+通算)を Gmail 送信。keiba の月次レポートと同枠組み |
 | `AutoraceFetchOrderHistory` | 毎日 02:30 | `python scripts/daily_fetch_order_history.py`: vote.autorace.jp の購入履歴を `--since <前回成功日から、最低 2d・上限 31d> --detail --cookie-source playwright` で取得 (2026-11-11: 固定 2d 窓で 10/14 が漏れたため)し `data/bet_history.csv` / `bet_history_detail.csv` にマージ。失敗時のみ Gmail 通知。**2026-05-08 から Playwright auto-login** に切替(SBI IPO project と同じパターン)。資格情報は `accounts.json`(.gitignore)。実装: `scripts/auto_login_autorace.py`。旧 Firefox cookie 方式は `--cookie-source firefox` で fallback 可。経緯: memory `ml_baseline_findings.md` 2026-05-08 |
+| `AutoraceBuyApp` | 起動時 (BootTrigger、未実行) | `streamlit run app/buy_app.py --server.port 8502`。通常は候補メール送信時に daily_predict が buy_app を起動するため、このタスクは補助 (2026-11-12 時点で一度も実行されていない) |
 | `AutoraceStreamlitApp` | ログオン時 (+手動 `schtasks /Run`) | `wscript //B scripts/run_streamlit_hidden.vbs`: streamlit_app.py を port 8501 で窓なし常駐起動。port 8501 応答中なら何もしない(二重起動ガード)。**Claude セッションから起動すると子プロセスとしてセッション終了時に巻き添え終了する**ため、Task Scheduler 経由で独立プロセス化 (2026-06-11) |
 | `AutoraceNightReport` | 毎日 00:00 | `wscript //B scripts/run_night_report_hidden.vbs` → `night_report.py`: **夜次メール** (夜次メール契約 v1、統合監視 `docs/nightly_mail_reflection_spec.md`)。当日実発注 (auto_buy_state) を RaceRefund API で暫定精算 + 前日確定 (bet_history) + 累計 + 振り返り 1 節をメール。**反省の正本は `logs/reflections/YYYY-MM.md`** (契約 §3、メール本文だけに存在する反省は禁止)。発注ゼロ・前日確定なしの日は送らない。**00:00 発火のため対象日は前日** (山陽ミッドナイト 〜23:50 を取りこぼさないよう 22:00→00:00 に変更、2026-08-08)。未確定レースは「結果待ち」表示し翌晩の前日確定で補正 (boat と同じ2段構え)。**本日集計は race_date 基準** (発売 0:00〜4:59 の発注は前日開催のミッドナイトとして除外し前日確定欄で計上、00:00 以降発走の当日ミッドナイトは本文に明示)。暫定精算は返還 (欠車・不成立)・特払を払戻に数える (2026-11-11)。週次 (weekly_status) の「今週の反省まとめ」節が転記して読み返す (契約 §5) (2026-08-07 導入) |
-| `AutoraceOddsTsCollector` | 毎日 07:05 + ログオン時 | `wscript //B scripts/run_odds_ts_hidden.vbs` → `scripts/odds_timeseries_collector.py`: 当日全レースのオッズを発走 -60/-30/-15/-8/-4/-3/+2 分の 7 時点でスナップショット、全券種 body を `data/odds_ts/YYYY-MM-DD.jsonl` に追記 (+2分 = 締切後の確定オッズ = 教師データ)。将来の確定オッズ予測 / smart money 検知 / 三連単順序モデル研究用の観測データ蓄積 (2026-07-05 導入)。読み取り専用・投票と無関係。再起動安全、最終レース+2分で自動終了。**ログオン時トリガ (AutoraceOddsTsCollectorOnLogon) を 2026-08-08 追加**: 8/7 20:26 の OS 再起動でコレクタが死んだまま山陽ミッドナイト分の観測を喪失したため、OddsPrerace と同じ 2 本構成に (冪等: 当日 jsonl から取得済みを復元して再開) |
+| `AutoraceOddsTsCollector` / `AutoraceOddsTsCollectorOnLogon` | 毎日 07:05 + ログオン時 (別タスク) | `wscript //B scripts/run_odds_ts_hidden.vbs` → `scripts/odds_timeseries_collector.py`: 当日全レースのオッズを発走 -60/-30/-15/-8/-4/-3/+2 分の 7 時点でスナップショット、全券種 body を `data/odds_ts/YYYY-MM-DD.jsonl` に追記 (+2分 = 締切後の確定オッズ = 教師データ)。将来の確定オッズ予測 / smart money 検知 / 三連単順序モデル研究用の観測データ蓄積 (2026-07-05 導入)。読み取り専用・投票と無関係。再起動安全、最終レース+2分で自動終了。**ログオン時トリガ (AutoraceOddsTsCollectorOnLogon) を 2026-08-08 追加**: 8/7 20:26 の OS 再起動でコレクタが死んだまま山陽ミッドナイト分の観測を喪失したため、OddsPrerace と同じ 2 本構成に (冪等: 当日 jsonl から取得済みを復元して再開) |
 | `AutoraceOddsPrerace` | 毎日 07:05 + ログオン時 | `pythonw odds_prerace_daemon.py`: 直前オッズ常駐デーモン (2026-07-03 導入)。当日の全開催・全レースの発走 **T-5分/T-1分** に Odds API を fetch し、全券種 (tns/fns/rtw/rfw/wid/rt3/rf3) を `data/odds_combo_prerace.csv` に縦持ち追記 → ドリフト検証 (T-5→T-1 モメンタム・確定直前値) 用の 2 時点収集。時刻推定は dynamic_scheduler と同一ロジック再利用 (Program/Print 実時刻 → anchor 線形補間 fallback)。最終レース後に自然終了。二重起動は named mutex ガード + IgnoreNew (旧 58620 bind 方式は WinNAT 動的除外ポート帯の WinError 10013 誤検知で収集が黙って止まるため 2026-07-12 mutex 化)。ログ: `data/odds_prerace_daemon.log`。追加アクセス 〜72 POST/日 (36R×2時点)。登録: `scripts/register_odds_prerace_task.ps1` / テスト: `tests/test_odds_prerace_daemon.py` |
 
 #### 設計
@@ -126,8 +127,10 @@ EV 閾値は 2026-05-31 の `scripts/ev_threshold_sweep.py` (walk-forward 25ヶ�
 2.00 (ROI効率185%・〜1本/日) も検討したが、総利益(¥68,510 > ¥60,930)と賭け機会
 (〜2.5本/日)を優先して **1.50 を維持** (ROI 136%・全25ヶ月プラス)。
 レポート: `reports/ev_threshold_sweep_2026-05-31.md`。
-三連系 (rt3 + rf3) 推奨: 浜松(4) + 山陽(6) 限定、ev_avg_calib >= 1.80 で pred top-3 の
-三連単 1 点 + 三連複 1 点を追加推奨 (2026-05-29 導入、paper 記録 `data/rt3_paper.csv`)。
+三連系 (rt3 + rf3) 推奨: ev_avg_calib >= 1.80 で pred top-3 の三連単 1 点 + 三連複 1 点を追加推奨
+(2026-05-29 導入、paper 記録 `data/rt3_paper.csv`)。**対象場の正本は `src/strategy_config.py:THREE_POINT_POLICY`**:
+現行 (2026-07-11〜) は 三連単 = 浜松(4)・山陽(6)、三連複 = 伊勢崎(3)・浜松(4)・山陽(6)
+(2026-05-29 当初は浜松・山陽限定 → 2026-06-09 に三連複を 4 場へ拡大 → 2026-07-11 に飯塚を除外)。
 過去検証 `scripts/ev_3point_by_place.py` thr=1.80:
 rt3 浜松 ROI 530% / 山陽 ROI 141%、rf3 浜松 ROI 330% / 山陽 ROI 185%。
 
@@ -150,11 +153,26 @@ rt3 浜松 ROI 530% / 山陽 ROI 141%、rf3 浜松 ROI 330% / 山陽 ROI 185%。
 state の reset は暦日基準なので、日跨ぎミッドナイト R (00:00 以降発火) は前日の日次 cap
 (`MAX_DAILY_AUTO_YEN`) とは別枠 (翌暦日の枠) で数えられる (仕様、2026-09-04 注記)。
 同一 R の executed/dry_run/uncertain が当日 state にあれば `skip_duplicate` で二重発注しない (冪等ガード)。
+冪等キーは 場_R番号 + 開催日 (race_date)。開催日を持たない 2026-11-12 より前の記録はラベルだけで一致とみなす (安全側)。
+click 前の失敗 (`failed`) の再試行は同一 R につき 1 日 1 回まで (`skip_retry_limit`)。二重発火で後続 run が
+`skip_lock` になった時、先行 run が同じ R を処理中 (state の `inflight`) なら `skip_lock_inflight` とし、
+手動購入ボタン付き候補メールを出さない。`daily_predict_picks.csv` は同じ R・車を重複記録しない (2026-11-12)。
+**連続失敗の停止 (sticky、2026-11-12)**: 失敗・結果不明が `CONSECUTIVE_FAILURES_STOP` (3) 回続くと
+`data/consecutive_failure_stop.flag` (対象 R の一覧入り JSON) を書いて自動発注を全券種停止し、警告メールを出す。
+連続失敗のカウントと対象 R は日付をまたいで持ち越し、0:00 では解除しない。**解除は次のどちらか**:
+(a) 人がフラグを削除する (公式の投票履歴で対象 R の成立有無と原因を確認してから)、
+(b) 翌日 02:30 の注文履歴取得 (`scripts/daily_fetch_order_history.py`) の後、対象 R すべての成立有無が
+bet_history で確定したら自動解除し、成立/不成立の一覧をメールで通知 (`auto_buy.release_failure_stop_if_confirmed`)。
+失敗・結果不明・停止のメールが送れなかった場合は `data/auto_buy_pending_mail.jsonl` に積み、次回起動時に再送する。
+**発注台帳 (2026-11-12)**: 発注記録は state に加え追記型の `data/auto_buy_ledger.jsonl` にも残し、日付が変わる時に
+前日の state を `data/auto_buy_state_archive/<date>.json` に退避する。夜次はこれらを合わせて読む (state の上書きで
+前日分が消えても集計できる)。夜次は前日の結果不明 R の成立/不成立を bet_history と照合して 1 行出す。
 **結果不明 (verdict `uncertain`、2026-11-12)**: execute_purchase のタイムアウト / 「投票する」click 以降の
 失敗 (exit 4 = `EXIT_UNCERTAIN`。click 前の失敗は exit 1 で従来どおり `failed`) / 想定外の終了コードは、
 注文が成立した可能性があるため予定額を当日上限に計上・冪等ガード対象・連続失敗 +1 とし、
 「結果不明 (投票履歴を確認)」メールを出す。手動購入ボタン付き候補メールは送らない (二重購入防止)。
-成立有無は公式の投票履歴 / 翌日の bet_history で確認する (自動照合はしない)。
+成立有無は公式の投票履歴 / 翌日の bet_history で確認する (翌晩の夜次メールに照合結果が 1 行出る)。
+buy_app の手動購入で exit 4 が返った時も「結果不明 (投票履歴を確認)」と表示する。
 残高警告: 投票後に確認画面から残高(ポイント+払戻金)を抽出し、合計が
 `AUTO_BUY_LOW_BALANCE_YEN` (デフォルト¥3000) 以下なら警告メール (1日1回、state で重複抑止)。
 2026-05-31 ユーザー要望で **`AUTO_BUY_ANYTIME=True` (デフォルト) = 時間帯制限なし常時発注**。

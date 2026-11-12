@@ -285,6 +285,11 @@ def fetch_today_race_starts(
             if race_no in race_starts:
                 starts[race_no] = race_starts[race_no]
                 n_exact += 1
+            elif race_starts:
+                # Program/Print が取れている場は実レース数で打ち切る (推定補間しない)。
+                # dynamic_scheduler と同じ規則 (2026-09-04 監査 P3)。8R 開催などで
+                # 存在しない R9〜 を推定してオッズ取得を空打ちしていた (2026-11-12 監査 指摘13)。
+                continue
             elif anchor_time is not None:
                 starts[race_no] = estimate_race_start(
                     today, anchor_r, anchor_time, race_no, interval)

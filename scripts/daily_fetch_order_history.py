@@ -161,6 +161,18 @@ def main() -> int:
         notify_failure("[autorace] 投票履歴取得 失敗", body)
         return result.returncode
 
+    # 連続失敗の sticky 停止: 対象 R の成立有無が今回の取得で確定したら解除する
+    # (2026-11-12 監査 指摘9。確定しない R が残れば停止は続く)
+    try:
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        import auto_buy
+        msg = auto_buy.release_failure_stop_if_confirmed()
+        if msg:
+            append_log("[info] 連続失敗の停止を解除:\n" + msg)
+    except Exception as e:  # noqa: BLE001
+        append_log(f"[warn] 連続失敗停止の解除判定に失敗 (停止は継続): {e}")
+
     return 0
 
 

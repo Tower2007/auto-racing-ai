@@ -153,29 +153,61 @@ def exec_race_date(timestamp: str | None, fallback: str) -> str:
     return d.isoformat()
 
 
+def load_exec_records(today: str) -> list[dict]:
+    """対象日の前後の発注記録を、state・退避した state・追記型台帳から集める (2026-11-12)。
+
+    auto_buy_state.json は暦日 1 日分の上書きなので、日付が変わった後の最初の発注で
+    前日分が消える (監査 指摘11)。auto_buy は日付が変わるときに前日の state を
+    data/auto_buy_state_archive/<date>.json に退避し、発注記録を
+    data/auto_buy_ledger.jsonl にも追記する。ここではその 3 つを重複除去して合わせる。
+    各記録に state_date (記録した暦日) と race_date (開催日) を付けて返す。
+    """
+    from src.order_ledger import ARCHIVE_DIRNAME, LEDGER_NAME, read_records, record_key
+    base = STATE_FILE.parent
+    day = dt.date.fromisoformat(today)
+    wanted = {(day + dt.timedelta(days=k)).isoformat() for k in (-1, 0, 1)}
+    raw: list[tuple[dict, str | None]] = []
+    sources = [STATE_FILE] + [base / ARCHIVE_DIRNAME / f"{d}.json" for d in sorted(wanted)]
+    for src in sources:
+        try:
+            st = json.loads(src.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        except Exception as e:  # noqa: BLE001
+            logging.warning("%s 読込失敗: %s", src.name, e)
+            continue
+        if st.get("date") in wanted:
+            raw += [(e, st.get("date")) for e in st.get("executions", [])]
+    for e in read_records(base / LEDGER_NAME):
+        if e.get("state_date") in wanted or e.get("race_date") in wanted:
+            raw.append((e, e.get("state_date")))
+    out, seen = [], set()
+    for e, state_date in raw:
+        k = record_key(e)
+        if k in seen:
+            continue
+        seen.add(k)
+        sd = state_date or (str(e.get("timestamp", ""))[:10] or today)
+        out.append({**e, "state_date": sd,
+                    "race_date": e.get("race_date") or exec_race_date(e.get("timestamp"), sd)})
+    return out
+
+
 def load_today_executions(today: str) -> tuple[list[dict], int, list[str]]:
     """対象日 (race_date=today) の実発注 (verdict=executed)、発注失敗数、
-    および state に入っているが前日開催 (ミッドナイト) と判定した発注のラベル。
+    および本日の state に入っているが前日開催 (ミッドナイト) の発注のラベル。
 
-    auto_buy_state は購入時刻の日付で 1 日分を持つため、前日開催の深夜 R が
-    混ざる。それらは本日の暫定精算から外す (前日確定欄 = bet_history で計上済み)。
+    前日開催の深夜 R は本日の暫定精算から外す (前日確定欄 = bet_history で計上済み)。
+    2026-11-12: state だけでなく退避した state と追記型台帳も読む (load_exec_records)。
     """
-    if not STATE_FILE.exists():
-        return [], 0, []
-    try:
-        st = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except Exception as e:
-        logging.warning("auto_buy_state 読込失敗: %s", e)
-        return [], 0, []
-    if st.get("date") != today:
-        return [], 0, []
     execs, failed, carried = [], 0, []
-    for e in st.get("executions", []):
+    for e in load_exec_records(today):
         v = e.get("verdict")
         venue_short, _, rno = str(e.get("race", "")).rpartition("_R")
         pc = VENUE_PC.get(venue_short)
-        if exec_race_date(e.get("timestamp"), today) != today:
-            if v == "executed" and pc is not None:
+        if e.get("race_date") != today:
+            if (v == "executed" and pc is not None and e.get("state_date") == today
+                    and str(e.get("race_date")) < today):
                 carried.append(f"{VENUE_JP.get(pc, '?')} R{rno}")
             continue
         if v == "failed":
@@ -200,24 +232,42 @@ def load_uncertain_executions(today: str) -> list[str]:
     注文成立を確認できなかった R。成立していれば bet_history (翌 02:30) が正なので
     暫定精算・的中・投資には含めず、本文と件名で「結果不明」として件数だけ示す。
     """
-    if not STATE_FILE.exists():
-        return []
-    try:
-        st = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except Exception as e:
-        logging.warning("auto_buy_state 読込失敗: %s", e)
-        return []
-    if st.get("date") != today:
-        return []
     out: list[str] = []
-    for e in st.get("executions", []):
-        if e.get("verdict") != "uncertain":
-            continue
-        if exec_race_date(e.get("timestamp"), today) != today:
+    for e in load_exec_records(today):
+        if e.get("verdict") != "uncertain" or e.get("race_date") != today:
             continue
         venue_short, _, rno = str(e.get("race", "")).rpartition("_R")
         pc = VENUE_PC.get(venue_short)
         out.append(f"{VENUE_JP.get(pc, venue_short or '?')} R{rno}")
+    return out
+
+
+FETCH_LOG = DATA / "fetch_order_history.log"
+
+
+def reconcile_prev_uncertain(today: str) -> list[str]:
+    """前日 (today-1) 開催の「結果不明」R が成立していたかを bet_history と照合する。
+
+    翌 02:30 の注文履歴取得の後なら「成立 / 不成立」、取得がまだなら「未確認」。
+    夜次メールに 1 行出す (2026-11-12)。
+    """
+    from src.order_ledger import bought_keys, confirm_race, last_fetch_success
+    prev = (dt.date.fromisoformat(today) - dt.timedelta(days=1)).isoformat()
+    targets = [e for e in load_exec_records(prev)
+               if e.get("verdict") == "uncertain" and e.get("race_date") == prev]
+    if not targets:
+        return []
+    bought = bought_keys(BET_HISTORY)
+    fetch_ok = last_fetch_success(FETCH_LOG)
+    out = []
+    for e in targets:
+        venue_short, _, rno = str(e.get("race", "")).rpartition("_R")
+        pc = e.get("place_code") or VENUE_PC.get(venue_short)
+        try:
+            st = confirm_race(prev, int(pc), int(e.get("race_no") or rno), bought, fetch_ok)
+        except (TypeError, ValueError):
+            st = "未確認"
+        out.append(f"{VENUE_JP.get(pc, venue_short or '?')} R{rno}: {st}")
     return out
 
 
@@ -538,6 +588,8 @@ def evaluate_today(today: str) -> tuple[dict, int]:
         "carried_prev": carried,
         # 結果不明の自動発注 (暫定精算に含めない。成立有無は bet_history が正)
         "uncertain": load_uncertain_executions(today),
+        # 前日の結果不明 R の成立有無 (bet_history と照合、2026-11-12)
+        "uncertain_prev_check": reconcile_prev_uncertain(today),
         # 登録済みなのに起動しなかった R (未ログオン等)。未到来の R は含まない
         "unfired": load_unfired_races(today),
         # 00:00 時点で未発走の当日ミッドナイト R (翌晩の前日確定で計上)
@@ -823,6 +875,11 @@ def _scope_notes(today: dict) -> list[str]:
         notes.append(f"自動発注 結果不明 {len(today['uncertain'])}R "
                      f"({', '.join(today['uncertain'])}): 成立を確認できず本日の暫定集計に"
                      f"含めない。公式の投票履歴で要確認 (成立分は明晩の前日確定欄で計上)")
+    if today.get("uncertain_prev_check"):
+        prev_day = (dt.date.fromisoformat(today["date"])
+                    - dt.timedelta(days=1)).isoformat()
+        notes.append(f"前日 ({prev_day}) の結果不明 {len(today['uncertain_prev_check'])}R "
+                     f"の照合 (注文履歴): {', '.join(today['uncertain_prev_check'])}")
     if today.get("unfired"):
         notes.append(f"未発火 {len(today['unfired'])}R ({', '.join(today['unfired'])}): "
                      f"発火タスクは登録済みだが予測・自動発注が起動していない。"

@@ -39,6 +39,12 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(ds, "AutoraceClient", _FakeClient)
     monkeypatch.setattr(ds, "fetch_today_schedule",
                         lambda client: {5: {"cancelFlg": "0"}})
+    # main は取得失敗と開催なしを区別する _ex を使う (2026-11-12)
+    monkeypatch.setattr(ds, "fetch_today_schedule_ex",
+                        lambda client: ({5: {"cancelFlg": "0"}}, None))
+    ns.problems = []
+    monkeypatch.setattr(ds, "notify_problem",
+                        lambda today, what, body: ns.problems.append(what))
 
     def _cleanup():
         ns.cleanup += 1
@@ -164,12 +170,34 @@ def test_past_races_are_not_targets(env):
     assert _marker(env)["n_registered"] == 1
 
 
-def test_no_meeting_does_not_write_marker(env):
-    """開催なし (= 取得失敗と区別できない {}) ではマーカーを書かない。
+def test_fetch_failure_does_not_write_marker_and_notifies(env):
+    """開催一覧の取得失敗ではマーカーを書かず、非 0 + 要確認メール (2026-11-12)。
     書くと通信エラーの日に再実行・救済が「登録済み」で止まる。"""
-    env.mp.setattr(ds, "fetch_today_schedule", lambda client: {})
+    env.mp.setattr(ds, "fetch_today_schedule_ex",
+                   lambda client: ({}, "Hold/Today 取得失敗: timeout"))
+    _at(env, 7, 0)
+    assert ds.main() == 1
+    assert _marker(env) is None
+    assert env.problems == ["開催一覧の取得失敗"]
+    assert env.created == []
+
+
+def test_confirmed_no_meeting_writes_marker(env):
+    """取得に成功して開催 0 件 = 開催なし確定 → マーカーを書く (同日の再実行は何もしない)。"""
+    env.mp.setattr(ds, "fetch_today_schedule_ex", lambda client: ({}, None))
     _at(env, 7, 0)
     assert ds.main() == 0
+    assert _marker(env)["n_registered"] == 0
+    assert env.problems == []
+
+
+def test_client_init_failure_notifies(env):
+    def _boom():
+        raise RuntimeError("CSRF 取得失敗")
+    env.mp.setattr(ds, "AutoraceClient", _boom)
+    _at(env, 7, 0)
+    assert ds.main() == 1
+    assert env.problems == ["API クライアント初期化失敗"]
     assert _marker(env) is None
 
 

@@ -1,5 +1,39 @@
 # CHANGELOG
 
+## 2026-11-12 (3) — 自動発注の堅牢化: 連続失敗停止の持ち越し・発注台帳・冪等キー・二重発火・結果不明の照合 (総合検証 指摘9〜13 と残る弱点)
+
+- **指摘9 連続失敗の停止が 0:00 で自動解除**: 失敗・結果不明が 3 回続くと
+  `data/consecutive_failure_stop.flag` (対象 R の JSON) を書き、自動発注を全券種停止 (sticky)。
+  連続失敗のカウント・対象 R・発動済みの印は日付をまたいで持ち越す。解除は (a) 人がフラグを削除
+  (次の run が検知してカウントを 0 に戻す) か (b) 翌 02:30 の注文履歴取得の後、対象 R すべての成立有無が
+  bet_history で確定した時 (`release_failure_stop_if_confirmed`、`daily_fetch_order_history.py` から呼ぶ。
+  run mutex を取ってから state を更新、解除メールに成立/不成立の一覧)。フラグを書けなかった場合は
+  持ち越したカウントで `skip_failures` が続く (fail-closed)。停止中の通知は 1 日 1 回。
+  失敗・結果不明・停止のメール送信に失敗したら `data/auto_buy_pending_mail.jsonl` に積み、
+  次回起動時 (daily_predict の起動時 / run_auto_buy) に再送。`_notify` は成否を返すようにした。
+- **指摘10 冪等キー**: 場_R番号 + 開催日。開催日の無い旧記録はラベルだけで一致 (安全側)。発注記録に
+  race_date / place_code / race_no を持たせた。
+- **指摘11 夜次が単日上書きの state に依存**: 発注記録を追記型台帳 `data/auto_buy_ledger.jsonl` にも残し
+  (save_state の中で未記帳分を追記)、日付が変わる時に前日の state を `data/auto_buy_state_archive/<date>.json`
+  に退避。夜次は state・退避・台帳を重複除去して読む (`night_report.load_exec_records`)。state の形式は互換。
+- **二重発火の弱点**: 後続 run が `skip_lock` の時、先行 run が同じ R を処理中 (state の `inflight`、10 分で失効)
+  なら `skip_lock_inflight` (手動購入ボタン付き候補メールを出さない)。click 前の失敗 (`failed`) の再試行は
+  同一 R・1 日 1 回まで (`skip_retry_limit`)。`daily_predict_picks.csv` は同じ R・車を重複記録しない。
+- **結果不明の自動照合**: 夜次で前日の `uncertain` R を bet_history と照合し「成立 / 不成立 / 未確認」を 1 行出す
+  (`src/order_ledger.py`。翌日 02:00 以降に成功した注文履歴取得が無ければ「未確認」)。
+- **buy_app**: 手動購入で exit 4 (結果不明) の時「結果不明 (投票履歴を確認)」と表示 (表示のみ)。
+- **dynamic_scheduler**: AutoraceClient 初期化失敗・Hold/Today 取得失敗で要確認メール + exit 1 (マーカーなし)。
+  取得成功で開催 0 件ならマーカーを書く。`daily_predict.fetch_today_schedule_ex` (失敗理由を返す) を追加
+  (既存の `fetch_today_schedule` の戻り値は不変)。
+- **指摘13 直前オッズデーモン**: Program/Print が取れた場は実レース数で打ち切り、存在しない R を推定補間しない
+  (稼働中のデーモンは次回起動から反映)。
+- **指摘12 ドキュメント**: CLAUDE.md の三連系対象場 (正本 `THREE_POINT_POLICY`)、タスク表 (OddsTsCollectorOnLogon・BuyApp)、
+  `auto_buy.py` の docstring (ANYTIME 既定) を実装に合わせた。
+- **pytest**: `pytest.ini` に `testpaths = tests` (素の `pytest` が Opinion/tmp_pip の PermissionError で失敗していた)。
+  `tests/conftest.py` でテスト中の実メール送信を全面禁止 (この作業中、差し替え漏れのテストから
+  要確認メールが 7 通誤送信されたため)。
+- テスト追加: `test_auto_buy_hardening.py` (19)、`test_dynamic_scheduler_rescue.py` に 3 件。
+
 ## 2026-11-12 (2) — ログオン時の救済登録・未発火検知・週次 schtasks 判定・損失停止の明記 (総合検証 指摘4・5・7・8)
 
 - **指摘4 ログオン時の再登録が全件 Access denied**: `AutoraceDynSchedulerOnLogon` (Interactive) は

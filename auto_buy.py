@@ -1,13 +1,17 @@
-"""夜間限定 自動投票 Phase 1 (2026-05-31 導入)。
+"""自動投票 Phase 1 (2026-05-31 導入)。
 
-寝てる時間帯 (山陽ミッドナイト + 川口ナイター後半) の機会損失対策として、
+当初は寝てる時間帯 (山陽ミッドナイト + 川口ナイター後半) の機会損失対策として
+夜間限定で始めたが、2026-05-31 のユーザー要望で AUTO_BUY_ANYTIME=True (既定) =
+時間帯制限なしの常時発注になっている (False で 22〜6 時の夜間限定に戻る)。
 厳格ガード付きで daily_predict の買い候補を自動投票する。
 
 設計方針 (Opinion/codex_briefs/2026-05-31_auto_buy_phase1.md):
   - マスタースイッチ AUTO_BUY_ENABLED (デフォルト OFF)
   - AUTO_BUY_DRY_RUN=True の間は実投票せず log + state 更新のみ
-  - 夜間 (AUTO_BUY_HOURS) のみ、1 日上限 / 当日損失停止 / EV 異常 /
-    連続失敗 の 5 ガードを全て満たした R のみ自動投票
+  - 時間帯 (AUTO_BUY_ANYTIME=False の時のみ) / 1 日上限 / 当日損失停止 (当日中は
+    発動しない、config_warnings 参照) / EV 異常 / 連続失敗 のガードを全て満たした
+    R のみ自動投票。連続失敗の停止は日付をまたいで継続する (sticky、2026-11-12)
+  - 発注記録は state (暦日 1 日分) に加え追記型台帳 data/auto_buy_ledger.jsonl にも残す
   - 既存 execute_purchase.py を subprocess で再利用 (--bets-json)
   - 毎回 Gmail 即時通知 (ユーザーの唯一の monitoring 手段)
 
@@ -143,8 +147,38 @@ def _empty_state(date_str: str) -> dict:
     }
 
 
+# 日付をまたいで持ち越す state のキー (2026-11-12 監査 指摘9: 連続失敗の停止を 0:00 で
+# 自動解除しない)。当日上限・損益・発注記録は従来どおり暦日でリセットする。
+_CARRY_OVER_KEYS = ("consecutive_failures", "failure_streak", "failure_stop_tripped")
+
+
+def _state_dir() -> Path:
+    """state と同じ場所 (テストで STATE_FILE を差し替えると一緒に移る)。"""
+    return STATE_FILE.parent
+
+
+def _archive_state(st: dict) -> None:
+    """前日の state を data/auto_buy_state_archive/<date>.json に退避 (既にあれば何もしない)。"""
+    try:
+        from src.order_ledger import ARCHIVE_DIRNAME
+        d = str(st.get("date") or "")
+        if not d:
+            return
+        p = _state_dir() / ARCHIVE_DIRNAME / f"{d}.json"
+        if p.exists():
+            return
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("auto_buy_state 退避失敗 (継続): %s", e)
+
+
 def load_state(now: dt.datetime | None = None) -> dict:
-    """auto_buy_state.json を読み込む。日付が変わっていれば reset。"""
+    """auto_buy_state.json を読み込む。日付が変わっていれば reset。
+
+    2026-11-12: reset 時は前日の state を退避し、連続失敗のカウント・連続失敗の
+    R 一覧・停止発動済みの印 (_CARRY_OVER_KEYS) だけを持ち越す。
+    """
     now = now or now_jst()
     today = now.date().isoformat()
     if STATE_FILE.exists():
@@ -152,13 +186,39 @@ def load_state(now: dt.datetime | None = None) -> dict:
             st = json.loads(STATE_FILE.read_text(encoding="utf-8"))
             if st.get("date") == today:
                 return st
+            _archive_state(st)
+            fresh = _empty_state(today)
+            for k in _CARRY_OVER_KEYS:
+                if k in st:
+                    fresh[k] = st[k]
+            return fresh
         except Exception as e:
             logger.warning("auto_buy_state 読み込み失敗、reset: %s", e)
     return _empty_state(today)
 
 
+def _ledger_sync(state: dict) -> None:
+    """state の発注記録のうち未記帳のものを追記型台帳に残す (2026-11-12 監査 指摘11)。
+
+    記帳済みの印 (ledger) を付ける。台帳の失敗は発注に影響させない。
+    """
+    try:
+        from src.order_ledger import LEDGER_NAME, append_records
+        new = [e for e in state.get("executions", []) if not e.get("ledger")]
+        if not new:
+            return
+        append_records(_state_dir() / LEDGER_NAME,
+                       [{**{k: v for k, v in e.items() if k != "ledger"},
+                         "state_date": state.get("date")} for e in new])
+        for e in new:
+            e["ledger"] = True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("発注台帳の追記失敗 (継続): %s", e)
+
+
 def save_state(state: dict) -> None:
-    """atomic write (tempfile + os.replace)。"""
+    """atomic write (tempfile + os.replace)。書く前に未記帳の発注記録を台帳へ追記する。"""
+    _ledger_sync(state)
     DATA.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(DATA), suffix=".tmp")
     try:
@@ -340,10 +400,11 @@ def build_bets(car_no: int, rec_yen: int,
 
 # ─── 実行 ─────────────────────────────────────────────────────
 
-def _notify(subject: str, body: str) -> None:
+def _notify(subject: str, body: str) -> bool:
     """Gmail 即時通知。AUTO_BUY_NOTIFY_TO 優先、無ければ MAIL_TO。
 
-    件名は他の通知と揃えて [autorace] を前置する。
+    件名は他の通知と揃えて [autorace] を前置する。送信できたら True、失敗は False
+    (例外は外に出さない)。
     """
     try:
         from gmail_notify import send_email
@@ -352,8 +413,178 @@ def _notify(subject: str, body: str) -> None:
         if not subject.startswith("[autorace]"):
             subject = f"[autorace] {subject}"
         send_email(subject=subject, body=body, recipients=recipients)
+        return True
     except Exception as e:
         logger.error("auto_buy Gmail 通知失敗: %s", e)
+        return False
+
+
+# ── 重要通知の再送 (2026-11-12 監査 指摘9) ───────────────────────────────────
+# 失敗・結果不明・連続失敗停止のメールが送れなかった場合 (9/16 SMTP 切断の実例)、
+# 未送信キューに積み、次回起動時 (daily_predict の起動 / run_auto_buy) に再送する。
+PENDING_MAIL_NAME = "auto_buy_pending_mail.jsonl"
+
+
+def _pending_mail_path() -> Path:
+    return _state_dir() / PENDING_MAIL_NAME
+
+
+def _notify_important(subject: str, body: str) -> None:
+    """重要通知。送信に失敗したら (_notify が False を返したら) 再送キューに積む。"""
+    if _notify(subject, body) is False:
+        try:
+            from src.order_ledger import append_records
+            append_records(_pending_mail_path(), [{
+                "subject": subject, "body": body,
+                "queued_at": now_jst().isoformat(timespec="seconds")}])
+            logger.warning("[auto_buy] 通知を再送キューに積んだ: %s", subject)
+        except Exception as e:  # noqa: BLE001
+            logger.error("[auto_buy] 再送キューへの保存も失敗: %s", e)
+
+
+def resend_pending_notifications() -> int:
+    """未送信キューの通知を再送。送れたものは消し、送れないものは残す。送れた件数を返す。"""
+    p = _pending_mail_path()
+    try:
+        if not p.exists():
+            return 0
+        from src.order_ledger import read_records
+        items = read_records(p)
+        remain, sent = [], 0
+        for it in items:
+            subj = str(it.get("subject", ""))
+            note = f"(再送: 初回送信失敗 {it.get('queued_at', '?')})\n\n"
+            if _notify(subj + " (再送)", note + str(it.get("body", ""))) is False:
+                remain.append(it)
+            else:
+                sent += 1
+        if remain:
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n"
+                                   for r in remain), encoding="utf-8")
+            os.replace(tmp, p)
+        else:
+            p.unlink()
+        return sent
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[auto_buy] 再送処理失敗 (継続): %s", e)
+        return 0
+
+
+# ── 連続失敗による停止の持ち越し (sticky) (2026-11-12 監査 指摘9) ─────────────────
+# 旧: 連続失敗 3 回の停止は state の日次リセット (0:00) で人の確認なしに解除されていた
+#     (9/16 23:38 に 3 回目 → 00:00 で解除)。
+# 新: 3 回目で data/consecutive_failure_stop.flag を書き、フラグがある間は自動発注を
+#     全券種止める (abandoned_lock_stop.flag と同じ「存在 = 停止」方式)。解除は
+#       (a) 人がフラグを削除する
+#       (b) 翌日 02:30 の注文履歴取得の後、フラグに記録した失敗・結果不明の R すべての
+#           成立有無が bet_history で確定した (release_failure_stop_if_confirmed、
+#           scripts/daily_fetch_order_history.py から呼ぶ)
+#     のどちらか。「次の発注が成功したら解除」はしない (停止中は発注しないため)。
+FAILURE_STOP_FLAG_NAME = "consecutive_failure_stop.flag"
+VERDICT_FAILURE_STOP = "skip_failure_stop"
+
+
+def _failure_stop_flag() -> Path:
+    return _state_dir() / FAILURE_STOP_FLAG_NAME
+
+
+def failure_stop_active() -> bool:
+    """連続失敗による sticky 停止中か (フラグ存在 = 停止)。"""
+    return _failure_stop_flag().exists()
+
+
+def _failure_stop_release_text() -> str:
+    return (
+        "解除方法 (どちらか):\n"
+        f"  (a) 人が data/{FAILURE_STOP_FLAG_NAME} を削除する "
+        "(公式の投票履歴で下記 R の成立有無と原因を確認してから)\n"
+        "  (b) 自動: 翌日 02:30 の注文履歴取得で、下記 R すべての成立有無が確定したら"
+        "解除し、その旨をメールで通知する\n"
+        "停止中も予測メールは届くが、自動発注は全券種行わない。")
+
+
+def _write_failure_stop_flag(state: dict, now: dt.datetime) -> None:
+    """連続失敗の閾値到達時: フラグ (JSON) を書き、警告メールを出す。"""
+    streak = list(state.get("failure_streak", []))
+    body_json = {"tripped_at": now.isoformat(timespec="seconds"),
+                 "consecutive_failures": state.get("consecutive_failures"),
+                 "races": streak}
+    try:
+        _failure_stop_flag().write_text(
+            json.dumps(body_json, ensure_ascii=False, indent=2), encoding="utf-8")
+        # 発動済みの印はフラグを書けた時だけ付ける (印あり・フラグ無し = 人による解除、と
+        # 判定するため。書けなかった場合は state の consecutive_failures が持ち越され、
+        # check_guards の skip_failures で止まり続ける = fail-closed)
+        state["failure_stop_tripped"] = True
+    except Exception as e:  # noqa: BLE001
+        logger.error("[auto_buy] 連続失敗停止フラグの書き込み失敗: %s", e)
+    lines = [f"  - {r.get('race_date', '?')} {r.get('race', '?')} "
+             f"({r.get('verdict', '?')}): {str(r.get('detail', ''))[:120]}" for r in streak]
+    _notify_important(
+        f"[AUTO-BUY] 🛑 連続失敗 {state.get('consecutive_failures')} 回 — "
+        f"自動発注を停止 (日付をまたいで継続)",
+        "【自動発注 停止: 連続失敗 (sticky)】\n\n"
+        f"自動発注が {state.get('consecutive_failures')} 回続けて失敗または結果不明に"
+        "なったため、自動発注を全券種停止しました。日付が変わっても解除されません。\n\n"
+        "対象 R:\n" + ("\n".join(lines) or "  (記録なし)") + "\n\n"
+        + _failure_stop_release_text())
+
+
+def _reset_failure_streak(state: dict) -> None:
+    state["consecutive_failures"] = 0
+    state["failure_streak"] = []
+    state["failure_stop_tripped"] = False
+
+
+def release_failure_stop_if_confirmed(now: dt.datetime | None = None,
+                                      bet_history_csv: Path | None = None,
+                                      fetch_log: Path | None = None) -> str | None:
+    """注文履歴取得の後に呼ぶ。フラグの R すべての成立有無が確定したら停止を解除する。
+
+    返り値: 解除したら解除メッセージ、しなければ None。発注 run と競合しないよう
+    run mutex を取得してから state を更新する (取れなければ何もしない = 停止継続)。
+    """
+    flag = _failure_stop_flag()
+    if not flag.exists():
+        return None
+    from src.order_ledger import (bought_keys, confirm_race, last_fetch_success,
+                                  UNCONFIRMED)
+    try:
+        info = json.loads(flag.read_text(encoding="utf-8"))
+        races = info.get("races") or []
+    except Exception:  # noqa: BLE001
+        return None   # 人が書いた/壊れたフラグは自動解除しない (安全側)
+    if not races:
+        return None
+    bought = bought_keys(bet_history_csv or BET_HISTORY_CSV)
+    fetch_ok = last_fetch_success(fetch_log or (_state_dir() / "fetch_order_history.log"))
+    results = []
+    for r in races:
+        try:
+            st = confirm_race(str(r["race_date"]), int(r["place_code"]),
+                              int(r["race_no"]), bought, fetch_ok)
+        except (KeyError, ValueError, TypeError):
+            st = UNCONFIRMED
+        results.append((r, st))
+    if any(st == UNCONFIRMED for _, st in results):
+        return None
+    lock = _acquire_lock(wait_sec=30)
+    if lock is None:
+        return None
+    try:
+        state = load_state(now)
+        _reset_failure_streak(state)
+        save_state(state)
+        flag.unlink(missing_ok=True)
+    finally:
+        _release_lock(lock)
+    lines = "\n".join(f"  - {r.get('race_date')} {r.get('race')} ({r.get('verdict')}): {st}"
+                      for r, st in results)
+    msg = ("連続失敗の対象 R の成立有無が注文履歴で確定したため、自動発注の停止を解除しました。\n\n"
+           + lines + "\n\n「成立」の R は実際に購入されています (二重購入がないか確認してください)。")
+    _notify_important("[AUTO-BUY] ✅ 連続失敗の停止を解除 (注文履歴で確認済み)", msg)
+    return msg
 
 
 # ── 発注結果の 3 区分 (2026-11-12 監査 指摘1・2) ─────────────────────────
@@ -837,6 +1068,73 @@ def _alert_abandoned_pending_once(now: dt.datetime | None,
         "(この通知は 1 日 1 回です。フラグの詳細はフラグファイル内に記載)")
 
 
+def _same_race(e: dict, race_label: str, race_date: str | None) -> bool:
+    """記録 e が同じ R か (2026-11-12 監査 指摘10: キーに開催日を含める)。
+
+    ラベル (場_R番号) が一致し、かつ開催日も一致するか、記録側に開催日が無い
+    (2026-11-12 より前の記録) 場合は一致とみなす (従来どおり = 安全側)。
+    """
+    if str(e.get("race", "")) != race_label:
+        return False
+    rd = e.get("race_date")
+    return rd is None or race_date is None or str(rd) == str(race_date)
+
+
+# 二重発火の後続 run が「先行が同じ R を処理中」と判断するための印 (state["inflight"])。
+# 発注直前に state に書き、結果を記録したら消す。異常終了で残った古い印は無視する。
+INFLIGHT_STALE_SEC = 600
+# click 前の失敗 (failed) の再試行回数の上限 (同一 R・1 日あたり)
+FAILED_RETRY_LIMIT = 1
+
+
+def _read_inflight(now: dt.datetime | None = None) -> list[dict]:
+    """state の処理中の印を読む (ロック無しの読み取り専用)。古いものは除く。"""
+    try:
+        st = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        items = st.get("inflight") or []
+        if isinstance(items, dict):
+            items = [items]
+        cur = now or now_jst()
+        out = []
+        for it in items:
+            try:
+                started = dt.datetime.fromisoformat(str(it.get("started_at")))
+                if started.tzinfo is None:
+                    started = started.replace(tzinfo=JST)
+                if (cur - started).total_seconds() <= INFLIGHT_STALE_SEC:
+                    out.append(it)
+            except (TypeError, ValueError):
+                continue
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _failure_stop_verdicts(candidates: list[dict],
+                           now: dt.datetime | None) -> list[dict]:
+    """sticky 停止中: 全候補を発注せず skip_failure_stop (通知は日次 1 回)。"""
+    verdicts = [
+        {"race": f"{c.get('venue','?')}_R{c.get('race_no')}",
+         "verdict": VERDICT_FAILURE_STOP, "amount": int(c.get("amount", 0)),
+         "timestamp": (now or now_jst()).isoformat()}
+        for c in candidates if c.get("bets")]
+    logger.warning("[auto_buy] 連続失敗の停止フラグ (%s) あり — %d 候補を発注しない",
+                   _failure_stop_flag(), len(verdicts))
+    try:
+        st = load_state(now)
+        if not st.get("failure_stop_alerted"):
+            st["failure_stop_alerted"] = True
+            save_state(st)
+            _notify_important(
+                "[AUTO-BUY] 🛑 連続失敗の停止中 — 自動発注を見送り (要確認)",
+                f"連続失敗の停止フラグ (data/{FAILURE_STOP_FLAG_NAME}) が残っているため、"
+                f"本日 {len(verdicts)} 候補を発注しませんでした (この通知は 1 日 1 回)。\n\n"
+                + _failure_stop_release_text())
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[auto_buy] 停止中通知の判定失敗: %s", e)
+    return verdicts
+
+
 def run_auto_buy(candidates: list[dict],
                  now: dt.datetime | None = None,
                  dry_run: bool | None = None) -> list[dict]:
@@ -848,6 +1146,7 @@ def run_auto_buy(candidates: list[dict],
     """
     if not AUTO_BUY_ENABLED:
         return []
+    resend_pending_notifications()   # 前回送れなかった重要通知の再送 (例外は内部で吸収)
     if not any(c.get("bets") for c in candidates):
         return []
     # 設定ずれの警告 (ログのみ、発注判定には影響しない。2026-11-12 監査 指摘8)
@@ -874,14 +1173,27 @@ def run_auto_buy(candidates: list[dict],
                        ABANDONED_STOP_FLAG, len(verdicts))
         _alert_abandoned_pending_once(now, len(verdicts))
         return verdicts
+    # ── 連続失敗による sticky 停止 (2026-11-12 監査 指摘9) ──
+    if failure_stop_active():
+        return _failure_stop_verdicts(candidates, now)
     lock = _acquire_lock()
     if lock is None:
         logger.warning("[auto_buy] lock 取得不能 (先行プロセス実行中?) — "
                        "cap 二重通過防止のため今回の発注をスキップ")
-        return [{"race": f"{c.get('venue','?')}_R{c.get('race_no')}",
-                 "verdict": "skip_lock", "amount": int(c.get("amount", 0)),
-                 "timestamp": (now or now_jst()).isoformat()}
-                for c in candidates if c.get("bets")]
+        # 先行 run が同じ R を処理中なら skip_lock_inflight (二重発火。手動購入ボタン付きの
+        # 候補メールを出さない。2026-11-12)。それ以外は従来どおり skip_lock。
+        inflight = _read_inflight(now)
+        out = []
+        for c in candidates:
+            if not c.get("bets"):
+                continue
+            label = f"{c.get('venue','?')}_R{c.get('race_no')}"
+            same = any(_same_race(x, label, c.get("race_date")) for x in inflight)
+            out.append({"race": label,
+                        "verdict": "skip_lock_inflight" if same else "skip_lock",
+                        "amount": int(c.get("amount", 0)),
+                        "timestamp": (now or now_jst()).isoformat()})
+        return out
     try:
         if lock[2]:
             # WAIT_ABANDONED: 先行プロセス異常終了・結果不明 (2026-07-12 Codex③
@@ -1012,6 +1324,9 @@ def run_auto_buy(candidates: list[dict],
                            "フラグ作成) を捕捉", ABANDONED_STOP_FLAG, len(verdicts))
             _alert_abandoned_pending_once(now, len(verdicts))
             return verdicts
+        # 連続失敗の sticky 停止もロック取得後に再検査 (待機中に先行 run が発動させた場合)
+        if failure_stop_active():
+            return _failure_stop_verdicts(candidates, now)
         return _run_auto_buy_locked(candidates, now, dry_run)
     finally:
         _release_lock(lock)
@@ -1024,6 +1339,19 @@ def _run_auto_buy_locked(candidates: list[dict],
     dry = AUTO_BUY_DRY_RUN if dry_run is None else dry_run
     state = load_state(now)
     state["profit_yen"] = today_profit_from_history(state["date"])
+    # 人による sticky 停止の解除を検知 (フラグが消えているのに発動済みの印が残る)。
+    # 連続失敗のカウントを 0 に戻し、通常どおり発注を再開する (2026-11-12 監査 指摘9)。
+    if state.get("failure_stop_tripped") and not failure_stop_active():
+        logger.warning("[auto_buy] 連続失敗の停止フラグが削除されている — 人による解除と"
+                       "みなし連続失敗カウントを 0 に戻す")
+        _reset_failure_streak(state)
+        save_state(state)
+
+    def _rec(c: dict, **kw) -> dict:
+        # 開催日・場・R を記録に残す (冪等キー・台帳・照合用、2026-11-12)
+        return {"race": f"{c.get('venue','?')}_R{c['race_no']}",
+                "race_date": c.get("race_date"), "place_code": c.get("place_code"),
+                "race_no": c.get("race_no"), **kw}
 
     results = []
     for c in candidates:
@@ -1032,18 +1360,33 @@ def _run_auto_buy_locked(candidates: list[dict],
         amount = int(c["amount"])
         ev = float(c.get("ev", 0.0))
         race_label = f"{c.get('venue','?')}_R{c['race_no']}"
+        race_date = c.get("race_date")
+        same = [e for e in state.get("executions", [])
+                if _same_race(e, race_label, race_date)]
         # レース単位の冪等ガード (2026-09-04 監査 P2、boat auto_buy.process_one と同型):
         # 当日 state に同一 race の executed/dry_run/uncertain (結果不明 = 成立の
         # 可能性あり、2026-11-12) 記録があれば二重発注しない。
         # per-race one-shot の二重発火 / 手動再走で同じ R を再評価した場合の防御。
-        # (state は暦日で reset されるため、日跨ぎレースは翌暦日の state で判定される)
-        if any(str(e.get("race", "")) == race_label
-               and e.get("verdict") in ("executed", "dry_run", VERDICT_UNCERTAIN)
-               for e in state.get("executions", [])):
+        # キーは 場_R番号 + 開催日 (2026-11-12 監査 指摘10。開催日の無い旧記録は
+        # ラベルだけで一致とみなす)。state は暦日で reset されるため、日跨ぎレースは
+        # 翌暦日の state で判定される。
+        if any(e.get("verdict") in ("executed", "dry_run", VERDICT_UNCERTAIN)
+               for e in same):
             reason = "skip_duplicate (当日この R は発注済み: 冪等ガード)"
             logger.info("[auto_buy] %s skip: %s", race_label, reason)
             results.append({"race": race_label, "amount": amount,
                             "verdict": "skip_duplicate",
+                            "timestamp": now.isoformat()})
+            continue
+        # click 前の失敗 (failed) の再試行は同一 R につき 1 日 1 回まで (二重発火・手動再走で
+        # 同じ失敗を繰り返さない。2026-11-12)
+        n_failed_same = sum(1 for e in same if e.get("verdict") == "failed")
+        if n_failed_same >= 1 + FAILED_RETRY_LIMIT:
+            reason = (f"skip_retry_limit (この R は既に {n_failed_same} 回失敗: "
+                      f"再試行は 1 日 {FAILED_RETRY_LIMIT} 回まで)")
+            logger.info("[auto_buy] %s skip: %s", race_label, reason)
+            results.append({"race": race_label, "amount": amount,
+                            "verdict": "skip_retry_limit",
                             "timestamp": now.isoformat()})
             continue
         ok, reason = check_guards(state, now, amount, ev)
@@ -1056,8 +1399,7 @@ def _run_auto_buy_locked(candidates: list[dict],
                       "三連系停止フラグ ON または判定不能)")
         if not ok:
             logger.info("[auto_buy] %s skip: %s", race_label, reason)
-            rec = {"race": race_label, "amount": amount,
-                   "verdict": reason, "timestamp": now.isoformat()}
+            rec = _rec(c, amount=amount, verdict=reason, timestamp=now.isoformat())
             state["executions"].append(rec)
             results.append(rec)
             _notify(f"[AUTO-BUY] {race_label} skip",
@@ -1073,9 +1415,8 @@ def _run_auto_buy_locked(candidates: list[dict],
             logger.info("[auto_buy][DRY-RUN] %s 投票相当: %s (¥%d)",
                         race_label, bets_desc, amount)
             state["spent_yen"] += amount  # cap ロジック検証のため simulate
-            rec = {"race": race_label, "amount": amount,
-                   "verdict": "dry_run", "bets": bets_desc,
-                   "timestamp": now.isoformat()}
+            rec = _rec(c, amount=amount, verdict="dry_run", bets=bets_desc,
+                       timestamp=now.isoformat())
             state["executions"].append(rec)
             results.append(rec)
             _notify(
@@ -1091,6 +1432,13 @@ def _run_auto_buy_locked(candidates: list[dict],
         # 実投票
         logger.info("[auto_buy][LIVE] %s 投票: %s (¥%d)",
                     race_label, bets_desc, amount)
+        # 処理中の印 (二重発火の後続 run が skip_lock_inflight と判断する。2026-11-12)
+        state["inflight"] = [{"race": race_label, "race_date": race_date,
+                              "started_at": now_jst().isoformat()}]
+        try:
+            save_state(state)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[auto_buy] 処理中の印の保存失敗 (継続): %s", e)
         # 戻り値の個数・型に依存しない (正規化で 3 値に揃える)。発注呼び出し自体の
         # 例外も auto_buy の外へ漏らさず「結果不明」に倒す (2026-11-12 監査 指摘1)。
         try:
@@ -1100,31 +1448,36 @@ def _run_auto_buy_locked(candidates: list[dict],
         except Exception as e:  # noqa: BLE001
             status, detail, balance = (
                 EXEC_UNCERTAIN, f"発注呼び出しで例外: {e!r}"[:300], None)
+        state.pop("inflight", None)
         if status == EXEC_OK:
             state["spent_yen"] += amount
             state["consecutive_failures"] = 0
+            state["failure_streak"] = []
             verdict = "executed"
         elif status == EXEC_UNCERTAIN:
             # 結果不明 (2026-11-12 監査 指摘1・2): 買えた前提で安全側に倒す。
             #   - 予定額を当日上限に計上 / 冪等ガード対象 (同じ R を再発注しない)
-            #   - 連続失敗に 1 加算 (既存の 3 回停止に乗せる。新しい sticky 停止は無い)
+            #   - 連続失敗に 1 加算 (3 回で sticky 停止)
             #   - 手動購入ボタン付きの候補メールは出さない (daily_predict 側)
             state["spent_yen"] += amount
-            state["consecutive_failures"] += 1
+            state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
             verdict = VERDICT_UNCERTAIN
         else:
-            state["consecutive_failures"] += 1
+            state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
             verdict = "failed"
         # 残高低下警告 (ポイント+払戻金 合計 ≤ しきい値、1 日 1 回)
         _maybe_low_balance_alert(state, balance)
-        rec = {"race": race_label, "amount": amount, "verdict": verdict,
-               "bets": bets_desc, "detail": detail[-200:],
-               "timestamp": now.isoformat()}
+        rec = _rec(c, amount=amount, verdict=verdict, bets=bets_desc,
+                   detail=detail[-200:], timestamp=now.isoformat())
         state["executions"].append(rec)
         results.append(rec)
+        if verdict != "executed":
+            state.setdefault("failure_streak", []).append(
+                {k: rec.get(k) for k in ("race", "race_date", "place_code", "race_no",
+                                         "verdict", "detail", "timestamp")})
         if verdict == VERDICT_UNCERTAIN:
             logger.warning("[auto_buy] %s 結果不明: %s", race_label, detail)
-            _notify(
+            _notify_important(
                 f"[AUTO-BUY] ⚠️ {venue_jp} R{c['race_no']} 計¥{amount} "
                 f"結果不明 (投票履歴を確認)",
                 f"【自動発注 結果不明 — 投票履歴を確認してください】\n"
@@ -1138,20 +1491,24 @@ def _run_auto_buy_locked(candidates: list[dict],
                 f"本日は再発注しません・連続失敗に 1 加算)\n"
                 f"当日 自動発注額: ¥{state['spent_yen']} / "
                 f"連続失敗 {state['consecutive_failures']}")
-            save_state(state)
-            continue
-        success = verdict == "executed"
-        _notify(
-            f"[AUTO-BUY] {venue_jp} R{c['race_no']} 計¥{amount} "
-            f"{'投票完了' if success else '失敗'}",
-            f"【自動発注 {'投票完了' if success else '失敗'}】\n"
-            f"{race_jp}\n\n"
-            f"買い目:\n  {bets_desc}\n\n"
-            f"合計: ¥{amount}\n"
-            f"結果: {verdict}\n"
-            f"当日 自動発注額: ¥{state['spent_yen']} / "
-            f"連続失敗 {state['consecutive_failures']}\n\n"
-            f"詳細: {detail[-300:]}")
+        else:
+            success = verdict == "executed"
+            (_notify if success else _notify_important)(
+                f"[AUTO-BUY] {venue_jp} R{c['race_no']} 計¥{amount} "
+                f"{'投票完了' if success else '失敗'}",
+                f"【自動発注 {'投票完了' if success else '失敗'}】\n"
+                f"{race_jp}\n\n"
+                f"買い目:\n  {bets_desc}\n\n"
+                f"合計: ¥{amount}\n"
+                f"結果: {verdict}\n"
+                f"当日 自動発注額: ¥{state['spent_yen']} / "
+                f"連続失敗 {state['consecutive_failures']}\n\n"
+                f"詳細: {detail[-300:]}")
+        # 連続失敗が閾値に達したら sticky 停止 (日付をまたいで継続、2026-11-12 監査 指摘9)
+        if (verdict != "executed"
+                and state.get("consecutive_failures", 0) >= CONSECUTIVE_FAILURES_STOP
+                and not failure_stop_active()):
+            _write_failure_stop_flag(state, now)
         save_state(state)
 
     save_state(state)

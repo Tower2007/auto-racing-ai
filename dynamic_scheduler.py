@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from src.client import AutoraceClient, VENUE_CODES
-from daily_predict import fetch_today_schedule
+from daily_predict import fetch_today_schedule, fetch_today_schedule_ex  # noqa: F401
 
 DATA = ROOT / "data"
 LOG_FILE = DATA / "dynamic_scheduler.log"
@@ -452,6 +452,20 @@ def register_race(task_name: str, fire_at: dt.datetime,
     return "failed", task_name, f"{err} / 別名 {alt}: {err2}"
 
 
+def notify_problem(today: dt.date, what: str, body: str) -> None:
+    """登録処理そのものが進められない時の要確認メール (送信失敗はログのみ)。"""
+    try:
+        from gmail_notify import send_email
+        send_email(
+            subject=f"[autorace] ⚠️ 動的タスク登録 失敗: {what} {today.isoformat()} (要確認)",
+            body=(body + "\n\nこのままでは本日の予測・自動発注が行われません。\n"
+                  "ログ: data/dynamic_scheduler.log\n"
+                  "対処: 原因を確認し、AutoraceDynamicScheduler を手動実行してください "
+                  "(ログオン時タスクも、登録記録が無ければ 07:00 以降に再試行します)。"))
+    except Exception as e:  # noqa: BLE001
+        logging.error("要確認メール送信失敗: %s", e)
+
+
 def notify_failures(today: dt.date, failed: list[str]) -> None:
     """登録できなかった R の要確認メール (送信失敗はログのみ)。"""
     try:
@@ -488,15 +502,26 @@ def main() -> int:
         client = AutoraceClient()
     except Exception as e:
         logging.error("AutoraceClient 初期化失敗: %s", e)
+        # 2026-11-12: 無通知の exit 1 だと、その日の予測・自動発注が丸ごと止まっても
+        # 誰も気づかない。要確認メールを出す (マーカーは書かない = 次回ログオン時に再試行)
+        notify_problem(today, "API クライアント初期化失敗",
+                       f"AutoraceClient の初期化に失敗したため、本日の発火タスクを"
+                       f"1 件も登録できていません。\n\nエラー: {e}")
         return 1
 
-    schedule = fetch_today_schedule(client)
+    schedule, sched_err = fetch_today_schedule_ex(client)
+    if sched_err:
+        # 取得失敗 (開催なしとは区別する、2026-11-12)。マーカーは書かず非 0 + 要確認メール
+        logging.error("Hold/Today 取得失敗 — 登録できない: %s", sched_err)
+        notify_problem(today, "開催一覧の取得失敗",
+                       f"Hold/Today (開催一覧) の取得に失敗したため、本日の発火タスクを"
+                       f"登録できていません。\n\nエラー: {sched_err}")
+        return 1
     if not schedule:
-        logging.info("Hold/Today 開催なし — 何も登録しない")
+        logging.info("Hold/Today 開催なし (取得成功・本日の開催 0 件) — 何も登録しない")
         logging.info("=== dynamic_scheduler done: registered=0 ===")
-        # マーカーは書かない: fetch_today_schedule は取得失敗でも {} を返すため、
-        # 「開催なし」と通信エラーを区別できない。書くとその日の再実行・救済が
-        # すべて「登録済み」で止まる。開催なしの日に再実行されても害は無い。
+        # 取得に成功して開催 0 件 = 開催なしが確定 → マーカーを書く (同日の再実行は何もしない)
+        write_marker(today, now, [])
         return 0
 
     registered = 0
