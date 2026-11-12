@@ -648,10 +648,119 @@ def render_3point_html(tp: dict) -> str:
         + "".join(rows) + '</ul>' + trig)
 
 
+# schtasks の Last Result のうち「異常終了ではない」コード
+SCHED_S_TASK_RUNNING = 267009      # 0x41301 現在実行中
+SCHED_S_TASK_HAS_NOT_RUN = 267011  # 0x41303 まだ一度も実行されていない
+# 本レポートを起動するタスク。レポート生成中は必ず「実行中」に見えるため、
+# これを NG に数えると全て正常でも毎週 🟡WARN になる (2026-08-10〜11-09 に実発生)。
+SELF_TASK_NAME = "AutoraceWeeklyStatus"
+# 自タスクの「実行中」を正常とみなす上限。これより前に起動したまま実行中なら
+# 今回のレポートではなく前回起動の固着なので NG として残す。
+SELF_RUNNING_MAX_AGE_HOURS = 6
+
+
+def _parse_schtasks_time(value) -> dt.datetime | None:
+    """schtasks の Last Run 列 (ロケール依存) を datetime に。読めなければ None。"""
+    s = str(value or "").strip()
+    for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S",
+                "%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %H:%M:%S"):
+        try:
+            return dt.datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+# 監視対象 = 現行の定期タスク (完全一致、2026-11-12 監査 指摘7)。削除済みの
+# Morning/Noon/EveningPredict は見ない。AutoraceDyn_* の個別 one-shot と UI 常駐
+# (StreamlitApp / BuyApp) は対象外。
+SCHTASKS_MONITORED = (
+    "AutoraceDailyIngest",
+    "AutoraceDynamicScheduler",
+    "AutoraceDynSchedulerOnLogon",
+    "AutoraceFetchOrderHistory",
+    "AutoraceDailyOrderHistory",     # 旧名互換
+    "AutoraceNightReport",
+    "AutoraceOddsPrerace",
+    "AutoraceOddsTsCollector",
+    "AutoraceOddsTsCollectorOnLogon",
+    "AutoraceWeeklyRetrain",
+    "AutoraceWeeklyStatus",
+    "AutoraceMonthlyReport",
+)
+# 常駐タスク: タスク自体が日中ずっと「実行中」なのが平常のもの。実行中を正常扱いする。
+#   AutoraceOddsPrerace: pythonw odds_prerace_daemon.py を直接実行 (ExecutionTimeLimit
+#   PT20H、最終レース後に自然終了)。2026-11-12 22:30 時点で State=Running。
+# OddsTsCollector / OnLogon は vbs が `sh.Run cmd, 0, False` で即 return するため
+# タスクは実行中にならない (コレクタ本体は別プロセス) → 常駐扱いにしない。
+RESIDENT_TASKS = ("AutoraceOddsPrerace",)
+# タスク別に正常とみなす追加コード。OddsPrerace は 07:05 とログオン時の 2 トリガーで、
+# 稼働中への多重起動は 0x800710E0 (要求拒否 = IgnoreNew) になる (正常)。
+TASK_RC_OK_EXTRA = {"AutoraceOddsPrerace": {0x800710E0}}
+
+# 異常に数える分類 (ng = 異常終了・他タスクの実行中・固着、missed = 取りこぼし)
+SCHTASKS_NG_STATES = ("ng", "missed")
+
+
+def classify_task_result(name: str, rc: int, last_run="",
+                         now: dt.datetime | None = None, missed: int = 0) -> str:
+    """schtasks の 1 タスクを分類する。
+
+    "ok" / "not_run" / "self_running" / "resident_running" / "ng" / "missed"。
+    実行中 (267009) を正常扱いするのは本レポート自身のタスク (6 時間以内) と
+    常駐タスク (RESIDENT_TASKS) だけ。他タスクの実行中は「朝バッチがこの時刻まで
+    終わっていない」兆候なので NG のまま数える。結果コードが正常でも取りこぼし
+    (NumberOfMissedRuns > 0) があれば "missed" (NG)。
+    """
+    name = str(name).strip().lstrip("\\")
+    # schtasks は 0x800710E0 を負の 10 進 (-2147020576) で出すことがあるため 32bit に正規化
+    rc_u = rc & 0xFFFFFFFF if isinstance(rc, int) else rc
+    if rc_u == 0 or rc_u in TASK_RC_OK_EXTRA.get(name, ()):
+        state = "ok"
+    elif rc_u == SCHED_S_TASK_HAS_NOT_RUN:
+        state = "not_run"
+    elif rc_u == SCHED_S_TASK_RUNNING and name in RESIDENT_TASKS:
+        state = "resident_running"
+    elif rc_u == SCHED_S_TASK_RUNNING and name.startswith(SELF_TASK_NAME):
+        started = _parse_schtasks_time(last_run)
+        if started is None:
+            state = "self_running"   # 時刻が読めないロケールでは誤 WARN を出さない側に倒す
+        else:
+            age_h = ((now or dt.datetime.now()) - started).total_seconds() / 3600
+            state = "self_running" if age_h <= SELF_RUNNING_MAX_AGE_HOURS else "ng"
+    else:
+        state = "ng"
+    if state != "ng" and int(missed or 0) > 0:
+        state = "missed"
+    return state
+
+
+_TASK_STATE_VIEW = {
+    "ok": ("✅", "#2e7d32", ""),
+    "not_run": ("⏳", "#888", ""),
+    "self_running": ("⏳", "#888", " (実行中 = 本レポート自身)"),
+    "resident_running": ("▶️", "#2e7d32", " (常駐中)"),
+    "missed": ("🔴", "#c62828", ""),
+    "ng": ("🔴", "#c62828", ""),
+}
+
+
+def _task_view(t: dict) -> tuple[str, str, str]:
+    """schtasks 1 行の (マーク, 色, 注記)。text / HTML で同じ分類を使う。"""
+    state = t.get("state") or classify_task_result(
+        t.get("name", ""), t.get("result", -1), t.get("last_run", ""),
+        missed=t.get("missed", 0))
+    mark, color, note = _TASK_STATE_VIEW[state]
+    if t.get("missed"):
+        note += f" 取りこぼし {t['missed']} 回"
+    return mark, color, note
+
+
 def check_schtasks_health() -> dict:
     """schtasks LastRunResult 監視(Codex R6 + R7 提案)。
 
-    Autorace* タスクの最終実行結果を取得し、0 以外を異常として返す。
+    Autorace* タスクの最終実行結果を取得し、異常終了 (classify_task_result が
+    "ng" を返すもの) を数える。
     R7: 列名ローカライズ対策として CSV 全体を data/schtasks_snapshot.csv に
     保存し、後から人手で確認できるようにする。
     """
@@ -722,42 +831,14 @@ def check_schtasks_health() -> dict:
     return out
 
 
-# ── schtasks 健全性の判定 (2026-11-12 監査 指摘7) ─────────────────────────────
-# 旧実装は「実行中の自分自身 (AutoraceWeeklyStatus, LastResult 0x41301)」を NG に
-# 数え、9/7 以降の週次が毎週「schtasks NG 1 件」の WARN になっていた。また削除済みの
-# Morning/Noon/EveningPredict を監視し、NightReport 等の現行タスクと取りこぼし
-# (NumberOfMissedRuns) を見ていなかった。
-# 監視対象は現行の定期タスク (完全一致)。AutoraceDyn_* の個別 one-shot と、
-# UI 常駐 (StreamlitApp / BuyApp) は対象外。
-SCHTASKS_MONITORED = (
-    "AutoraceDailyIngest",
-    "AutoraceDynamicScheduler",
-    "AutoraceDynSchedulerOnLogon",
-    "AutoraceFetchOrderHistory",
-    "AutoraceDailyOrderHistory",     # 旧名互換
-    "AutoraceNightReport",
-    "AutoraceOddsPrerace",
-    "AutoraceOddsTsCollector",
-    "AutoraceOddsTsCollectorOnLogon",
-    "AutoraceWeeklyRetrain",
-    "AutoraceWeeklyStatus",
-    "AutoraceMonthlyReport",
-)
-SCHTASKS_RC_RUNNING = 0x41301        # 267009: 実行中
-SCHTASKS_RC_NOT_YET_RUN = 0x41303    # 267011: まだ実行されていない
-SCHTASKS_RC_OK = {0, SCHTASKS_RC_RUNNING, SCHTASKS_RC_NOT_YET_RUN}
-# タスク別に正常とみなす追加コード。OddsPrerace は 07:05 と ログオン時の 2 トリガーで、
-# 稼働中への多重起動は 0x800710E0 (要求拒否 = IgnoreNew) になる (正常)。
-SCHTASKS_RC_OK_EXTRA = {"AutoraceOddsPrerace": {0x800710E0}}
-
-
 def evaluate_schtasks_rows(rows: list[tuple[str, int, str]],
-                           missed: dict[str, int]) -> dict:
+                           missed: dict[str, int],
+                           now: dt.datetime | None = None) -> dict:
     """(タスク名, LastResult, 前回実行) の行と取りこぼし回数から健全性を判定する。
 
-    監視対象外 (削除済み・AutoraceDyn_*・UI 常駐) は見ない。同名の重複行
-    (トリガー数ぶん出る) は最初の 1 行だけ使う。NG = 結果コード異常 または
-    取りこぼし > 0 (タスク単位で 1 件)。
+    監視対象 (SCHTASKS_MONITORED) 以外は見ない。同名の重複行 (トリガー数ぶん出る)
+    は最初の 1 行だけ使う。分類は classify_task_result、NG は SCHTASKS_NG_STATES
+    (タスク単位で 1 件。結果コード異常と取りこぼしが重なっても 1 件)。
     """
     out = {"tasks": [], "ng_count": 0}
     seen: set[str] = set()
@@ -766,17 +847,11 @@ def evaluate_schtasks_rows(rows: list[tuple[str, int, str]],
         if name not in SCHTASKS_MONITORED or name in seen:
             continue
         seen.add(name)
-        # schtasks は 0x800710E0 を負の 10 進 (-2147020576) で出すことがあるため 32bit に正規化
-        rc_u = rc & 0xFFFFFFFF if isinstance(rc, int) else rc
-        ok_codes = SCHTASKS_RC_OK | SCHTASKS_RC_OK_EXTRA.get(name, set())
-        rc_ok = rc_u in ok_codes
         n_missed = int(missed.get(name, 0) or 0)
-        ok = rc_ok and n_missed == 0
+        state = classify_task_result(name, rc, last_run, now=now, missed=n_missed)
         out["tasks"].append({"name": name, "result": rc, "last_run": last_run,
-                             "missed": n_missed, "ok": ok,
-                             "running": rc_u == SCHTASKS_RC_RUNNING,
-                             "not_yet_run": rc_u == SCHTASKS_RC_NOT_YET_RUN})
-        if not ok:
+                             "state": state, "missed": n_missed})
+        if state in SCHTASKS_NG_STATES:
             out["ng_count"] += 1
     return out
 
@@ -805,16 +880,6 @@ def query_missed_runs() -> dict[str, int] | None:
         if name and n.strip().lstrip("-").isdigit():
             out[name] = int(n.strip())
     return out
-
-
-def _schtasks_mark(t: dict) -> str:
-    if not t.get("ok", t.get("result") == 0):
-        return "🔴"
-    if t.get("running"):
-        return "▶️"
-    if t.get("not_yet_run") or t.get("result") == SCHTASKS_RC_NOT_YET_RUN:
-        return "⏳"
-    return "✅"
 
 
 def check_ngrok_health(days: int = 7) -> dict:
@@ -1144,10 +1209,15 @@ STATUS_COLOR = {"OK": "#2e7d32", "WARN": "#e65100", "NG": "#c62828"}
 
 OVERALL_CRITERIA = [
     "🔴 NG: daily_ingest ログにエラー行がある、または死活監視 "
-    "(bet_history / schtasks / EHI / ngrok / モデル鮮度) のいずれかが NG",
+    "(bet_history / EHI / ngrok / モデル鮮度) のいずれかが NG",
     f"🟡 WARN: 収集 NO_DATA 日が {INGEST_WARN_NODATA_DAYS} 日以上、"
+    "schtasks に異常終了タスクまたは取りこぼし (予定実行の未発火) がある、"
     "または死活監視のいずれかが WARN (死活監視が例外で判定不能な場合も WARN)",
     "🟢 OK: 上記いずれにも該当しない",
+    f"※ schtasks の rc={SCHED_S_TASK_RUNNING} (実行中) は本レポート自身 "
+    f"({SELF_TASK_NAME}) に限り正常扱い。{SELF_RUNNING_MAX_AGE_HOURS} 時間を超えて"
+    "実行中のままなら固着として異常に数える。常駐タスク "
+    f"({', '.join(RESIDENT_TASKS)}) の実行中は平常 (正常扱い)",
     "※ 当日は結果が未確定のため集計対象外 (直近 N 日は前日起点で数える)。"
     "「OK n/m日」の分母 m も確定した日だけを数える",
     "※ 🛑RT3 タグは総合状態とは独立の購入停止フラグ (件名・本文の両方に出す)",
@@ -1273,10 +1343,9 @@ def render_health_text(bh: dict, st: dict, ehi: dict | None = None,
         lines.append("")
         lines.append(f"  schtasks Autorace* {len(st['tasks'])} 件 / NG {st['ng_count']} 件")
         for t in st["tasks"]:
-            mark = _schtasks_mark(t)
-            miss = f" 取りこぼし {t['missed']} 回" if t.get("missed") else ""
+            mark, _, note = _task_view(t)
             lines.append(f"    {mark} {t['name']:34s} rc={t['result']:>6} "
-                         f"last_run={t['last_run']}{miss}")
+                         f"last_run={t['last_run']}{note}")
         if st.get("snapshot_path"):
             lines.append(f"  (raw snapshot: {st['snapshot_path']})")
     for w in st.get("warnings", []):
@@ -1415,13 +1484,10 @@ def render_health_html(bh: dict, st: dict, ehi: dict | None = None,
         for i, t in enumerate(st["tasks"]):
             alt = ' style="background:#fafafa;"' if i % 2 == 1 else ""
             rc = t["result"]
-            mark = _schtasks_mark(t)
-            color = "#c62828" if mark == "🔴" else ("#888" if mark == "⏳" else "#2e7d32")
-            miss = (f'<br><span style="color:#c62828">取りこぼし {t["missed"]} 回</span>'
-                    if t.get("missed") else "")
+            mark, color, note = _task_view(t)
             parts.append(
                 f"<tr{alt}>"
-                f'<td style={TD}>{mark} {t["name"]}{miss}</td>'
+                f'<td style={TD}>{mark} {t["name"]}{note}</td>'
                 f'<td style={TD_R}><span style="color:{color}">{rc}</span></td>'
                 f'<td style={TD_R}>{t["last_run"]}</td>'
                 f"</tr>"

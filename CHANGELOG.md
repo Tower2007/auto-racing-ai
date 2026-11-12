@@ -17,15 +17,17 @@
   (PC 未ログオンの可能性) を出す。発火予定 + 3 分が未到来の R (0 時以降のミッドナイト等) は数えない。
   実ログで 10/30 浜松 R1〜R9 の 9 件を検出することを確認。発火の仕組み (Interactive 登録) は変えていない。
 - **指摘7 週次の常時 WARN**: `weekly_status.check_schtasks_health` を `evaluate_schtasks_rows` に分離。
-  実行中 (0x41301) を正常扱い、監視対象を現行の定期タスク (完全一致) に更新 (削除済み Morning/Noon/
+  a6d15ad (自タスクの実行中のみ正常・6 時間超は固着) を土台に統合 (マージ時、下記)。
+  監視対象を現行の定期タスク (完全一致) に更新 (削除済み Morning/Noon/
   EveningPredict を外し NightReport・OddsPrerace・OddsTsCollector・MonthlyReport・DynSchedulerOnLogon を追加)、
-  OddsPrerace の 0x800710E0 (稼働中への多重起動拒否) を正常扱い、NumberOfMissedRuns > 0 を
+  常駐タスク (`RESIDENT_TASKS` = AutoraceOddsPrerace) の実行中と、OddsPrerace の 0x800710E0
+  (稼働中への多重起動拒否) を正常扱い、NumberOfMissedRuns > 0 を
   「取りこぼし n 回」として NG に数える (PowerShell の Get-ScheduledTaskInfo を読み取りで実行)。
 - **指摘8 当日損失停止**: 当日中は発動しないことを CLAUDE.md とコードのコメントに明記。判定は不変。
   当日上限が損失停止の閾値 (絶対値) を超える設定なら `run_auto_buy` 起動時に警告ログ
   (`auto_buy.config_warnings`、メールなし)。既定 (¥3,000 / −¥3,000) では出ない。
 - テスト追加: `test_dynamic_scheduler_rescue.py` (10)、`test_night_unfired.py` (5)、
-  `test_weekly_schtasks_health.py` (7)、`test_auto_buy_config_warnings.py` (3)。
+  `test_weekly_schtasks_health.py` (11、a6d15ad 統合後の仕様)、`test_auto_buy_config_warnings.py` (3)。
 
 ## 2026-11-12 — 自動発注に「結果不明 (uncertain)」判定を追加 (統合監視 総合検証 指摘1・2)
 
@@ -52,6 +54,21 @@
   は再開基準日 (2026-11-03) 導入後に固定データ (7/1) が全除外されて落ちていたため、テスト側で
   since を切り、境界テスト `test_check_3point_health_killswitch_since_boundary` を追加 (判定ロジックは不変)。
 - 未対応 (別途): buy_app の手動実行は exit 4 も従来どおり「投票失敗」と表示する。
+
+## 2026-11-12 — 週次メールの自己 WARN を解消 (毎週月曜の誤 🟡)
+
+週次レポートを生成している最中は `AutoraceWeeklyStatus` 自身が必ず rc=267009 (実行中) に
+見える。これを schtasks の NG に数えていたため、全項目が正常でも 2026-08-10〜11-09 の
+毎週月曜に件名が `🟡WARN (… health: schtasks NG 1 件)` になっていた (統合監視側の指摘)。
+本物の警告と区別がつかず、🟡 の信頼度を下げていた。
+
+- `classify_task_result` を新設し、**自タスクの実行中だけ**を正常扱いに
+  (表示は `⏳ … (実行中 = 本レポート自身)`)。他タスクの実行中は「朝バッチが終わっていない」
+  兆候なので従来どおり異常に数える。自タスクでも 6 時間を超えて実行中のままなら
+  前回起動の固着として異常に残す。
+- 判定基準ブロックの文言を実装に合わせた: schtasks の異常終了は 🟡WARN の条件
+  (従来は 🔴NG の列挙に入っていたが、実装は当初から WARN)。自タスク除外の規則も明記。
+- テスト: `tests/test_weekly_status_self_task.py` (10 件)。
 
 ## 2026-11-11 — メール ROI 整合監査の是正 (仮想/実弾の表記・夜次の返還/日跨ぎ・取込窓)
 
