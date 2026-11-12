@@ -1406,7 +1406,45 @@ def render_health_text(bh: dict, st: dict, ehi: dict | None = None,
             prefix = {"NG": "🔴 NG", "WARN": "🟡 WARN", "INFO": "ℹ️  INFO"}.get(level, level)
             lines.append(f"    {prefix}: {msg}")
 
+    acc = model_accuracy_lines()
+    if acc:
+        lines.append("")
+        lines.append("  🎯 予測精度の計器 (記録のみ・購入判断に不使用)")
+        for a in acc:
+            lines.append(f"    {a}")
+
     return "\n".join(lines)
+
+
+# walk-forward 評価値の注記 (2026-11-12 精度検証)。学習の odds 特徴は確定オッズ、本番は発火時
+# オッズのため、walk-forward の logloss は前向き (発火時) より 0.013〜0.02 楽観的に出る。
+WF_OPTIMISM_NOTE = ("注: walk-forward / 学習時の検証値は確定オッズで計算しており、発火時オッズの"
+                    "前向き実績より logloss で 0.013〜0.02 楽観的 (2026-05〜10 の月別比較)。")
+
+
+def model_accuracy_lines() -> list[str]:
+    """モデル精度の計器 (text/HTML 共通)。失敗しても空リストで本体を止めない。"""
+    out: list[str] = []
+    try:
+        from ml import shadow_trial
+        out.extend(shadow_trial.weekly_lines())
+    except Exception as e:  # noqa: BLE001
+        out.append(f"試走ありシャドー: 取得失敗 ({type(e).__name__})")
+    try:
+        h = pd.read_csv(DATA / "retrain_history.csv")
+        if len(h) and "gate_mode" in h.columns and pd.notna(h["gate_mode"].iloc[-1]):
+            r = h.iloc[-1]
+            if r["gate_mode"] == "v3_compare_window":
+                out.append(f"採用ゲート v3 (比較窓 {r['cmp_start']}〜, {int(r['cmp_n']):,} 行): "
+                           f"logloss 候補 {r['cand_ll_cmp']:.5f} / 現役 {r['champ_ll_cmp']:.5f}、"
+                           f"AUC 候補 {r['cand_auc_cmp']:.4f} / 現役 {r['champ_auc_cmp']:.4f} → {r['verdict']}"
+                           f" (ROI 拒否権は複勝 top1)")
+            else:
+                out.append(f"採用ゲート: v2 フォールバック (現役の学習外を保証できる比較窓なし) → {r['verdict']}")
+    except Exception:
+        pass
+    out.append(WF_OPTIMISM_NOTE)
+    return out
 
 
 def render_health_html(bh: dict, st: dict, ehi: dict | None = None,
@@ -1599,6 +1637,12 @@ def _append_model_freshness_html(parts: list[str], mf: dict | None) -> None:
                 color = {"NG": "#c62828", "WARN": "#e65100", "INFO": "#666"}.get(level, "#444")
                 parts.append(f'<li style="color:{color}"><b>{level}</b>: {msg}</li>')
             parts.append("</ul>")
+    acc = model_accuracy_lines()
+    if acc:
+        parts.append('<h4 style="margin:14px 0 4px 0; font-size:13px;">'
+                     '🎯 予測精度の計器 (記録のみ・購入判断に不使用)</h4>')
+        for a in acc:
+            parts.append(f'<p style="margin:2px 0; font-size:12px;">{_html_escape(a)}</p>')
 
 
 # 非開催マーク。plaintext / HTML で必ず同じ表記を使う (2026-08-03 修正 P5)。

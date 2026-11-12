@@ -45,6 +45,12 @@ STEPS = [
     ("ml.train_production", "本番モデル学習 + 品質ゲート", 1800),
 ]
 
+# 任意ステップ (2026-11-12): 本番の後に走らせるシャドー。失敗しても本番の再学習・採用には
+# 影響させない (ログだけ残し、終了コードも通知も変えない)。
+OPTIONAL_STEPS = [
+    ("ml.shadow_trial", "試走ありシャドーモデルの学習 (記録のみ・購入判断に不使用)", 1800),
+]
+
 
 def _log(msg: str) -> None:
     ts = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -68,6 +74,25 @@ def _notify_failure(step: str, detail: str) -> None:
         )
     except Exception as e:
         _log(f"[notify] Gmail 通知失敗: {e}")
+
+
+def run_optional_step(module: str, desc: str, timeout: int) -> bool:
+    """任意ステップ。失敗はログのみ (通知しない・呼び出し側の終了コードに影響させない)。"""
+    _log(f"[start] {module} — {desc} (任意)")
+    try:
+        r = subprocess.run(
+            [sys.executable, "-m", module], cwd=str(ROOT), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=timeout,
+        )
+    except Exception as e:  # noqa: BLE001
+        _log(f"[WARN] {module} 失敗 (本番には影響なし): {type(e).__name__}: {e}")
+        return False
+    if r.returncode != 0:
+        tail = (r.stdout or "")[-400:] + (r.stderr or "")[-400:]
+        _log(f"[WARN] {module} exit={r.returncode} (本番には影響なし)\n{tail}")
+        return False
+    _log(f"[ok] {module} done (任意)")
+    return True
 
 
 def run_step(module: str, desc: str, timeout: int, extra_args: list[str]) -> bool:
@@ -109,6 +134,9 @@ def main() -> int:
             _log(f"=== weekly_retrain ABORTED at {module} "
                  f"(本番モデルは未更新) ===")
             return 1
+
+    for module, desc, timeout in OPTIONAL_STEPS:
+        run_optional_step(module, desc, timeout)
 
     _log("=== weekly_retrain done (3 ステップ完走) ===")
     return 0

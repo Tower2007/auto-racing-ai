@@ -149,6 +149,141 @@ def train_full(X: pd.DataFrame, y: pd.Series, dates: pd.Series
     return model, metrics, X_va, y_va
 
 
+# 採用ゲート v3 (2026-11-12): 末尾 10% のうち前半 (q0.90〜q0.95) を early stopping、
+# 後半 (q0.95〜) を新旧比較用の窓にする。学習に使う行 (< q0.90) は従来と同じ。
+COMPARE_Q = 0.95
+
+
+def train_full_v3(X: pd.DataFrame, y: pd.Series, dates: pd.Series):
+    """train_full と同じ学習行・同じパラメータで、検証を「早期終了用」と「比較用」に分ける。
+
+    返り値: (model, metrics, X_es, y_es, X_cmp, y_cmp)。metrics の valid_* は早期終了用の値
+    (従来列の互換)、cmp_* は比較用の窓の値。比較用の窓は学習にも早期終了にも使わない。
+    """
+    q90 = dates.quantile(0.9)
+    q95 = dates.quantile(COMPARE_Q)
+    is_tr = (dates < q90).values
+    is_es = ((dates >= q90) & (dates < q95)).values
+    is_cmp = (dates >= q95).values
+    X_tr, y_tr = X[is_tr], y[is_tr]
+    X_es, y_es = X[is_es], y[is_es]
+    X_cmp, y_cmp = X[is_cmp], y[is_cmp]
+    logger.info("Train: %s, ES-val: %s, Compare: %s (from %s)",
+                f"{len(X_tr):,}", f"{len(X_es):,}", f"{len(X_cmp):,}", q95.date())
+    train_data = lgb.Dataset(X_tr, label=y_tr, categorical_feature="auto")
+    valid_data = lgb.Dataset(X_es, label=y_es, categorical_feature="auto", reference=train_data)
+    params = {
+        "objective": "binary",
+        "metric": ["binary_logloss", "auc"],
+        "learning_rate": 0.05,
+        "num_leaves": 63,
+        "feature_fraction": 0.85,
+        "bagging_fraction": 0.85,
+        "bagging_freq": 5,
+        "min_data_in_leaf": 50,
+        "verbosity": -1,
+        "seed": 42,
+    }
+    model = lgb.train(
+        params, train_data, num_boost_round=2000,
+        valid_sets=[train_data, valid_data], valid_names=["train", "valid"],
+        callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False),
+                   lgb.log_evaluation(period=200)],
+    )
+    bi = model.best_iteration
+    p_tr = model.predict(X_tr, num_iteration=bi)
+    p_es = model.predict(X_es, num_iteration=bi)
+    p_cmp = model.predict(X_cmp, num_iteration=bi)
+    metrics = {
+        "n_train": int(len(X_tr)), "n_val": int(len(X_es)), "n_cmp": int(len(X_cmp)),
+        "best_iteration": int(bi),
+        "train_auc": float(roc_auc_score(y_tr, p_tr)),
+        "valid_auc": float(roc_auc_score(y_es, p_es)),
+        "valid_logloss": float(log_loss(y_es, p_es)),
+        "cmp_start": q95.date().isoformat(),
+        "cmp_auc": float(roc_auc_score(y_cmp, p_cmp)),
+        "cmp_logloss": float(log_loss(y_cmp, np.clip(p_cmp, 1e-6, 1 - 1e-6))),
+        "train_date_max": dates[is_tr].max().date().isoformat(),
+    }
+    return model, metrics, X_es, y_es, X_cmp, y_cmp
+
+
+def champion_train_end(old_meta: dict | None, dates: pd.Series) -> str | None:
+    """現役モデルの学習終端 (これより後のデータは現役にとって学習外)。
+
+    v3 以降の meta は train_metrics.train_date_max を持つ。無い旧 meta は、現役の
+    data_date_range.max までのデータに同じ規則 (日付の 90% 分位未満が学習) を当てて再現する。
+    再現できなければ None (= 比較用の窓が学習外と保証できない → v3 比較をしない)。
+    """
+    if not old_meta:
+        return None
+    tdm = (old_meta.get("train_metrics") or {}).get("train_date_max")
+    if tdm:
+        return str(tdm)
+    mx = (old_meta.get("data_date_range") or {}).get("max")
+    if not mx:
+        return None
+    sub = dates[dates <= pd.Timestamp(mx)]
+    if sub.empty:
+        return None
+    q90 = sub.quantile(0.9)
+    return sub[sub < q90].max().date().isoformat()
+
+
+def _champion_on(X: pd.DataFrame, y: pd.Series, old_meta: dict | None) -> dict | None:
+    """現役 production_model を X で採点 (AUC / logloss)。不能なら None。"""
+    model_path = DATA / "production_model.lgb"
+    if old_meta is None or not model_path.exists() or len(X) == 0:
+        return None
+    try:
+        booster = lgb.Booster(model_file=str(model_path))
+        cols = old_meta.get("feature_columns")
+        Xv = X[cols] if cols and all(c in X.columns for c in cols) else X
+        p = booster.predict(Xv)
+        return {"auc": float(roc_auc_score(y, p)),
+                "logloss": float(log_loss(y, np.clip(p, 1e-6, 1 - 1e-6)))}
+    except Exception as e:  # noqa: BLE001
+        logger.warning("現役モデルの比較窓採点に失敗 (fallback): %s", e)
+        return None
+
+
+# v3 の閾値 (logloss 主指標。比較用の窓で同じ行を採点するので窓ずれノイズは無い)
+LL_TOL = 0.0015          # 候補 logloss が現役 + これ以内なら OK
+STALE_LL_TOL = 0.005     # 現役が STALE_DAYS 超なら + これ以内で WARN 採用 (鮮度優先)
+
+
+def _should_adopt_v3(cand: dict, champ: dict, new_metrics: dict, old_meta: dict | None,
+                     model_age_days: int | None, force: bool = False) -> tuple[str, str]:
+    """採用ゲート v3: 比較用の窓 (学習・早期終了に未使用、現役にとっても学習外) で logloss 主判定。
+
+    cand / champ: {"auc", "logloss"} (同じ行)。AUC は併記のみ。
+    sanity (旧モデルなし / force / target 定義変更 / best_iter 激減) は v2 と同じ。
+    """
+    if old_meta is None:
+        return "OK", "旧モデルなし、初回採用"
+    if force:
+        return "OK", "--force 指定、強制採用"
+    old_tdv = old_meta.get("target_definition_version")
+    if old_tdv is not None and old_tdv != TARGET_DEFINITION_VERSION:
+        return "WARN", (f"target_definition_version 変更: {old_tdv} -> {TARGET_DEFINITION_VERSION}. "
+                        "教師データ定義差の可能性あり、採用するが要確認")
+    new_bi = new_metrics.get("best_iteration", 0)
+    old_bi = (old_meta.get("train_metrics") or {}).get("best_iteration", 0)
+    if old_bi > 0 and new_bi < old_bi * 0.4:
+        return "NG", (f"best_iteration 激減: {old_bi} -> {new_bi} "
+                      f"({new_bi / old_bi * 100:.0f}%、閾値40% degenerate疑い)")
+    d_ll = cand["logloss"] - champ["logloss"]
+    d_auc = cand["auc"] - champ["auc"]
+    txt = (f"比較窓 logloss 候補{cand['logloss']:.5f} vs 現役{champ['logloss']:.5f} "
+           f"(diff={d_ll:+.5f}) / AUC 候補{cand['auc']:.4f} vs 現役{champ['auc']:.4f} ({d_auc:+.4f})")
+    if d_ll <= LL_TOL:
+        return "OK", f"[v3] {txt} 許容+{LL_TOL}"
+    age = model_age_days if model_age_days is not None else 0
+    if age >= STALE_DAYS and d_ll <= STALE_LL_TOL:
+        return "WARN", f"[v3] 鮮度オーバーライド採用: 現役{age}日経過, {txt} (許容+{STALE_LL_TOL})"
+    return "NG", f"[v3] logloss 悪化: {txt} (許容+{LL_TOL}, 現役{age}日)"
+
+
 def fit_calibration() -> tuple[IsotonicRegression, dict]:
     """walk-forward 予測(過去の honest 予測)から isotonic を fit。
 
@@ -249,6 +384,9 @@ HISTORY_HEADER = [
     # 採用ゲート v2 (ROI 拒否権) — 2026-07 追加。旧行は空欄のまま
     "roi_champion", "roi_candidate", "roi_delta_pt",
     "roi_ci_low", "roi_ci_high", "roi_n_bets", "roi_verdict",
+    # 採用ゲート v3 (比較用の窓・logloss 主指標・複勝 ROI) — 2026-11-12 追加。旧行は空欄
+    "gate_mode", "cmp_start", "cmp_n", "cand_ll_cmp", "champ_ll_cmp",
+    "cand_auc_cmp", "champ_auc_cmp", "roi_bet_type",
 ]
 
 
@@ -296,7 +434,7 @@ def _migrate_history_header() -> None:
 
 
 def _append_retrain_history(verdict: str, reason: str, metrics: dict,
-                            roi: dict | None = None) -> None:
+                            roi: dict | None = None, extra: dict | None = None) -> None:
     """再学習結果を data/retrain_history.csv に追記。
 
     weekly_status の塩漬けリスク監視 (Antigravity 2026-05-23 提案) で
@@ -312,6 +450,7 @@ def _append_retrain_history(verdict: str, reason: str, metrics: dict,
         "best_iteration": metrics.get("best_iteration", ""),
         "target_definition_version": TARGET_DEFINITION_VERSION,
         **_roi_history_fields(roi or {}),
+        **(extra or {}),
     }
     try:
         _migrate_history_header()
@@ -455,8 +594,30 @@ def _should_adopt(new_metrics: dict, old_meta: dict | None,
 ROI_RACE_KEYS = ["race_date", "place_code", "race_no"]
 
 
+def place_payout_frame(d: pd.DataFrame, pay: pd.DataFrame) -> pd.DataFrame:
+    """複勝 (fns) の確定払戻を車ごとに付ける: is_win = 払戻のある車、odds = refund/100。
+
+    d: race_date / place_code / race_no / car_no を持つ候補行。payouts.csv の fns 行は
+    3 着内 (頭数で 2 着内) の各車に 1 行ずつある。払戻が 1 行も無いレースは odds を NaN にして
+    roi_gate のペア比較から除外させる (未確定・中止)。
+    """
+    f = pay[pay["bet_type"] == "fns"].copy()
+    f["race_date"] = pd.to_datetime(f["race_date"], errors="coerce").dt.normalize()
+    f = f.dropna(subset=["race_date", "car_no_1", "refund"])
+    f["car_no"] = pd.to_numeric(f["car_no_1"], errors="coerce")
+    f = f.drop_duplicates(subset=ROI_RACE_KEYS + ["car_no"])
+    out = d.copy()
+    out["race_date"] = pd.to_datetime(out["race_date"]).dt.normalize()
+    out = out.merge(f[ROI_RACE_KEYS + ["car_no", "refund"]], on=ROI_RACE_KEYS + ["car_no"], how="left")
+    has_pay = out.groupby(ROI_RACE_KEYS)["refund"].transform(lambda s: s.notna().any())
+    out["is_win"] = out["refund"].notna().astype(int)
+    out["odds"] = np.where(out["is_win"] == 1, out["refund"] / 100.0, 1.0)
+    out.loc[~has_pay, "odds"] = np.nan
+    return out.drop(columns=["refund"])
+
+
 def _roi_veto(model: lgb.Booster, old_meta: dict | None,
-              X_va: pd.DataFrame, df_va: pd.DataFrame) -> dict:
+              X_va: pd.DataFrame, df_va: pd.DataFrame, bet_type: str = "fns") -> dict:
     """採用ゲート v2: ROI 劣化拒否権 (ml/roi_gate.py 共通仕様の呼び出し側)。
 
     champion (現役 production_model.lgb) と candidate を同一 val 集合・
@@ -483,8 +644,11 @@ def _roi_veto(model: lgb.Booster, old_meta: dict | None,
         d["p_champion"] = champ.predict(Xv)
         d["p_candidate"] = model.predict(X_va, num_iteration=model.best_iteration)
 
-        # 単勝確定払戻: payouts.csv の tns 行 (refund は 100 円あたり払戻金)
         pay = pd.read_csv(DATA / "payouts.csv", low_memory=False)
+        if bet_type == "fns":
+            # 2026-11-12: 運用 (複勝) に合わせ、top1 の複勝 1 点 100 円で比べる
+            return evaluate_roi_gate(place_payout_frame(d, pay), race_keys=ROI_RACE_KEYS)
+        # 旧方式: 単勝確定払戻 (payouts.csv の tns 行。refund は 100 円あたり払戻金)
         tns = pay[pay["bet_type"] == "tns"].copy()
         tns["race_date"] = pd.to_datetime(tns["race_date"], errors="coerce").dt.normalize()
         tns = tns.dropna(subset=["race_date", "car_no_1", "refund"])
@@ -512,19 +676,41 @@ def main():
     X, y, df_kept, feature_cols = prepare(df, args.target)
     logger.info("Total kept: %s rows × %d features", f"{len(df_kept):,}", X.shape[1])
 
-    model, train_metrics, X_va, y_va = train_full(X, y, df_kept["race_date"])
+    model, train_metrics, X_va, y_va, X_cmp, y_cmp = train_full_v3(X, y, df_kept["race_date"])
     iso, calib_metrics = fit_calibration()
 
-    # 品質ゲート: 現役モデルを同一 val で再採点して公平比較 (2026-06-26)
+    # 品質ゲート v3 (2026-11-12): 比較用の窓 (学習・早期終了に未使用) で、現役の学習外を
+    # 保証できるときだけ logloss 主判定。できないときは v2 (早期終了用 val での AUC 比較)。
     old_meta = _load_current_meta()
-    incumbent_auc = _incumbent_auc_on_val(X_va, y_va, old_meta)
     age_days = _model_age_days(old_meta)
-    if incumbent_auc is not None:
-        logger.info("現役モデル 同一val 再採点 AUC=%.4f (候補=%.4f, 現役%s日経過)",
-                    incumbent_auc, train_metrics["valid_auc"],
-                    age_days if age_days is not None else "?")
-    verdict, reason = _should_adopt(
-        train_metrics, old_meta, incumbent_auc, age_days, force=args.force)
+    champ_end = champion_train_end(old_meta, df_kept["race_date"])
+    cmp_start = train_metrics["cmp_start"]
+    champ_cmp = None
+    if champ_end is not None and champ_end < cmp_start:
+        champ_cmp = _champion_on(X_cmp, y_cmp, old_meta)
+    gate_extra = {"cmp_start": cmp_start, "cmp_n": train_metrics["n_cmp"],
+                  "cand_ll_cmp": round(train_metrics["cmp_logloss"], 6),
+                  "cand_auc_cmp": round(train_metrics["cmp_auc"], 5), "roi_bet_type": "fns"}
+    if champ_cmp is not None:
+        gate_extra.update({"gate_mode": "v3_compare_window",
+                           "champ_ll_cmp": round(champ_cmp["logloss"], 6),
+                           "champ_auc_cmp": round(champ_cmp["auc"], 5)})
+        logger.info("現役 比較窓 (%s〜, 現役学習終端 %s) logloss=%.5f AUC=%.4f / 候補 logloss=%.5f AUC=%.4f",
+                    cmp_start, champ_end, champ_cmp["logloss"], champ_cmp["auc"],
+                    train_metrics["cmp_logloss"], train_metrics["cmp_auc"])
+        verdict, reason = _should_adopt_v3(
+            {"auc": train_metrics["cmp_auc"], "logloss": train_metrics["cmp_logloss"]},
+            champ_cmp, train_metrics, old_meta, age_days, force=args.force)
+    else:
+        gate_extra["gate_mode"] = "v2_fallback"
+        incumbent_auc = _incumbent_auc_on_val(X_va, y_va, old_meta)
+        if incumbent_auc is not None:
+            logger.info("現役モデル 同一val 再採点 AUC=%.4f (候補=%.4f, 現役%s日経過)",
+                        incumbent_auc, train_metrics["valid_auc"],
+                        age_days if age_days is not None else "?")
+        verdict, reason = _should_adopt(
+            train_metrics, old_meta, incumbent_auc, age_days, force=args.force)
+        reason = f"[v2 fallback: 現役学習終端 {champ_end} / 比較窓 {cmp_start}〜] {reason}"
 
     # 採用ゲート v2: ROI 劣化拒否権 (精度ゲートが採用判定のときのみ最終チェック)。
     # NG (大幅かつ有意な ROI 劣化) だけ採用をブロックする。SKIP/ERROR/WARN は
@@ -532,7 +718,11 @@ def main():
     if verdict == "NG":
         roi_res = {"verdict": "SKIP", "reason": "精度ゲート NG のため ROI 比較不要"}
     else:
-        roi_res = _roi_veto(model, old_meta, X_va, df_kept.loc[X_va.index])
+        # ROI 拒否権は比較用の窓 (無ければ早期終了用 val) で複勝 top1 を比べる
+        if champ_cmp is not None:
+            roi_res = _roi_veto(model, old_meta, X_cmp, df_kept.loc[X_cmp.index])
+        else:
+            roi_res = _roi_veto(model, old_meta, X_va, df_kept.loc[X_va.index])
     logger.info("ROI 拒否権 (採用ゲート v2): %s: %s",
                 roi_res["verdict"], roi_res.get("reason", ""))
     if roi_res["verdict"] == "ERROR":
@@ -543,7 +733,7 @@ def main():
         logger.warning("verdict = NG へ上書き (ROI 拒否権発動)")
 
     # 学習履歴を append (OK/WARN/NG 全件、塩漬け監視用 + roi_* 列)
-    _append_retrain_history(verdict, reason, train_metrics, roi=roi_res)
+    _append_retrain_history(verdict, reason, train_metrics, roi=roi_res, extra=gate_extra)
 
     if verdict == "NG":
         logger.warning("=" * 60)

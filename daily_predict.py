@@ -1478,6 +1478,7 @@ def main():
         n_noprog = 0  # program 取得失敗 (date 不一致の疑い) — 2026-09-04 監査 P1
         nan_races = []  # (venue, race_no) の list
         noprog_races = []
+        shadow_frames = []  # 試走ありシャドー用 (記録のみ・購入判断に不使用。2026-11-12)
         for pc in args.venues:
             venue = VENUE_CODES.get(pc, str(pc))
             logger.info("--- %s (pc=%d) races=%s ---", venue, pc, race_nos)
@@ -1499,6 +1500,7 @@ def main():
                     append_odds_snapshot(df, time_label)
                 except Exception as e:
                     logger.warning("odds_snapshot 追記失敗: %s", e)
+                shadow_frames.append(df)
                 n_eval += 1
                 top1 = df[df["pred_rank"] == 1].copy()
                 top1_ev = float(top1["ev_avg_calib"].iloc[0]) if not top1.empty else float("nan")
@@ -1697,6 +1699,16 @@ def main():
                            rt3_refs=rt3_refs)
         print()
         print(text)
+
+        # 試走ありシャドー (ml/shadow_trial.py): 購入処理の後に、本番の予測と並べて記録する。
+        # 記録のみ。本番の pred / pred_calib / EV / 発注には一切使わない。失敗は握りつぶす。
+        try:
+            from ml import shadow_trial as _st
+            _sr = _st.record(shadow_frames, align_features)
+            logger.info("[shadow_trial] %d R 記録 (%s, %.0f ms)",
+                        _sr["n_races"], _sr["status"], _sr["elapsed_ms"])
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[shadow_trial] 記録失敗 (本番には影響なし): %s", e)
 
         n_hit = len(picks)
         logger.info("サマリ: eval=%d / hit=%d / below_thr=%d / NaN-skip=%d%s / no-program=%d%s",
