@@ -648,10 +648,69 @@ def render_3point_html(tp: dict) -> str:
         + "".join(rows) + '</ul>' + trig)
 
 
+# schtasks の Last Result のうち「異常終了ではない」コード
+SCHED_S_TASK_RUNNING = 267009      # 0x41301 現在実行中
+SCHED_S_TASK_HAS_NOT_RUN = 267011  # 0x41303 まだ一度も実行されていない
+# 本レポートを起動するタスク。レポート生成中は必ず「実行中」に見えるため、
+# これを NG に数えると全て正常でも毎週 🟡WARN になる (2026-08-10〜11-09 に実発生)。
+SELF_TASK_NAME = "AutoraceWeeklyStatus"
+# 自タスクの「実行中」を正常とみなす上限。これより前に起動したまま実行中なら
+# 今回のレポートではなく前回起動の固着なので NG として残す。
+SELF_RUNNING_MAX_AGE_HOURS = 6
+
+
+def _parse_schtasks_time(value) -> dt.datetime | None:
+    """schtasks の Last Run 列 (ロケール依存) を datetime に。読めなければ None。"""
+    s = str(value or "").strip()
+    for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S",
+                "%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %H:%M:%S"):
+        try:
+            return dt.datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def classify_task_result(name: str, rc: int, last_run="",
+                         now: dt.datetime | None = None) -> str:
+    """schtasks の 1 タスクを "ok" / "not_run" / "self_running" / "ng" に分類する。
+
+    実行中 (267009) を正常扱いするのは本レポート自身のタスクだけ。他タスクの
+    実行中は「朝バッチがこの時刻まで終わっていない」兆候なので NG のまま数える。
+    """
+    if rc == 0:
+        return "ok"
+    if rc == SCHED_S_TASK_HAS_NOT_RUN:
+        return "not_run"
+    if rc == SCHED_S_TASK_RUNNING and str(name).startswith(SELF_TASK_NAME):
+        started = _parse_schtasks_time(last_run)
+        if started is None:
+            return "self_running"   # 時刻が読めないロケールでは誤 WARN を出さない側に倒す
+        age_h = ((now or dt.datetime.now()) - started).total_seconds() / 3600
+        return "self_running" if age_h <= SELF_RUNNING_MAX_AGE_HOURS else "ng"
+    return "ng"
+
+
+_TASK_STATE_VIEW = {
+    "ok": ("✅", "#2e7d32", ""),
+    "not_run": ("⏳", "#888", ""),
+    "self_running": ("⏳", "#888", " (実行中 = 本レポート自身)"),
+    "ng": ("🔴", "#c62828", ""),
+}
+
+
+def _task_view(t: dict) -> tuple[str, str, str]:
+    """schtasks 1 行の (マーク, 色, 注記)。text / HTML で同じ分類を使う。"""
+    state = t.get("state") or classify_task_result(
+        t.get("name", ""), t.get("result", -1), t.get("last_run", ""))
+    return _TASK_STATE_VIEW[state]
+
+
 def check_schtasks_health() -> dict:
     """schtasks LastRunResult 監視(Codex R6 + R7 提案)。
 
-    Autorace* タスクの最終実行結果を取得し、0 以外を異常として返す。
+    Autorace* タスクの最終実行結果を取得し、異常終了 (classify_task_result が
+    "ng" を返すもの) を数える。
     R7: 列名ローカライズ対策として CSV 全体を data/schtasks_snapshot.csv に
     保存し、後から人手で確認できるようにする。
     """
@@ -720,9 +779,11 @@ def check_schtasks_health() -> dict:
             except (ValueError, TypeError):
                 rc = -1
             last_run = str(row[last_run_col]) if last_run_col else ""
-            entry = {"name": raw_name, "result": rc, "last_run": last_run}
+            state = classify_task_result(raw_name, rc, last_run)
+            entry = {"name": raw_name, "result": rc, "last_run": last_run,
+                     "state": state}
             out["tasks"].append(entry)
-            if rc != 0 and rc != 267011:  # 267011 = まだ実行されていない (allowed)
+            if state == "ng":
                 out["ng_count"] += 1
     except FileNotFoundError:
         out["warnings"].append("schtasks 未検出")
@@ -1058,10 +1119,14 @@ STATUS_COLOR = {"OK": "#2e7d32", "WARN": "#e65100", "NG": "#c62828"}
 
 OVERALL_CRITERIA = [
     "🔴 NG: daily_ingest ログにエラー行がある、または死活監視 "
-    "(bet_history / schtasks / EHI / ngrok / モデル鮮度) のいずれかが NG",
+    "(bet_history / EHI / ngrok / モデル鮮度) のいずれかが NG",
     f"🟡 WARN: 収集 NO_DATA 日が {INGEST_WARN_NODATA_DAYS} 日以上、"
+    "schtasks に異常終了タスクがある、"
     "または死活監視のいずれかが WARN (死活監視が例外で判定不能な場合も WARN)",
     "🟢 OK: 上記いずれにも該当しない",
+    f"※ schtasks の rc={SCHED_S_TASK_RUNNING} (実行中) は本レポート自身 "
+    f"({SELF_TASK_NAME}) に限り正常扱い。{SELF_RUNNING_MAX_AGE_HOURS} 時間を超えて"
+    "実行中のままなら固着として異常に数える",
     "※ 当日は結果が未確定のため集計対象外 (直近 N 日は前日起点で数える)。"
     "「OK n/m日」の分母 m も確定した日だけを数える",
     "※ 🛑RT3 タグは総合状態とは独立の購入停止フラグ (件名・本文の両方に出す)",
@@ -1187,8 +1252,9 @@ def render_health_text(bh: dict, st: dict, ehi: dict | None = None,
         lines.append("")
         lines.append(f"  schtasks Autorace* {len(st['tasks'])} 件 / NG {st['ng_count']} 件")
         for t in st["tasks"]:
-            mark = "✅" if t["result"] == 0 else ("⏳" if t["result"] == 267011 else "🔴")
-            lines.append(f"    {mark} {t['name']:34s} rc={t['result']:>6} last_run={t['last_run']}")
+            mark, _, note = _task_view(t)
+            lines.append(f"    {mark} {t['name']:34s} rc={t['result']:>6} "
+                         f"last_run={t['last_run']}{note}")
         if st.get("snapshot_path"):
             lines.append(f"  (raw snapshot: {st['snapshot_path']})")
     for w in st.get("warnings", []):
@@ -1327,11 +1393,10 @@ def render_health_html(bh: dict, st: dict, ehi: dict | None = None,
         for i, t in enumerate(st["tasks"]):
             alt = ' style="background:#fafafa;"' if i % 2 == 1 else ""
             rc = t["result"]
-            mark = "✅" if rc == 0 else ("⏳" if rc == 267011 else "🔴")
-            color = "#2e7d32" if rc == 0 else ("#888" if rc == 267011 else "#c62828")
+            mark, color, note = _task_view(t)
             parts.append(
                 f"<tr{alt}>"
-                f'<td style={TD}>{mark} {t["name"]}</td>'
+                f'<td style={TD}>{mark} {t["name"]}{note}</td>'
                 f'<td style={TD_R}><span style="color:{color}">{rc}</span></td>'
                 f'<td style={TD_R}>{t["last_run"]}</td>'
                 f"</tr>"
