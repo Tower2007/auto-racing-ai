@@ -1709,6 +1709,14 @@ def main():
                         _sr["n_races"], _sr["status"], _sr["elapsed_ms"])
         except Exception as e:  # noqa: BLE001
             logger.warning("[shadow_trial] 記録失敗 (本番には影響なし): %s", e)
+        # 全期間 (直近まで) で学習したシャドー 2 本 (ml/shadow_full.py, 2026-11-13)。同じく記録のみ。
+        try:
+            from ml import shadow_full as _sf
+            _sf_r = _sf.record(shadow_frames, align_features)
+            logger.info("[shadow_full] %d R 記録 (%s, %.0f ms)",
+                        _sf_r["n_races"], _sf_r["status"], _sf_r["elapsed_ms"])
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[shadow_full] 記録失敗 (本番には影響なし): %s", e)
 
         n_hit = len(picks)
         logger.info("サマリ: eval=%d / hit=%d / below_thr=%d / NaN-skip=%d%s / no-program=%d%s",

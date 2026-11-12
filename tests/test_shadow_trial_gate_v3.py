@@ -214,7 +214,9 @@ def test_weekly_retrain_optional_step_failure_keeps_rc(monkeypatch):
     monkeypatch.setattr(wr, "_log", lambda m: None)
     monkeypatch.setattr(sys, "argv", ["weekly_retrain.py"])
     assert wr.main() == 0
-    assert calls[-1] == "ml.shadow_trial" and "ml.train_production" in calls
+    # 任意ステップ (試走シャドー・全期間シャドー) は本番の後。失敗しても rc=0
+    assert calls.index("ml.shadow_trial") > calls.index("ml.train_production")
+    assert calls[-1] == "ml.shadow_full"
 
 
 def test_daily_predict_hook_is_guarded():

@@ -1431,6 +1431,11 @@ def model_accuracy_lines() -> list[str]:
     except Exception as e:  # noqa: BLE001
         out.append(f"試走ありシャドー: 取得失敗 ({type(e).__name__})")
     try:
+        from ml import shadow_full
+        out.extend(shadow_full.weekly_lines())
+    except Exception as e:  # noqa: BLE001
+        out.append(f"全期間シャドー: 取得失敗 ({type(e).__name__})")
+    try:
         h = pd.read_csv(DATA / "retrain_history.csv")
         if len(h) and "gate_mode" in h.columns and pd.notna(h["gate_mode"].iloc[-1]):
             r = h.iloc[-1]
