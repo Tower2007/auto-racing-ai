@@ -1244,6 +1244,11 @@ def append_rt3_paper(ref: dict) -> None:
 # check_guards の skip (日次上限・損失停止など) は意図した見送りで、AUTO-BUY skip
 # メールが出るため対象外。skip_abandoned_* は専用の警告メールがあるため対象外。
 AUTO_BUY_UNHANDLED_VERDICTS = frozenset({"failed", "skip_lock"})
+# 結果不明 (2026-11-12 監査 指摘1・2): 「投票する」click 以降の失敗/タイムアウトで
+# 注文が成立した可能性がある。手動購入ボタン付きの候補メールを送ると二重購入を
+# 招くため、この verdict を含む run では候補メールを送らない (AUTO-BUY の
+# 「結果不明 (投票履歴を確認)」メールが代わりに出る)。auto_buy.VERDICT_UNCERTAIN と一致。
+AUTO_BUY_UNCERTAIN_VERDICT = "uncertain"
 
 
 def candidate_mail_decision(n_picks: int, auto_buy_enabled: bool, dry_run: bool,
@@ -1258,6 +1263,12 @@ def candidate_mail_decision(n_picks: int, auto_buy_enabled: bool, dry_run: bool,
     """
     if n_picks == 0:
         return True, "候補なし (suppress-noresult-email 側で判定)"
+    # 結果不明の R を含むなら、送信設定や他の失敗より優先して送らない (二重購入防止)
+    unsure = [v for v in (verdicts or [])
+              if v.get("verdict") == AUTO_BUY_UNCERTAIN_VERDICT]
+    if unsure:
+        return False, "自動発注の結果不明あり (手動購入ボタンは出さない): " + ", ".join(
+            str(v.get("race")) for v in unsure)
     if send_always:
         return True, "AUTO_BUY_SEND_CANDIDATE_MAIL=True (従来どおり毎回送信)"
     if not auto_buy_enabled:

@@ -210,13 +210,18 @@ def test_check_3point_health_strict_pair_scope():
         ])
         # backstop 側 (⑤) も同じ tmp detail を見る (全場: +1,620 → OK)
         backstop.DETAIL_CSV = tmp_data / "bet_history_detail.csv"
-        orig = (weekly_status.DATA, weekly_status.RT3_STOP_FLAG)
+        orig = (weekly_status.DATA, weekly_status.RT3_STOP_FLAG,
+                weekly_status.THREE_POINT_KILLSWITCH_SINCE)
         try:
             weekly_status.DATA = tmp_data
             weekly_status.RT3_STOP_FLAG = tmp_data / "rt3_stop.flag"
+            # このテストはペア厳密一致の検証。再開基準日 (2026-11-03 導入、
+            # 固定データ 2026-07-01 より後) の絞り込みは切り、境界は別テストで見る
+            weekly_status.THREE_POINT_KILLSWITCH_SINCE = None
             out = weekly_status.check_3point_health()
         finally:
-            weekly_status.DATA, weekly_status.RT3_STOP_FLAG = orig
+            (weekly_status.DATA, weekly_status.RT3_STOP_FLAG,
+             weekly_status.THREE_POINT_KILLSWITCH_SINCE) = orig
         # 伊勢崎 rt3 (vote 700 / hit 1980) が現役集計から除外されている
         assert out["invest"] == 1_100, out
         assert out["payout"] == 1_440, out
@@ -226,6 +231,43 @@ def test_check_3point_health_strict_pair_scope():
         # 条件⑤ (全場バックストップ) が OK で入っている
         c5 = [c for c in out["conditions"] if c[0] == "⑤"]
         assert len(c5) == 1 and c5[0][1] == "OK", out["conditions"]
+        assert not sb.flag.exists() and sb.sent == []
+
+
+def test_check_3point_health_killswitch_since_boundary():
+    """①② は再開基準日「以降」(当日を含む) の購入だけで評価する (2026-11-03 導入)。
+    前日の大損は①②に入らず、⑤ バックストップ (全期間) にだけ入る。"""
+    import weekly_status
+    with _BackstopSandbox() as sb:
+        tmp_data = sb.tmp / "wsdata"
+        tmp_data.mkdir()
+        _write_detail(tmp_data / "bet_history_detail.csv", [
+            # 基準日の前日: -¥6,000 (単独なら②発動水準) → ①②の対象外
+            _detail_row(4, "rt3", vote=6_000, hit=0, race_no=1,
+                        date="2026-11-02"),
+            # 基準日当日: 対象 (境界は >=)
+            _detail_row(6, "rf3", vote=100, hit=450, race_no=2,
+                        date="2026-11-03"),
+            _detail_row(6, "rt3", vote=100, hit=0, race_no=2,
+                        date="2026-11-03"),
+        ])
+        backstop.DETAIL_CSV = tmp_data / "bet_history_detail.csv"
+        orig = (weekly_status.DATA, weekly_status.RT3_STOP_FLAG,
+                weekly_status.THREE_POINT_KILLSWITCH_SINCE)
+        try:
+            weekly_status.DATA = tmp_data
+            weekly_status.RT3_STOP_FLAG = tmp_data / "rt3_stop.flag"
+            weekly_status.THREE_POINT_KILLSWITCH_SINCE = "2026-11-03"
+            out = weekly_status.check_3point_health()
+        finally:
+            (weekly_status.DATA, weekly_status.RT3_STOP_FLAG,
+             weekly_status.THREE_POINT_KILLSWITCH_SINCE) = orig
+        assert out["since"] == "2026-11-03", out
+        assert out["invest"] == 200 and out["payout"] == 450, out
+        assert out["n_picks"] == 1, out
+        assert out["triggered"] is False, out
+        # ⑤ は全期間: -6,000 + 250 = -5,750 (> -10,000 で OK、前日分も含む)
+        assert out["backstop"]["profit"] == -5_750, out["backstop"]
         assert not sb.flag.exists() and sb.sent == []
 
 

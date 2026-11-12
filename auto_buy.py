@@ -330,12 +330,49 @@ def _notify(subject: str, body: str) -> None:
         logger.error("auto_buy Gmail 通知失敗: %s", e)
 
 
+# ── 発注結果の 3 区分 (2026-11-12 監査 指摘1・2) ─────────────────────────
+# EXEC_OK        … 投票完了を確認 (verdict "executed")
+# EXEC_FAILED    … 「投票する」click より前の失敗 = 注文は成立していない (verdict "failed")
+# EXEC_UNCERTAIN … click 以降に確認が取れず終了 / タイムアウト / 想定外の終了コード
+#                  = 注文が成立した可能性がある (verdict "uncertain")
+EXEC_OK, EXEC_FAILED, EXEC_UNCERTAIN = "ok", "failed", "uncertain"
+VERDICT_UNCERTAIN = "uncertain"
+# execute_purchase.py の終了コード (scripts/execute_purchase.py の EXIT_UNCERTAIN と
+# 一致させる。tests/test_auto_buy_uncertain.py が一致を検査)。
+#   0 = 投票完了 / 1 = click 前の失敗 / 2 = 引数不正 / 3 = 停止フラグで入口中止
+#   4 = click 以降の結果不明 (EXECUTE_EXIT_UNCERTAIN)
+EXECUTE_EXIT_PRE_CLICK_FAILURES = (1, 2, 3)
+EXECUTE_EXIT_UNCERTAIN = 4
+
+
+def _normalize_exec_result(res) -> tuple[str, str, dict | None]:
+    """_run_execute_purchase の戻り値を (status, detail, balance) に正規化する。
+
+    値の個数・型に依存しない (2026-11-12: 旧実装はタイムアウト時だけ 2 値を返し、
+    呼び出し側の 3 値 unpack が ValueError で落ちていた)。
+    判別できない形は EXEC_UNCERTAIN (買えた可能性がある側) に倒す。
+    """
+    if not isinstance(res, (tuple, list)) or not res:
+        return EXEC_UNCERTAIN, f"発注結果を解釈できない ({res!r})"[:300], None
+    head = res[0]
+    detail = str(res[1]) if len(res) > 1 else ""
+    balance = res[2] if len(res) > 2 and isinstance(res[2], dict) else None
+    if head is True or head == EXEC_OK:
+        return EXEC_OK, detail, balance
+    if head is False or head == EXEC_FAILED:
+        return EXEC_FAILED, detail, balance
+    return EXEC_UNCERTAIN, detail, balance
+
+
 def _run_execute_purchase(race_date: str, place_code: int, race_no: int,
-                          bets: list[dict]) -> tuple[bool, str, dict | None]:
+                          bets: list[dict]) -> tuple[str, str, dict | None]:
     """execute_purchase.py を subprocess 実行 (実投票)。
 
-    返り値: (success, detail, balance)
+    返り値: (status, detail, balance) — 常に 3 値。
+      status  = EXEC_OK / EXEC_FAILED / EXEC_UNCERTAIN
       balance = {"points","cash","total"} or None (確認画面から抽出)
+    タイムアウト・click 以降の不確定 (exit 4)・想定外の終了コードは
+    EXEC_UNCERTAIN (注文が成立した可能性がある)。
     """
     cmd = [
         sys.executable, str(EXECUTE_SCRIPT),
@@ -350,7 +387,10 @@ def _run_execute_purchase(race_date: str, place_code: int, race_no: int,
             encoding="utf-8", errors="replace", timeout=180,
         )
     except subprocess.TimeoutExpired:
-        return False, "timeout >180s"
+        # 子プロセスは kill 済みだが、どこまで進んだか (「投票する」click 済みか) は
+        # 不明 → 結果不明 (買えた可能性がある側) として返す。
+        return (EXEC_UNCERTAIN,
+                "タイムアウト (>180s、投票処理の途中で打ち切り)", None)
 
     # execute_purchase は stdout に結果 JSON を indent=2 で複数行出力する。
     # → 最終行 ('}') だけでなく stdout 全体 / 最後の {...} ブロックを解釈する。
@@ -376,12 +416,20 @@ def _run_execute_purchase(race_date: str, place_code: int, race_no: int,
     balance = parsed.get("balance") if isinstance(parsed, dict) else None
 
     # returncode を主判定にする (0=happy path 完走=success:true、
-    # 1=例外/検証失敗、2=引数不正)。parsed.success は sanity check。
+    # 1=click 前の例外/検証失敗、2=引数不正、3=停止フラグ、4=click 以降の結果不明)。
+    # parsed.success は sanity check。
     if r.returncode == 0:
         if parsed is not None and parsed.get("success") is False:
-            return False, detail, balance
-        return True, detail, balance
-    return False, detail, balance
+            return EXEC_FAILED, detail, balance
+        return EXEC_OK, detail, balance
+    if r.returncode in EXECUTE_EXIT_PRE_CLICK_FAILURES:
+        return EXEC_FAILED, detail, balance
+    if r.returncode == EXECUTE_EXIT_UNCERTAIN:
+        return (EXEC_UNCERTAIN,
+                f"「投票する」押下後に成立確認が取れず: {detail}"[:300], balance)
+    # 想定外の終了コード (強制終了・クラッシュ等) は click 前後を判別できない → 結果不明
+    return (EXEC_UNCERTAIN,
+            f"想定外の終了コード {r.returncode}: {detail}"[:300], balance)
 
 
 def _maybe_low_balance_alert(state: dict, balance: dict | None) -> None:
@@ -953,11 +1001,12 @@ def _run_auto_buy_locked(candidates: list[dict],
         ev = float(c.get("ev", 0.0))
         race_label = f"{c.get('venue','?')}_R{c['race_no']}"
         # レース単位の冪等ガード (2026-09-04 監査 P2、boat auto_buy.process_one と同型):
-        # 当日 state に同一 race の executed/dry_run 記録があれば二重発注しない。
+        # 当日 state に同一 race の executed/dry_run/uncertain (結果不明 = 成立の
+        # 可能性あり、2026-11-12) 記録があれば二重発注しない。
         # per-race one-shot の二重発火 / 手動再走で同じ R を再評価した場合の防御。
         # (state は暦日で reset されるため、日跨ぎレースは翌暦日の state で判定される)
         if any(str(e.get("race", "")) == race_label
-               and e.get("verdict") in ("executed", "dry_run")
+               and e.get("verdict") in ("executed", "dry_run", VERDICT_UNCERTAIN)
                for e in state.get("executions", [])):
             reason = "skip_duplicate (当日この R は発注済み: 冪等ガード)"
             logger.info("[auto_buy] %s skip: %s", race_label, reason)
@@ -1010,12 +1059,27 @@ def _run_auto_buy_locked(candidates: list[dict],
         # 実投票
         logger.info("[auto_buy][LIVE] %s 投票: %s (¥%d)",
                     race_label, bets_desc, amount)
-        success, detail, balance = _run_execute_purchase(
-            c["race_date"], int(c["place_code"]), int(c["race_no"]), c["bets"])
-        if success:
+        # 戻り値の個数・型に依存しない (正規化で 3 値に揃える)。発注呼び出し自体の
+        # 例外も auto_buy の外へ漏らさず「結果不明」に倒す (2026-11-12 監査 指摘1)。
+        try:
+            status, detail, balance = _normalize_exec_result(
+                _run_execute_purchase(c["race_date"], int(c["place_code"]),
+                                      int(c["race_no"]), c["bets"]))
+        except Exception as e:  # noqa: BLE001
+            status, detail, balance = (
+                EXEC_UNCERTAIN, f"発注呼び出しで例外: {e!r}"[:300], None)
+        if status == EXEC_OK:
             state["spent_yen"] += amount
             state["consecutive_failures"] = 0
             verdict = "executed"
+        elif status == EXEC_UNCERTAIN:
+            # 結果不明 (2026-11-12 監査 指摘1・2): 買えた前提で安全側に倒す。
+            #   - 予定額を当日上限に計上 / 冪等ガード対象 (同じ R を再発注しない)
+            #   - 連続失敗に 1 加算 (既存の 3 回停止に乗せる。新しい sticky 停止は無い)
+            #   - 手動購入ボタン付きの候補メールは出さない (daily_predict 側)
+            state["spent_yen"] += amount
+            state["consecutive_failures"] += 1
+            verdict = VERDICT_UNCERTAIN
         else:
             state["consecutive_failures"] += 1
             verdict = "failed"
@@ -1026,6 +1090,25 @@ def _run_auto_buy_locked(candidates: list[dict],
                "timestamp": now.isoformat()}
         state["executions"].append(rec)
         results.append(rec)
+        if verdict == VERDICT_UNCERTAIN:
+            logger.warning("[auto_buy] %s 結果不明: %s", race_label, detail)
+            _notify(
+                f"[AUTO-BUY] ⚠️ {venue_jp} R{c['race_no']} 計¥{amount} "
+                f"結果不明 (投票履歴を確認)",
+                f"【自動発注 結果不明 — 投票履歴を確認してください】\n"
+                f"{race_jp}\n\n"
+                f"買い目:\n  {bets_desc}\n\n"
+                f"予定額: ¥{amount}\n"
+                f"理由: {detail[-300:]}\n\n"
+                f"公式の投票履歴で成立有無を確認してください。\n"
+                f"成立していた場合、手動で買い直さないでください。\n\n"
+                f"(安全側の扱い: この R は当日上限に ¥{amount} を計上済み・"
+                f"本日は再発注しません・連続失敗に 1 加算)\n"
+                f"当日 自動発注額: ¥{state['spent_yen']} / "
+                f"連続失敗 {state['consecutive_failures']}")
+            save_state(state)
+            continue
+        success = verdict == "executed"
         _notify(
             f"[AUTO-BUY] {venue_jp} R{c['race_no']} 計¥{amount} "
             f"{'投票完了' if success else '失敗'}",

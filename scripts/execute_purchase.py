@@ -59,6 +59,31 @@ VENUE_JP_MAP = {2: "川口", 3: "伊勢崎", 4: "浜松", 5: "飯塚", 6: "山�
 MAX_AMOUNT_YEN = 1000   # 1 券種あたりの最大投資額
 MAX_TOTAL_YEN = 1500    # 1 R の全券種合計上限 (複勝¥1000 + rt3¥100 + rf3¥100 余裕)
 
+# 終了コード (2026-11-12 監査 指摘2)。auto_buy.py の EXECUTE_EXIT_* と一致させる。
+#   0 = 投票完了 / 1 = 「投票する」click より前の失敗 (注文は成立していない)
+#   2 = 引数不正 / 3 = 停止フラグで入口中止
+#   4 = EXIT_UNCERTAIN: 「投票する」click 以降に確認が取れず終了 (注文が成立した可能性あり)
+EXIT_UNCERTAIN = 4
+
+
+class PurchaseUncertain(RuntimeError):
+    """「投票する」click 以降の失敗。注文が成立した可能性があり、結果不明として扱う。"""
+
+
+def _classify_after_click(exc: BaseException, clicked: bool) -> BaseException:
+    """投票処理中の例外を、click 前後で分類して送出すべき例外を返す。
+
+    境界は「投票する」ボタンの click 呼び出し (注文が成立しうる最初の操作) の直前。
+    clicked=True (click を呼んだ後。click 自体の失敗・タイムアウトも含む) の例外は
+    PurchaseUncertain に包む。click 前の例外はそのまま (従来どおり exit 1)。
+    """
+    if not clicked or isinstance(exc, PurchaseUncertain):
+        return exc
+    err = PurchaseUncertain(
+        f"「投票する」click 以降に確認が取れず終了 (結果不明): {exc}")
+    err.__cause__ = exc
+    return err
+
 # 券種メタ (2026-05-30 三連系まとめ買い対応、inspect_purchase_page 調査で確定)
 #   tab_label: #select-bettype 内の券種ラベル (全角)
 #   n_cars   : 必要な車番数
@@ -371,6 +396,10 @@ async def execute_buy(
         )
 
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 「投票する」click を呼んだか (2026-11-12 監査 指摘2)。True 以降の例外は
+    # 注文成立の可能性があるため PurchaseUncertain (exit 4) に分類する。
+    clicked = False
 
     async with async_playwright() as pw:
         context, page = await _launch_context(pw)
@@ -818,6 +847,9 @@ async def execute_buy(
                     if _blk2:
                         raise RuntimeError(
                             f"click 直前の最終再検査で中止 (発注せず): {_why2}")
+                    # ★ click 前/後の境界: ここから先の失敗は結果不明 (exit 4)。
+                    # click 呼び出し自体が例外/タイムアウトでも送信済みの可能性がある。
+                    clicked = True
                     await vote_btn.click(timeout=5000)
                 finally:
                     _abmod.release_purchase_gate(_gate)
@@ -1041,6 +1073,10 @@ async def execute_buy(
                 ),
             }
 
+        except (Exception, asyncio.CancelledError) as e:
+            # click 以降の例外 (click 失敗ラップ・失敗キーワード検出・GraphQL 全一致
+            # 不足・完了確認不能・その他想定外) は結果不明に分類 (2026-11-12 監査 指摘2)
+            raise _classify_after_click(e, clicked)
         finally:
             try:
                 await context.close()
@@ -1215,6 +1251,11 @@ def main() -> None:
             args.race_date, args.place, args.race,
             dry_run=args.dry_run, bets=bets,
         ))
+    except PurchaseUncertain as e:
+        # 「投票する」click 以降の失敗: 注文が成立した可能性がある (結果不明)
+        print(json.dumps({"success": False, "uncertain": True, "error": str(e)},
+                         ensure_ascii=False))
+        sys.exit(EXIT_UNCERTAIN)
     except Exception as e:
         print(json.dumps({"success": False, "error": str(e)},
                          ensure_ascii=False))

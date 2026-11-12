@@ -1,5 +1,31 @@
 # CHANGELOG
 
+## 2026-11-12 — 自動発注に「結果不明 (uncertain)」判定を追加 (統合監視 総合検証 指摘1・2)
+
+- **指摘1 タイムアウトで例外落ち**: `auto_buy._run_execute_purchase` がタイムアウト時だけ
+  2 値を返し、呼び出し側の 3 値 unpack が ValueError で落ちていた (2026-07-26 川口 R9 で実発生。
+  state 未記録・上限未計上・失敗メールなし・手動購入ボタン付き候補メール送信)。
+  常に 3 値 `(status, detail, balance)` を返し、タイムアウトは結果不明とする。呼び出し側は
+  `_normalize_exec_result` で値の個数に依存せず解釈し、発注呼び出しの例外も外へ漏らさない。
+- **指摘2 click 後の失敗が failed 扱い**: `execute_purchase.py` は「投票する」click
+  (注文が成立しうる最初の操作) の直前で `clicked=True` を立て、それ以降の例外
+  (click 自体の失敗・失敗キーワード検出・まとめ買いの GraphQL 全一致不足・完了確認不能・想定外)
+  を `PurchaseUncertain` に分類して **exit 4 (`EXIT_UNCERTAIN`)** で終える。click 前の失敗は従来どおり
+  exit 1 (2 = 引数不正 / 3 = 停止フラグ)。2026-05-31 浜松 R5 は failed 判定なのに注文成立していた。
+- **結果不明の扱い** (`auto_buy`, verdict `uncertain`): タイムアウト / exit 4 / 想定外の終了コード
+  (強制終了など) / 発注呼び出しの例外。予定額を当日上限 `spent_yen` に計上 (買えた前提)、
+  冪等ガード対象 (同じ R を当日再発注しない)、`consecutive_failures` +1 (既存の 3 回停止に乗せる)、
+  警告メール「[AUTO-BUY] ⚠️ 場 R 計¥ 結果不明 (投票履歴を確認)」を 1 通。新しい sticky 停止は足していない。
+- **候補メール**: `daily_predict.candidate_mail_decision` は結果不明を含む run では
+  「⚠️自動発注できず (手動購入可)」の 1-click 購入ボタン付き候補メールを送らない
+  (`AUTO_BUY_SEND_CANDIDATE_MAIL=1` でも送らない。二重購入防止)。click 前の `failed` は従来どおり送る。
+- **夜次**: `night_report.load_uncertain_executions` で結果不明 R を件名 (`❓結果不明N`) と本文注記に出す。
+  暫定精算・的中・投資には含めない (成立分は bet_history = 翌晩の前日確定欄が正)。
+- **テスト**: `tests/test_auto_buy_uncertain.py` (22 件) を追加。`test_check_3point_health_strict_pair_scope`
+  は再開基準日 (2026-11-03) 導入後に固定データ (7/1) が全除外されて落ちていたため、テスト側で
+  since を切り、境界テスト `test_check_3point_health_killswitch_since_boundary` を追加 (判定ロジックは不変)。
+- 未対応 (別途): buy_app の手動実行は exit 4 も従来どおり「投票失敗」と表示する。
+
 ## 2026-11-11 — メール ROI 整合監査の是正 (仮想/実弾の表記・夜次の返還/日跨ぎ・取込窓)
 
 統合監視側の監査 (「通知ごとに ROI が違う」) で、計算自体は一致していたが

@@ -145,7 +145,12 @@ rt3 浜松 ROI 530% / 山陽 ROI 141%、rf3 浜松 ROI 330% / 山陽 ROI 185%。
 (atomic write・日次 reset)、**毎回 Gmail 即時通知 (券種・出目・金額を日本語で明記)**。
 state の reset は暦日基準なので、日跨ぎミッドナイト R (00:00 以降発火) は前日の日次 cap
 (`MAX_DAILY_AUTO_YEN`) とは別枠 (翌暦日の枠) で数えられる (仕様、2026-09-04 注記)。
-同一 R の executed/dry_run が当日 state にあれば `skip_duplicate` で二重発注しない (冪等ガード)。
+同一 R の executed/dry_run/uncertain が当日 state にあれば `skip_duplicate` で二重発注しない (冪等ガード)。
+**結果不明 (verdict `uncertain`、2026-11-12)**: execute_purchase のタイムアウト / 「投票する」click 以降の
+失敗 (exit 4 = `EXIT_UNCERTAIN`。click 前の失敗は exit 1 で従来どおり `failed`) / 想定外の終了コードは、
+注文が成立した可能性があるため予定額を当日上限に計上・冪等ガード対象・連続失敗 +1 とし、
+「結果不明 (投票履歴を確認)」メールを出す。手動購入ボタン付き候補メールは送らない (二重購入防止)。
+成立有無は公式の投票履歴 / 翌日の bet_history で確認する (自動照合はしない)。
 残高警告: 投票後に確認画面から残高(ポイント+払戻金)を抽出し、合計が
 `AUTO_BUY_LOW_BALANCE_YEN` (デフォルト¥3000) 以下なら警告メール (1日1回、state で重複抑止)。
 2026-05-31 ユーザー要望で **`AUTO_BUY_ANYTIME=True` (デフォルト) = 時間帯制限なし常時発注**。

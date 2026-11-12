@@ -193,6 +193,34 @@ def load_today_executions(today: str) -> tuple[list[dict], int, list[str]]:
     return execs, failed, carried
 
 
+def load_uncertain_executions(today: str) -> list[str]:
+    """対象日 (race_date=today) の「結果不明」発注 (verdict=uncertain) のラベル。
+
+    2026-11-12 監査 指摘1・2: タイムアウト / 「投票する」click 以降の失敗で
+    注文成立を確認できなかった R。成立していれば bet_history (翌 02:30) が正なので
+    暫定精算・的中・投資には含めず、本文と件名で「結果不明」として件数だけ示す。
+    """
+    if not STATE_FILE.exists():
+        return []
+    try:
+        st = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        logging.warning("auto_buy_state 読込失敗: %s", e)
+        return []
+    if st.get("date") != today:
+        return []
+    out: list[str] = []
+    for e in st.get("executions", []):
+        if e.get("verdict") != "uncertain":
+            continue
+        if exec_race_date(e.get("timestamp"), today) != today:
+            continue
+        venue_short, _, rno = str(e.get("race", "")).rpartition("_R")
+        pc = VENUE_PC.get(venue_short)
+        out.append(f"{VENUE_JP.get(pc, venue_short or '?')} R{rno}")
+    return out
+
+
 def load_after_midnight_races(today: str) -> list[str]:
     """対象日に dynamic_scheduler が 0:00 以降の発火で登録した R (ミッドナイト後半)。
 
@@ -447,6 +475,8 @@ def evaluate_today(today: str) -> tuple[dict, int]:
         },
         # 前日開催のミッドナイト R (本日 state に入っていたが本日集計から除外)
         "carried_prev": carried,
+        # 結果不明の自動発注 (暫定精算に含めない。成立有無は bet_history が正)
+        "uncertain": load_uncertain_executions(today),
         # 00:00 時点で未発走の当日ミッドナイト R (翌晩の前日確定で計上)
         "after_midnight": load_after_midnight_races(today),
     }, n_failed
@@ -726,6 +756,10 @@ def _scope_notes(today: dict) -> list[str]:
                      f"{len(today['after_midnight'])}R "
                      f"({', '.join(today['after_midnight'])}) は本メール時点で未発走 "
                      f"→ 発注があれば結果待ち扱いで、明晩の前日確定欄で計上")
+    if today.get("uncertain"):
+        notes.append(f"自動発注 結果不明 {len(today['uncertain'])}R "
+                     f"({', '.join(today['uncertain'])}): 成立を確認できず本日の暫定集計に"
+                     f"含めない。公式の投票履歴で要確認 (成立分は明晩の前日確定欄で計上)")
     return notes
 
 
@@ -919,6 +953,8 @@ def build_subject(today_str: str, today: dict, n_failed: int) -> str:
     """件名。外形 `[autorace] 🌙 夜次 <日付> ...` は維持。"""
     head = f"[autorace] 🌙 夜次 {today_str} {day_flag(today)} "
     failed_tag = f" ⚠️失敗{n_failed}" if n_failed else ""
+    if today.get("uncertain"):
+        failed_tag += f" ❓結果不明{len(today['uncertain'])}"
     if today["n"] == 0:
         return head + "購入なし" + failed_tag
     pending_tag = f" ⏳残{today['n_pending']}" if today["n_pending"] else ""
@@ -974,7 +1010,7 @@ def main() -> int:
     prev = confirmed_summary(prev_date)
     cum = confirmed_summary(None)
 
-    if today["n"] == 0 and prev is None:
+    if today["n"] == 0 and prev is None and not today.get("uncertain"):
         logging.info("当日発注なし・前日確定なし — メールなし (契約 §1 非開催)")
         return 0
 
