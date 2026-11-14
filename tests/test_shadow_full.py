@@ -136,7 +136,7 @@ def test_wiring_weekly_retrain_and_daily_predict():
     assert ("ml.shadow_full" in [m for m, *_ in wr.OPTIONAL_STEPS])
     assert "ml.shadow_full" not in [m for m, *_ in wr.STEPS]   # 本番の必須ステップには入れない
     src = (ROOT / "daily_predict.py").read_text(encoding="utf-8")
-    i_hook = src.index("_sf.record(shadow_frames, align_features)")
+    i_hook = src.index("_sf.record(_sv, align_features)")
     assert src.index("auto_buy.run_auto_buy(candidates)") < i_hook
     block = src[src.rindex("try:", 0, i_hook):i_hook + 400]
     assert "except Exception" in block

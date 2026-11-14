@@ -225,7 +225,7 @@ def weekly_lines(res: dict | None = None) -> list[str]:
         if not res.get("n_eval_races"):
             return [f"全期間シャドー: 記録 {res['n_logged_races']} R、結果確定済みで 4 本とも揃う R はまだありません"]
         line = (f"前向きの同じ {res['n_eval_races']} R ({res['eval_date_min']}〜{res['eval_date_max']}、"
-                f"試走あり R のみ、3 着内 logloss・校正前): 本番 {res['ll_prod']:.4f} / 試走シャドー "
+                f"試走あり R のみ、3 着内 logloss・校正前): 試走なし本番系統 {res['ll_prod']:.4f} / 試走シャドー "
                 f"{res['ll_shadow']:.4f} / 全期間 {res['ll_full']:.4f} / 試走×全期間 {res['ll_full_trial']:.4f}")
         if res["n_weeks"] >= WEEKS_FOR_DECISION:
             line += f" — {res['n_weeks']} 週分たまり、判断材料が揃った (本番化は利用者の判断)"

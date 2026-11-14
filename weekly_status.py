@@ -1426,6 +1426,11 @@ def model_accuracy_lines() -> list[str]:
     """モデル精度の計器 (text/HTML 共通)。失敗しても空リストで本体を止めない。"""
     out: list[str] = []
     try:
+        from ml import production_trial
+        out.extend(production_trial.weekly_lines())   # 本番 = 試走入り/試走なし と同じ R の比較
+    except Exception as e:  # noqa: BLE001
+        out.append(f"本番モデルの系統: 取得失敗 ({type(e).__name__})")
+    try:
         from ml import shadow_trial
         out.extend(shadow_trial.weekly_lines())
     except Exception as e:  # noqa: BLE001

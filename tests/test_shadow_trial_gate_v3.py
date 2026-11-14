@@ -222,7 +222,7 @@ def test_weekly_retrain_optional_step_failure_keeps_rc(monkeypatch):
 def test_daily_predict_hook_is_guarded():
     """発火経路の追加は try/except で囲まれ、購入処理 (auto_buy) より後にある。"""
     src = (ROOT / "daily_predict.py").read_text(encoding="utf-8")
-    i_hook = src.index("_st.record(shadow_frames, align_features)")
+    i_hook = src.index("_st.record(_sv, align_features)")
     i_buy = src.index("auto_buy.run_auto_buy(candidates)")
     assert i_buy < i_hook
     block = src[src.rindex("try:", 0, i_hook):i_hook + 400]

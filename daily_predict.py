@@ -608,6 +608,22 @@ def predict_race(
             X = align_features(feat, meta)
             feat["pred"] = model.predict(X)
             feat["pred_calib"] = iso.transform(feat["pred"].values)
+            # 試走入り本番モデル (第 2 系統, ml/production_trial.py, 2026-11-14)。
+            # src/strategy_config.PRODUCTION_USE_TRIAL がオフ (既定) なら何もしない = 従来どおり。
+            # オンで R の試走が全車揃えば R 単位で pred / pred_calib を試走入り系統の値に置き換える。
+            # 試走欠け・ファイル無し/破損・特徴量不足・例外は試走なしの値のまま (フォールバック)。
+            # EV・順位・候補は下の従来の式のまま (pred / pred_calib の出どころだけが変わる)。
+            try:
+                from ml import production_trial as _pt
+                feat = _pt.apply_trial_model(feat, align_features)
+                if feat.attrs.get("model_used"):
+                    logging.info("predict_race(%d, %s, %d): model=%s%s", place_code, race_date,
+                                 race_no, feat.attrs["model_used"],
+                                 (f" (フォールバック: {feat.attrs['fallback_reason']})"
+                                  if feat.attrs.get("fallback_reason") else ""))
+            except Exception as e:  # noqa: BLE001 — 切替の失敗で本番 (試走なし) を止めない
+                logging.warning("predict_race(%d, %s, %d): 試走入り切替の失敗 (試走なしのまま): %s",
+                                place_code, race_date, race_no, e)
             # 異常 odds を NaN 化 (2 パターン)。
             # 異常時は NaN にすることで near-miss retry に再評価させる。
             #   1. max > 50: min=1.0/max=183 のセンチネル
@@ -1702,9 +1718,20 @@ def main():
 
         # 試走ありシャドー (ml/shadow_trial.py): 購入処理の後に、本番の予測と並べて記録する。
         # 記録のみ。本番の pred / pred_calib / EV / 発注には一切使わない。失敗は握りつぶす。
+        # 試走入りが本番に使われた R は、シャドー記録の pred_prod が「試走なし本番」の意味を保つよう
+        # 試走なしの値に戻した写しを渡す。どちらを使ったかと両系統の値は model_used_preds.csv へ。
+        try:
+            from ml import production_trial as _pt
+            _sv = [_pt.notrial_view(f) for f in shadow_frames]
+            _ur = _pt.record_used(shadow_frames)
+            if _ur.get("n_races"):
+                logger.info("[production_trial] %d R 記録 (%s)", _ur["n_races"], _ur["status"])
+        except Exception as e:  # noqa: BLE001
+            _sv = shadow_frames
+            logger.warning("[production_trial] 記録失敗 (本番には影響なし): %s", e)
         try:
             from ml import shadow_trial as _st
-            _sr = _st.record(shadow_frames, align_features)
+            _sr = _st.record(_sv, align_features)
             logger.info("[shadow_trial] %d R 記録 (%s, %.0f ms)",
                         _sr["n_races"], _sr["status"], _sr["elapsed_ms"])
         except Exception as e:  # noqa: BLE001
@@ -1712,7 +1739,7 @@ def main():
         # 全期間 (直近まで) で学習したシャドー 2 本 (ml/shadow_full.py, 2026-11-13)。同じく記録のみ。
         try:
             from ml import shadow_full as _sf
-            _sf_r = _sf.record(shadow_frames, align_features)
+            _sf_r = _sf.record(_sv, align_features)
             logger.info("[shadow_full] %d R 記録 (%s, %.0f ms)",
                         _sf_r["n_races"], _sf_r["status"], _sf_r["elapsed_ms"])
         except Exception as e:  # noqa: BLE001

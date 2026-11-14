@@ -262,9 +262,9 @@ def weekly_lines(res: dict | None = None) -> list[str]:
              f"{res['trial_ok_rate'] * 100:.1f}% ({c.get('ok', 0)}/{res['n_logged_races']} R、"
              f"一部欠け {c.get('partial', 0)} R・なし {c.get('none', 0)} R)"]
         if res.get("n_eval_races"):
-            line = (f"試走ありシャドー vs 本番 (同じ {res['n_eval_races']} R / "
+            line = (f"試走ありシャドー vs 試走なし本番系統 (同じ {res['n_eval_races']} R / "
                     f"{res['eval_date_min']}〜{res['eval_date_max']}、3 着内の logloss): "
-                    f"本番 {res['ll_prod']:.4f} → シャドー {res['ll_shadow']:.4f} "
+                    f"試走なし系統 {res['ll_prod']:.4f} → シャドー {res['ll_shadow']:.4f} "
                     f"(差 {res['ll_shadow'] - res['ll_prod']:+.4f}、低いほど良い。どちらも校正前)")
             if res["n_weeks"] >= WEEKS_FOR_DECISION:
                 line += f" — {res['n_weeks']} 週分たまり、本番化の判断材料が揃った (判断は利用者)"
@@ -272,7 +272,7 @@ def weekly_lines(res: dict | None = None) -> list[str]:
                 line += f" — {res['n_weeks']}/{WEEKS_FOR_DECISION} 週"
             L.append(line)
         else:
-            L.append("試走ありシャドー vs 本番: 結果確定済みで比較できる R はまだありません")
+            L.append("試走ありシャドー vs 試走なし本番系統: 結果確定済みで比較できる R はまだありません")
         return L
     except Exception as e:  # noqa: BLE001
         return [f"試走ありシャドー: 集計失敗 ({type(e).__name__})"]

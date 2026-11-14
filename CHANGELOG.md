@@ -1,5 +1,29 @@
 # CHANGELOG
 
+## 2026-11-14 — 試走入り本番モデル (第 2 系統) と切替スイッチ (既定オフ = 従来どおり)
+
+利用者の指示「オートは試走も入れて」。親が差分を確認してからスイッチをオンにする。
+- **`ml/production_trial.py` 新設**: 試走入り系統を本番と同じ手順 (同じデータ・train_full_v3 の分割・パラメータ・
+  walk-forward OOF に isotonic・採用ゲート v3 = 自系統の現役と比較・複勝 ROI 拒否権) で学習し、別ファイル群
+  `data/production_trial_{model.lgb,calib.pkl,meta.json}` に保存 (履歴 `data/retrain_history_trial.csv`、
+  walk-forward `data/walkforward_predictions_trial_top3.parquet`)。特徴量は試走シャドーと同じ (試走関連 6 列を戻す、
+  ai_expect_code は除外のまま)。既存の `data/production_*` (試走なし) は触らず、フォールバックとして使い続ける。
+  初回学習 (2026-11-14): walk-forward 337 秒 + 学習・校正 17 秒。
+- **切替スイッチ** `src/strategy_config.PRODUCTION_USE_TRIAL` (既定 **False**)。オフの間は推論で何もしない。
+- **推論** (`daily_predict.predict_race`): 校正の直後・EV の前で、オンかつ R の試走が全車揃うときだけ R 単位で
+  pred / pred_calib を試走入り系統の値に置き換える。試走欠け・ファイル無し/破損・特徴量不足・予測例外・NaN は
+  R 単位で試走なしのまま (理由を 1 行ログ)。EV・順位・候補の式は不変 (pred_calib の出どころだけ)。
+  どちらを使ったかと両系統の値は購入処理の後に `data/model_used_preds.csv` (新規) へ。既存 CSV の列は変えない。
+  シャドー記録 (`shadow_trial_preds.csv` / `shadow_full_preds.csv`) の pred_prod は「試走なし系統」の値を渡し続け、
+  列の意味を保つ。週次メールの計器に「本番モデル = 試走入り/試走なし」と同じ R の対数損失を 1 行。
+- **週次再学習**: 任意ステップに `ml.production_trial` (必須 3 ステップの後)。失敗しても試走なし系統と rc に影響しない。
+  試走なし系統が失敗したら従来どおり全体が失敗 (試走入りも走らない)。
+- **切替の妥当性 (比較窓 2026-08-05〜11-06、14,762 行 / 2,007 R、両系統とも学習終端 5/4)**: 3 着内 logloss
+  試走なし 0.5090 → 試走入り 0.5003 (校正後)、AUC 0.8182 → 0.8239。校正は帯ごとに ±0.02 以内。
+  買い目の見込み (発火時の複勝オッズ × 0.9143、top1 EV≥1.50): 1,925 R で候補 312 → 297 (−4.8%)、
+  05-05 以降 3,856 R で 609 → 600 (−1.5%)。top1 の入れ替わり 約 10%。発注件数の大きな増減はない見込み。
+- tests: `tests/test_production_trial.py` (14 件)。既存 2 件の配線チェックを新しい呼び方に合わせた。
+
 ## [Unreleased] - 発火のリードを全場 4 分前に (2026-11-14)
 
 ### Changed
