@@ -205,3 +205,111 @@ def test_daily_predict_wiring():
     assert "except Exception" in blk
     i_rec = src.index("_pt.record_used(shadow_frames)")
     assert src.index("auto_buy.run_auto_buy(candidates)") < i_rec   # 記録は購入処理の後
+
+
+# ---------------------------------------------------------------- 買い候補の並行比較 (2026-11-15)
+def _bc_files(tmp_path, races):
+    """races: [(race_no, {car: (p_trial, p_notrial)}, {car: (omin, omax)}, 払戻 {car: 円} or None)]
+    確率は raw = 校正後 とする (単純化)。払戻 None = 結果未確定。"""
+    log, snap, pay = [], [], []
+    for rn, probs, odds, refund in races:
+        for car, (pt_, pn_) in probs.items():
+            log.append({"race_date": "2026-11-15", "place_code": 3, "race_no": rn, "car_no": car,
+                        "model_used": "trial", "fallback_reason": "", "pred_trial": pt_, "pred_calib_trial": pt_,
+                        "pred_notrial": pn_, "pred_calib_notrial": pn_, "trial_status": "ok",
+                        "trial_model_trained_at": "", "captured_at": "x"})
+            lo, hi = odds[car]
+            snap.append({"race_date": "2026-11-15", "place_code": 3, "race_no": rn, "car_no": car,
+                         "place_odds_min": lo, "place_odds_max": hi, "captured_at": "2026-11-15T10:00:00"})
+        if refund is not None:
+            pay.append({"race_date": "2026-11-15", "place_code": 3, "race_no": rn, "bet_type": "fns",
+                        "car_no_1": 99, "refund": 100.0})        # 確定の印 (他の車の払戻は下で足す)
+            for car, y in refund.items():
+                pay.append({"race_date": "2026-11-15", "place_code": 3, "race_no": rn, "bet_type": "fns",
+                            "car_no_1": car, "refund": y})
+    pd.DataFrame(log).to_csv(tmp_path / "u.csv", index=False)
+    pd.DataFrame(snap).to_csv(tmp_path / "s.csv", index=False)
+    pd.DataFrame(pay or [{"race_date": "", "place_code": 0, "race_no": 0, "bet_type": "x",
+                          "car_no_1": 0, "refund": 0}]).to_csv(tmp_path / "p.csv", index=False)
+    return dict(log_path=tmp_path / "u.csv", snap_path=tmp_path / "s.csv", payouts_path=tmp_path / "p.csv",
+                ledger_path=tmp_path / "none.jsonl", thr=1.5, discount=1.0)
+
+
+def test_buy_compare_five_groups_and_diff(tmp_path):
+    # EV = p x (min+max)/2。しきい値 1.5。車1 の平均オッズ 3.0
+    o = {1: (2.0, 4.0), 2: (1.0, 1.0)}
+    races = [
+        # R1: 両方 車1 を本命 (0.6 → EV 1.8)。的中 (払戻 300)
+        (1, {1: (0.6, 0.6), 2: (0.3, 0.3)}, o, {1: 300.0}),
+        # R2: 試走入りだけが買う (入り 0.6 → 1.8 / なし 0.4 → 1.2)。車1 は払戻なし (3 着外)
+        (2, {1: (0.6, 0.4), 2: (0.3, 0.3)}, o, {2: 100.0}),
+        # R3: 試走なしだけが買う (なし 0.7 → 2.1 / 入り 0.4 → 1.2)。車1 的中 200
+        (3, {1: (0.4, 0.7), 2: (0.3, 0.3)}, o, {1: 200.0}),
+        # R4: どちらも買わない
+        (4, {1: (0.3, 0.3), 2: (0.2, 0.2)}, o, {1: 150.0}),
+        # R5: 試走入りが買う候補だが結果未確定 → 点数には入るが回収率・損益差には入らない
+        (5, {1: (0.9, 0.3), 2: (0.1, 0.1)}, o, None),
+    ]
+    r = pt.evaluate_buy_compare(**_bc_files(tmp_path, races))
+    assert r["n_compare"] == 5 and abs(r["same_top_rate"] - 1.0) < 1e-9
+    assert (r["trial"]["n"], r["trial"]["n_settled"]) == (3, 2)           # R1, R2, R5 (未確定)
+    assert (r["notrial"]["n"], r["notrial"]["n_settled"]) == (2, 2)       # R1, R3
+    assert (r["both"]["n"], r["both"]["n_same_car"]) == (1, 1)
+    assert (r["only_trial"]["n"], r["only_trial"]["n_settled"]) == (2, 1)  # R2, R5
+    assert r["only_notrial"]["n"] == 1                                     # R3
+    assert abs(r["trial"]["roi"] - 1.5) < 1e-9                             # (300 + 0) / 200
+    assert abs(r["notrial"]["roi"] - 2.5) < 1e-9                           # (300 + 200) / 200
+    # 損益差: R1 0、R2 入り -100、R3 なし +100 → 入り - なし = -100 - 100 = -200 円
+    assert abs(r["diff"]["yen"] - (-200.0)) < 1e-9 and r["diff"]["n_races"] == 3
+
+
+def test_buy_compare_excludes_anomalous_odds_and_ev_cap(tmp_path):
+    p = {1: (0.6, 0.6), 2: (0.3, 0.3)}
+    races = [
+        (1, p, {1: (2.0, 51.0), 2: (1.0, 1.0)}, {1: 300.0}),          # max > 50
+        (2, p, {1: (1.0, 21.0), 2: (1.0, 1.0)}, {1: 300.0}),          # max/min > 20
+        (3, p, {1: (np.nan, np.nan), 2: (1.0, 1.0)}, {1: 300.0}),     # 本命のオッズ未公開
+        (4, p, {1: (30.0, 40.0), 2: (1.0, 1.0)}, {1: 300.0}),         # EV 21 > 10 (auto_buy の異常ガード)
+        (5, p, {1: (3.0, 3.0), 2: (1.0, 1.0)}, {1: 300.0}),           # 通常 (EV 1.8)
+    ]
+    r = pt.evaluate_buy_compare(**_bc_files(tmp_path, races))
+    assert r["trial"]["n"] == 1 and r["notrial"]["n"] == 1 and r["n_compare"] == 5
+
+
+def test_buy_compare_missing_probs_excluded_and_ledger(tmp_path):
+    p, od = {1: (0.6, 0.6), 2: (0.3, 0.3)}, {1: (3.0, 3.0), 2: (1.0, 1.0)}
+    kw = _bc_files(tmp_path, [(1, p, od, {1: 300.0}), (2, p, od, {1: 300.0})])
+    lg = pd.read_csv(kw["log_path"])
+    lg.loc[(lg.race_no == 2) & (lg.car_no == 2), "pred_trial"] = np.nan      # R2 は試走入りの確率が欠ける
+    lg.to_csv(kw["log_path"], index=False)
+    led = tmp_path / "led.jsonl"
+    rows = [{"verdict": "executed", "race_date": "2026-11-15", "place_code": 3, "race_no": 1,
+             "bets": "複勝 1号 ¥100 / 三連複 1=2=3 ¥100"},
+            {"verdict": "executed", "race_date": "2026-11-15", "place_code": 3, "race_no": 9,
+             "bets": "複勝 5号 ¥100"}]
+    led.write_text("\n".join(json.dumps(x, ensure_ascii=False) for x in rows) + "\n", encoding="utf-8")
+    kw["ledger_path"] = led
+    r = pt.evaluate_buy_compare(**kw)
+    assert r["n_logged"] == 2 and r["n_compare"] == 1
+    assert r["ledger"]["n_match"] == 1 and r["ledger"]["n_ledger"] == 1      # 対象外の R9 は数えない
+
+
+def test_buy_compare_lines(tmp_path, monkeypatch):
+    # 記録ゼロ (ファイルなし) → 行なし
+    assert pt.buy_compare_lines(pt.evaluate_buy_compare(log_path=tmp_path / "nope.csv")) == []
+    o = {1: (2.0, 4.0), 2: (1.0, 1.0)}
+    p = {1: (0.6, 0.6), 2: (0.3, 0.3)}
+    L = pt.buy_compare_lines(pt.evaluate_buy_compare(**_bc_files(tmp_path, [(1, p, o, {1: 300.0})])))
+    assert len(L) == 3 and "小標本" in L[0] and "試走入り 1 点" in L[0] and "紙上の記録" in L[-1]
+    # 結果未確定: 件数だけ
+    L2 = pt.buy_compare_lines(pt.evaluate_buy_compare(**_bc_files(tmp_path, [(1, p, o, None)])))
+    assert "回収率" not in L2[0] and "未確定" in L2[1]
+    # 集計が例外でも weekly_lines は止まらない
+    monkeypatch.setattr(pt, "use_trial_enabled", lambda: True)
+    monkeypatch.setattr(pt, "evaluate_buy_compare", lambda *a, **k: 1 / 0)
+    ev = {"n_races": 1, "n_trial": 1, "n_fallback": 0, "date_min": "a", "date_max": "b"}
+    out = pt.weekly_lines(ev, buy={})
+    assert "本番モデル" in out[0] and len(out) >= 1
+    monkeypatch.setattr(pt, "evaluate", lambda *a, **k: ev)
+    out2 = pt.weekly_lines()
+    assert "本番モデル" in out2[0] and "集計失敗" in out2[-1]

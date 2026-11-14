@@ -361,10 +361,215 @@ def evaluate(log_path: Path | None = None, results_path: Path | None = None) -> 
     return res
 
 
-def weekly_lines(res: dict | None = None) -> list[str]:
+# ---------------------------------------------------------------- 買い候補の並行比較 (報告のみ)
+# 本番の買い候補の定義 (読み取り元。ここでは再現するだけで発注経路には触らない):
+#   daily_predict.predict_race (627-651 行): 異常オッズ (max>50 または max/min>20) は EV=NaN、
+#     EV = pred_calib × (odds_min+odds_max)/2 × FIRE_EV_DISCOUNT、順位は raw pred の rank(method="min")
+#   daily_predict.main (1521-1534 行): 順位 1 の車 (同率は先頭行) の EV >= --thr (既定 1.50) だけが候補
+#   auto_buy.check_guards (306 行): EV > EV_ANOMALY_CAP (10.0) は発注しない
+BUY_THR = 1.50
+EV_ANOMALY_CAP = 10.0
+ODDS_MAX_CAP = 50.0
+ODDS_RATIO_CAP = 20.0
+SMALL_SAMPLE_N = 30
+_BOOT_N = 4000
+LEDGER_PATH = DATA / "auto_buy_ledger.jsonl"
+
+
+def _boot_ci(x: np.ndarray, stat) -> tuple[float, float]:
+    """レース単位ブートストラップの 95% 区間 (stat: 行列の行ごとの統計)。固定 seed。"""
+    x = np.asarray(x, dtype=float)
+    if len(x) < 2:
+        return (float("nan"), float("nan"))
+    rng = np.random.default_rng(0)
+    idx = rng.integers(0, len(x), (_BOOT_N, len(x)))
+    v = stat(x[idx])
+    return (float(np.percentile(v, 2.5)), float(np.percentile(v, 97.5)))
+
+
+def _top1_candidates(lg: pd.DataFrame, pred_col: str, calib_col: str, thr: float, discount: float) -> pd.DataFrame:
+    """R ごとに本番と同じ手順で買い候補 (車 1 台) を作る。index = race キー、列 car_no / ev。"""
+    k = ["race_date", "place_code", "race_no"]
+    d = lg.copy()
+    d["_rank"] = d.groupby(k)[pred_col].rank(method="min", ascending=False)
+    omin, omax = d["place_odds_min"].astype(float), d["place_odds_max"].astype(float)
+    anomalous = (omax > ODDS_MAX_CAP) | ((omin > 0) & (omax / omin.where(omin > 0) > ODDS_RATIO_CAP))
+    d["ev"] = (d[calib_col].astype(float) * (omin + omax) / 2 * discount).where(~anomalous)
+    top = d[d["_rank"] == 1].groupby(k, sort=False).head(1)      # 同率 1 位は先頭行 (本番の iloc[0])
+    top = top[top["ev"].notna() & (top["ev"] >= thr) & (top["ev"] <= EV_ANOMALY_CAP)]
+    return top.set_index(k)[["car_no", "ev"]]
+
+
+def _ledger_match(cand: pd.DataFrame, ledger_path: Path, races: set) -> dict | None:
+    """試走入りの再構成した買い候補と、台帳 (executed の複勝) の突き合わせ。書式が合わなければ None。"""
+    import re
+    if not ledger_path.exists():
+        return None
+    ex = {}
+    for line in ledger_path.read_text(encoding="utf-8").splitlines():
+        try:
+            r = json.loads(line)
+            if r.get("verdict") != "executed" or not r.get("race_date"):
+                continue
+            m = re.search(r"複勝\s*(\d+)", str(r.get("bets", "")))
+            if m:
+                ex[(str(r["race_date"])[:10], int(r["place_code"]), int(r["race_no"]))] = int(m.group(1))
+        except Exception:  # noqa: BLE001
+            continue
+    ex = {kk: v for kk, v in ex.items() if kk in races}          # 比較の対象 R (記録開始前の R は除く)
+    if not ex:
+        return None
+    mine = {(str(i[0])[:10], int(i[1]), int(i[2])): int(c) for i, c in cand["car_no"].items()}
+    return {"n_ledger": len(ex), "n_recon": len(mine),
+            "n_match": sum(1 for kk, v in ex.items() if mine.get(kk) == v),
+            "n_ledger_not_recon": sum(1 for kk in ex if kk not in mine),
+            "n_recon_not_ledger": sum(1 for kk in mine if kk not in ex)}
+
+
+def evaluate_buy_compare(log_path: Path | None = None, snap_path: Path | None = None,
+                         payouts_path: Path | None = None, ledger_path: Path | None = None,
+                         thr: float | None = None, discount: float | None = None) -> dict:
+    """試走入り / 試走なし それぞれで判定していたときの買い候補 (複勝 100 円) と回収率の前向き比較。
+
+    読み取り専用。実際に買うのは本番側 (試走入り) で、ここは紙上の記録。両系統の確率がそろい
+    発火時オッズ (odds_snapshots の最初の取得) の記録がある R だけが対象 (n_compare)。払戻は payouts の fns。
+    確定 (fns 行がある) していない R の候補は点数だけに数え、回収率・損益には入れない。
+    """
+    if discount is None:
+        from src.strategy_config import FIRE_EV_DISCOUNT as discount
+    thr = BUY_THR if thr is None else thr
+    p = Path(log_path or USED_LOG)
+    res: dict = {"n_logged": 0}
+    if not p.exists():
+        return res
+    k = ["race_date", "place_code", "race_no"]
+    lg = pd.read_csv(p).drop_duplicates(k + ["car_no"], keep="first")
+    lg["race_date"] = lg["race_date"].astype(str).str[:10]
+    res["n_logged"] = int(lg.drop_duplicates(k).shape[0])
+    if not res["n_logged"]:
+        return res
+    pc = ["pred_trial", "pred_calib_trial", "pred_notrial", "pred_calib_notrial"]
+    lg = lg[lg[pc].notna().all(axis=1).groupby([lg[c] for c in k]).transform("all")]   # 全車で両系統の確率あり
+    res["n_both_probs"] = int(lg.drop_duplicates(k).shape[0])
+    sp = Path(snap_path or (DATA / "odds_snapshots.csv"))
+    if not sp.exists() or not res["n_both_probs"]:
+        res["n_compare"] = 0
+        return res
+    s = pd.read_csv(sp, usecols=k + ["car_no", "place_odds_min", "place_odds_max", "captured_at"])
+    s["race_date"] = s["race_date"].astype(str).str[:10]
+    s = s.sort_values("captured_at").drop_duplicates(k + ["car_no"], keep="first")
+    m = lg.merge(s[k + ["car_no", "place_odds_min", "place_odds_max"]], on=k + ["car_no"], how="left",
+                 indicator=True)
+    # 発火時の snapshot がある R だけ。車ごとのオッズ欠け (未公開) は本命の EV が NaN = 買わない (本番と同じ)
+    m = m[(m["_merge"] == "both").groupby([m[c] for c in k]).transform("any")].drop(columns="_merge")
+    res["n_compare"] = int(m.drop_duplicates(k).shape[0])
+    if not res["n_compare"]:
+        return res
+    m = m.reset_index(drop=True)
+    res["date_min"], res["date_max"] = str(m["race_date"].min()), str(m["race_date"].max())
+    ct = _top1_candidates(m, "pred_trial", "pred_calib_trial", thr, discount)
+    cn = _top1_candidates(m, "pred_notrial", "pred_calib_notrial", thr, discount)
+    # 本命 (raw pred の 1 位) が同じ R の割合
+    def first_top(col):
+        r = m.groupby(k)[col].rank(method="min", ascending=False)
+        return m[r == 1].groupby(k, sort=False).head(1).set_index(k)["car_no"]
+    ft, fn = first_top("pred_trial"), first_top("pred_notrial")
+    res["same_top_rate"] = float((ft == fn.reindex(ft.index)).mean())
+    # 払戻 (確定した R だけ)
+    pp = Path(payouts_path or (DATA / "payouts.csv"))
+    settled: set = set()
+    refund: dict = {}
+    if pp.exists():
+        f = pd.read_csv(pp, usecols=k + ["bet_type", "car_no_1", "refund"], low_memory=False)
+        f = f[f["bet_type"] == "fns"].copy()
+        f["race_date"] = f["race_date"].astype(str).str[:10]
+        settled = {(a, int(b), int(c)) for a, b, c in f[k].drop_duplicates().itertuples(index=False, name=None)}
+        for r in f.itertuples(index=False):
+            if pd.notna(r.car_no_1) and pd.notna(r.refund):
+                refund[(r.race_date, int(r.place_code), int(r.race_no), int(r.car_no_1))] = float(r.refund)
+
+    def key(i):
+        return (str(i[0])[:10], int(i[1]), int(i[2]))
+
+    def pnl(cand, idx):            # 100 円あたりの損益 (払戻/100 − 1)。未確定は NaN
+        return np.array([refund.get(key(i) + (int(cand.loc[i, "car_no"]),), 0.0) / 100.0 - 1.0
+                         if key(i) in settled else np.nan for i in idx], dtype=float)
+
+    def stat(cand, idx):
+        done = pnl(cand, idx)
+        done = done[~np.isnan(done)]
+        o = {"n": int(len(idx)), "n_settled": int(len(done))}
+        if len(done):
+            ret = done + 1.0
+            lo, hi = _boot_ci(ret, lambda a: a.mean(axis=1))
+            o.update({"hit": float((ret > 0).mean()), "roi": float(ret.mean()), "lo": lo, "hi": hi,
+                      "profit_yen": float(done.sum() * 100)})
+        return o
+
+    both = ct.index.intersection(cn.index)
+    res["trial"], res["notrial"] = stat(ct, ct.index), stat(cn, cn.index)
+    res["both"] = stat(ct, both)
+    res["both"]["n_same_car"] = int((ct.loc[both, "car_no"] == cn.loc[both, "car_no"]).sum())
+    res["only_trial"] = stat(ct, ct.index.difference(cn.index))
+    res["only_notrial"] = stat(cn, cn.index.difference(ct.index))
+    # 損益の差 (試走入り − 試走なし): 確定した R のうち、どちらかが買う R の対比較
+    allr = ct.index.union(cn.index)
+    a, b = pd.Series(0.0, index=allr), pd.Series(0.0, index=allr)
+    a.loc[ct.index], b.loc[cn.index] = pnl(ct, ct.index), pnl(cn, cn.index)
+    d = (a - b).to_numpy()
+    d = d[~np.isnan(d)]
+    if len(d):
+        lo, hi = _boot_ci(d, lambda x: x.sum(axis=1) * 100)
+        res["diff"] = {"yen": float(d.sum() * 100), "lo": lo, "hi": hi, "n_races": int(len(d))}
+    led = _ledger_match(ct, Path(ledger_path or LEDGER_PATH),
+                        {key(i) for i in m.drop_duplicates(k).set_index(k).index})
+    if led:
+        res["ledger"] = led
+    return res
+
+
+def _fmt_group(g: dict) -> str:
+    s = f"{g['n']} 点"
+    if g["n_settled"] != g["n"]:
+        s += f" (確定 {g['n_settled']})"
+    if g["n_settled"]:
+        s += f" 回収率 {g['roi'] * 100:.0f}% [{g['lo'] * 100:.0f}〜{g['hi'] * 100:.0f}]"
+    return s
+
+
+def buy_compare_lines(bc: dict | None = None) -> list[str]:
+    """週次メール用 (2〜3 行)。記録ゼロなら行なし。標本が小さい間は小標本と明記。失敗しても例外は出さない。"""
+    try:
+        bc = bc if bc is not None else evaluate_buy_compare()
+        if not bc.get("n_logged"):
+            return []
+        if not bc.get("n_compare"):
+            return [f"買い候補の並行比較: 記録 {bc['n_logged']} R、両系統の確率とオッズがそろう R はまだありません"]
+        t, n = bc["trial"], bc["notrial"]
+        small = max(t["n"], n["n"]) < SMALL_SAMPLE_N
+        out = [f"買い候補の並行比較 (同じ {bc['n_compare']} R、本命一致 {bc['same_top_rate'] * 100:.0f}%)"
+               f"{' ※小標本' if small else ''}: 試走入り {_fmt_group(t)} / 試走なし {_fmt_group(n)}"]
+        if "diff" not in bc:
+            out.append("  (結果未確定のため片方だけの回収率・損益差は未算出)")
+        else:
+            dd = bc["diff"]
+            out.append(f"  片方だけ: 入りのみ {_fmt_group(bc['only_trial'])} / なしのみ {_fmt_group(bc['only_notrial'])}、"
+                       f"両方 {bc['both']['n']} 点 (同じ車 {bc['both']['n_same_car']})、"
+                       f"損益差 (入り−なし、100 円/点) {dd['yen']:+.0f} 円 [{dd['lo']:+.0f}〜{dd['hi']:+.0f}]")
+        tail = "実際に買うのは試走入り、試走なしは紙上の記録"
+        if bc.get("ledger"):
+            tail += f" (再構成と台帳の一致 {bc['ledger']['n_match']}/{bc['ledger']['n_ledger']} 件)"
+        out.append("  " + tail)
+        return out
+    except Exception as e:  # noqa: BLE001
+        return [f"買い候補の並行比較: 集計失敗 ({type(e).__name__})"]
+
+
+def weekly_lines(res: dict | None = None, buy: dict | None = None) -> list[str]:
     try:
         if not use_trial_enabled():
             return ["本番モデル = 試走なし (PRODUCTION_USE_TRIAL=False。試走入り系統は学習のみ)"]
+        run_buy = res is None or buy is not None   # res を直接渡す呼び方 (テスト) では並行比較を足さない
         res = res if res is not None else evaluate()
         if not res.get("n_races"):
             return ["本番モデル = 試走入り (PRODUCTION_USE_TRIAL=True)、記録はまだありません"]
@@ -373,7 +578,7 @@ def weekly_lines(res: dict | None = None) -> list[str]:
         if res.get("n_eval_races"):
             s += (f" / 同じ {res['n_eval_races']} R の 3 着内 logloss (校正後) 試走入り {res['ll_trial']:.4f}"
                   f" ・ 試走なし {res['ll_notrial']:.4f}")
-        return [s]
+        return [s] + (buy_compare_lines(buy) if run_buy else [])
     except Exception as e:  # noqa: BLE001
         return [f"本番モデルの系統: 集計失敗 ({type(e).__name__})"]
 
