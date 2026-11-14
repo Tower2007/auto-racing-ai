@@ -119,8 +119,8 @@ def test_main_schedule_run_registers_normally(env):
     names = [n for n, _ in env.created]
     assert names == ["AutoraceDyn_iizuka_R1", "AutoraceDyn_iizuka_R2",
                      "AutoraceDyn_iizuka_R3"]
-    # 日跨ぎ R3 (24:04) は翌日 00:01 発火 (飯塚 3 分前)
-    assert env.created[2][1] == dt.datetime(2026, 11, 13, 0, 1)
+    # 日跨ぎ R3 (24:04) は翌日 00:00 発火 (飯塚も 4 分前。2026-11-14 に 3 分前から変更)
+    assert env.created[2][1] == dt.datetime(2026, 11, 13, 0, 0)
     mk = _marker(env)
     assert mk["date"] == "2026-11-12" and mk["n_registered"] == 3
     assert env.notified == []
@@ -133,8 +133,8 @@ def test_rescue_uses_alt_name_on_access_denied(env):
     env.deny = {"AutoraceDyn_iizuka_R1", "AutoraceDyn_iizuka_R2"}
     # R1: 前日の同名タスク (時刻違い) → 別名、R2: 本日の同時刻で登録済み → 既存
     env.existing = {
-        "AutoraceDyn_iizuka_R1": dt.datetime(2026, 11, 11, 21, 25),
-        "AutoraceDyn_iizuka_R2": dt.datetime(2026, 11, 12, 21, 51),
+        "AutoraceDyn_iizuka_R1": dt.datetime(2026, 11, 11, 21, 24),
+        "AutoraceDyn_iizuka_R2": dt.datetime(2026, 11, 12, 21, 50),
     }
     assert ds.main() == 0
     assert [n for n, _ in env.alt] == ["AutoraceDyn_iizuka_R1_alt"]
@@ -163,7 +163,7 @@ def test_rescue_failure_exits_nonzero_and_notifies(env):
 
 def test_past_races_are_not_targets(env):
     """発走済み (発火時刻が過ぎた) R は登録対象外・失敗にも数えない。"""
-    _at(env, 22, 0)      # R1 21:25 / R2 21:51 発火は過去、R3 (翌 00:01) のみ
+    _at(env, 22, 0)      # R1 21:24 / R2 21:50 発火は過去、R3 (翌 00:00) のみ
     assert ds.main() == 0
     assert [n for n, _ in env.created] == ["AutoraceDyn_iizuka_R3"]
     assert env.notified == []
