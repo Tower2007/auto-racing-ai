@@ -67,6 +67,8 @@ def trial_files(tmp_path, monkeypatch):
     monkeypatch.setattr(pt, "MODEL_PATH", mp)
     monkeypatch.setattr(pt, "CALIB_PATH", cp)
     monkeypatch.setattr(pt, "META_PATH", jp)
+    # 古さの判定は再学習の履歴も見るので、実データの履歴を読まないよう空の場所へ向ける
+    monkeypatch.setattr(pt, "HISTORY_PATH", tmp_path / "retrain_history_trial.csv")
     pt._CACHE.clear()
     return mp, cp, jp
 
@@ -302,11 +304,35 @@ def test_trial_meta_unreadable_falls_back(trial_files):
     pd.testing.assert_frame_equal(out[["pred", "pred_calib"]], before[["pred", "pred_calib"]])
 
 
-def test_trial_model_age_days():
+def test_trial_model_age_days(tmp_path):
     now = pd.Timestamp("2026-11-30T12:00:00").to_pydatetime()
-    assert pt.trial_model_age_days({"trained_at": "2026-11-15T03:07:35"}, now=now) == pytest.approx(15.37, abs=0.01)
-    assert pt.trial_model_age_days({"trained_at": "bad"}, now=now) is None
-    assert pt.trial_model_age_days(None, now=now) is None
+    none = tmp_path / "no_history.csv"
+    assert pt.trial_model_age_days({"trained_at": "2026-11-15T03:07:35"}, now=now,
+                                   history_path=none) == pytest.approx(15.37, abs=0.01)
+    assert pt.trial_model_age_days({"trained_at": "bad"}, now=now, history_path=none) is None
+    assert pt.trial_model_age_days(None, now=now, history_path=none) is None
+
+
+def test_age_counts_from_last_retrain_run_even_if_rejected(tmp_path):
+    """ゲートで不採用 (NG) が続いて現役モデルが残っているのは正常。再学習が走っていれば古い扱いにしない。"""
+    now = pd.Timestamp("2026-11-30T12:00:00").to_pydatetime()
+    h = tmp_path / "retrain_history_trial.csv"
+    h.write_text("timestamp,verdict,reason\n2026-11-15T03:07:35,OK,x\n2026-11-29T03:05:00,NG,y\n", encoding="utf-8")
+    assert pt.trial_model_age_days({"trained_at": "2026-11-15T03:07:35"}, now=now,
+                                   history_path=h) == pytest.approx(1.37, abs=0.01)
+    # 履歴が壊れていても学習日だけで判定する
+    h.write_text("timestamp,verdict\nbad,NG\n", encoding="utf-8")
+    assert pt.trial_model_age_days({"trained_at": "2026-11-15T03:07:35"}, now=now,
+                                   history_path=h) == pytest.approx(15.37, abs=0.01)
+
+
+def test_rejected_but_recent_retrain_keeps_trial_model(trial_files, tmp_path):
+    _mp, _cp, jp = trial_files
+    _set_trained_at(jp, (pd.Timestamp.now() - pd.Timedelta(days=pt.TRIAL_MAX_AGE_DAYS + 6)).isoformat(timespec="seconds"))
+    recent = (pd.Timestamp.now() - pd.Timedelta(days=2)).isoformat(timespec="seconds")
+    pt.HISTORY_PATH.write_text(f"timestamp,verdict,reason\n{recent},NG,gate\n", encoding="utf-8")
+    out = pt.apply_trial_model(_race(), _align, enabled=True)
+    assert out.attrs["model_used"] == "trial"
 
 
 def test_weekly_lines_show_trial_trained_date(trial_files, monkeypatch):

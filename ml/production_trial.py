@@ -55,18 +55,44 @@ _CACHE: dict = {}
 
 # 試走入りモデルの古さのガード (2026-11-15)。学習日 (meta の trained_at) からこの日数を超えたら、
 # 推論は試走なしへフォールバックする。15 日 = 週次再学習 (日曜 03:00) を 2 回続けて落とした状態。
+# 経過日数は「学習日」と「再学習の最終実行 (不採用の回も含む)」の新しい方から数える。
 TRIAL_MAX_AGE_DAYS = 15
 
 
-def trial_model_age_days(meta: dict | None, now: dt.datetime | None = None) -> float | None:
-    """meta の trained_at からの経過日数。meta が無い・日付が無い/解釈できないなら None。"""
+def _last_retrain_run_ts(path: Path | None = None) -> dt.datetime | None:
+    """試走入り系統の再学習が最後に走った時刻 (採否を問わない。retrain_history_trial.csv の最終行)。"""
+    try:
+        p = Path(path or HISTORY_PATH)
+        if not p.exists():
+            return None
+        last = None
+        with p.open(encoding="utf-8", newline="") as f:
+            for row in csv.DictReader(f):
+                last = row.get("timestamp") or last
+        ts = dt.datetime.fromisoformat(str(last))
+        return ts.astimezone().replace(tzinfo=None) if ts.tzinfo is not None else ts
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def trial_model_age_days(meta: dict | None, now: dt.datetime | None = None,
+                         history_path: Path | None = None) -> float | None:
+    """週次再学習が最後にこの系統を扱ってからの経過日数。meta が無い・学習日が解釈できないなら None。
+
+    基準は「学習日 (meta の trained_at)」と「再学習の最終実行 (履歴の最終行。不採用の回も含む)」の新しい方。
+    採用ゲートで不採用が続いて現役モデルが残るのは正常な状態なので、それだけでは古い扱いにしない。
+    止めたいのは再学習そのものが走っていない・失敗している状態。
+    """
     try:
         ts = dt.datetime.fromisoformat(str((meta or {})["trained_at"]))
         if ts.tzinfo is not None:
             ts = ts.astimezone().replace(tzinfo=None)
-        return ((now or dt.datetime.now()) - ts).total_seconds() / 86400.0
     except Exception:  # noqa: BLE001
         return None
+    run = _last_retrain_run_ts(history_path)
+    if run is not None and run > ts:
+        ts = run
+    return ((now or dt.datetime.now()) - ts).total_seconds() / 86400.0
 
 
 def use_trial_enabled() -> bool:
