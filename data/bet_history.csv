@@ -573,3 +573,7 @@ date,place_code,place_name,race_no,bet_amount,refund_amount,profit
 2026-11-12,6,sanyou,8,300,1130,830
 2026-11-13,2,kawaguchi,3,100,0,-100
 2026-11-13,6,sanyou,3,300,0,-300
+2026-11-14,2,kawaguchi,2,100,260,160
+2026-11-14,2,kawaguchi,5,100,100,0
+2026-11-14,6,sanyou,3,300,190,-110
+2026-11-14,6,sanyou,5,100,100,0
