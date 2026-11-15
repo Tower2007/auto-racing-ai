@@ -20,6 +20,9 @@ data/*
 !data/production_model.lgb
 !data/production_calib.pkl
 !data/production_meta.json
+!data/production_trial_model.lgb
+!data/production_trial_calib.pkl
+!data/production_trial_meta.json
 !data/expected_votes.csv
 !data/bet_history.csv
 !data/bet_history_detail.csv
