@@ -36,7 +36,15 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+# タスクは `python scripts/weekly_retrain.py` (作業フォルダ指定なし) で起動されるため、sys.path[0] は
+# scripts/ になり、ルート直下の gmail_notify / src が import できず通知が無音で失敗していた (2026-11-15)。
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 LOG_FILE = ROOT / "data" / "weekly_retrain.log"
+
+# 試走入り本番モデルの学習ステップ。PRODUCTION_USE_TRIAL=True (実弾の予測がこの系統) の間は、
+# 失敗を必須ステップと同じく通知し終了コードを非ゼロにする (試走なし系統の更新は止めない)。
+TRIAL_MODULE = "ml.production_trial"
 
 # (module, 説明, タイムアウト秒)。順序が依存関係。
 STEPS = [
@@ -46,7 +54,8 @@ STEPS = [
 ]
 
 # 任意ステップ (2026-11-12): 本番の後に走らせるシャドー。失敗しても本番の再学習・採用には
-# 影響させない (ログだけ残し、終了コードも通知も変えない)。
+# 影響させない (ログだけ残し、終了コードも通知も変えない)。例外: ml.production_trial は
+# PRODUCTION_USE_TRIAL=True の間は失敗を通知し終了コードを 1 にする (2026-11-15、TRIAL_MODULE 参照)。
 OPTIONAL_STEPS = [
     # 試走入り本番モデル (第 2 系統, 2026-11-14)。walk-forward → 学習 → 校正 → 採用ゲート v3 (自系統の現役と比較)。
     # 失敗しても試走なし系統 (上の必須 3 ステップ = フォールバック) の学習・採用には影響しない。
@@ -80,8 +89,34 @@ def _notify_failure(step: str, detail: str) -> None:
         _log(f"[notify] Gmail 通知失敗: {e}")
 
 
-def run_optional_step(module: str, desc: str, timeout: int) -> bool:
-    """任意ステップ。失敗はログのみ (通知しない・呼び出し側の終了コードに影響させない)。"""
+def _trial_is_production() -> bool:
+    """src/strategy_config.PRODUCTION_USE_TRIAL。読めなければ True (失敗を無音にしない安全側)。"""
+    try:
+        from src import strategy_config as sc
+        return bool(getattr(sc, "PRODUCTION_USE_TRIAL", False))
+    except Exception as e:  # noqa: BLE001
+        _log(f"[WARN] PRODUCTION_USE_TRIAL を読めない ({type(e).__name__}: {e}) — 本番扱いで続行")
+        return True
+
+
+def _notify_trial_failure(detail: str) -> None:
+    try:
+        from gmail_notify import send_email
+        send_email(
+            subject=f"[autorace] 週次再学習 失敗: 試走入りモデルの再学習 失敗 ({TRIAL_MODULE})",
+            body=("試走入り本番モデル (PRODUCTION_USE_TRIAL=True で実弾の予測に使用中) の週次再学習が"
+                  "失敗しました。\n\n"
+                  "実弾の予測は前回採用の試走入りモデルのまま残ります。学習日から一定日数 "
+                  "(ml/production_trial.TRIAL_MAX_AGE_DAYS) を過ぎると、予測側で試走なしモデルへ"
+                  "自動フォールバックします。試走なし系統 (必須ステップ) の再学習は完了しています。\n\n"
+                  f"詳細(末尾):\n{detail[-1500:]}"),
+        )
+    except Exception as e:  # noqa: BLE001
+        _log(f"[notify] Gmail 通知失敗: {e}")
+
+
+def run_optional_step(module: str, desc: str, timeout: int) -> tuple[bool, str]:
+    """任意ステップ。(成功, 失敗詳細) を返す。ここでは通知しない (呼び出し側が試走入り本番時だけ通知)。"""
     _log(f"[start] {module} — {desc} (任意)")
     try:
         r = subprocess.run(
@@ -89,14 +124,15 @@ def run_optional_step(module: str, desc: str, timeout: int) -> bool:
             encoding="utf-8", errors="replace", timeout=timeout,
         )
     except Exception as e:  # noqa: BLE001
-        _log(f"[WARN] {module} 失敗 (本番には影響なし): {type(e).__name__}: {e}")
-        return False
+        detail = f"{type(e).__name__}: {e}"
+        _log(f"[WARN] {module} 失敗: {detail}")
+        return False, detail
     if r.returncode != 0:
-        tail = (r.stdout or "")[-400:] + (r.stderr or "")[-400:]
-        _log(f"[WARN] {module} exit={r.returncode} (本番には影響なし)\n{tail}")
-        return False
+        tail = (r.stdout or "")[-600:] + (r.stderr or "")[-600:]
+        _log(f"[WARN] {module} exit={r.returncode}\n{tail}")
+        return False, f"exit={r.returncode}\n{tail}"
     _log(f"[ok] {module} done (任意)")
-    return True
+    return True, ""
 
 
 def run_step(module: str, desc: str, timeout: int, extra_args: list[str]) -> bool:
@@ -139,11 +175,21 @@ def main() -> int:
                  f"(本番モデルは未更新) ===")
             return 1
 
+    rc = 0
     for module, desc, timeout in OPTIONAL_STEPS:
-        run_optional_step(module, desc, timeout)
+        ok, detail = run_optional_step(module, desc, timeout)
+        # 試走入りが本番の間は、その学習失敗 (ゲート不採用は exit 0 なので含まない) を通知 + rc=1。
+        # 残りの任意ステップは続ける。
+        if not ok and module == TRIAL_MODULE and _trial_is_production():
+            _log(f"[FAIL] {module} (PRODUCTION_USE_TRIAL=True — 実弾の予測モデルが未更新)")
+            _notify_trial_failure(detail)
+            rc = 1
 
-    _log("=== weekly_retrain done (3 ステップ完走) ===")
-    return 0
+    if rc:
+        _log("=== weekly_retrain done (必須 3 ステップ完走、試走入り本番モデルの再学習 失敗) ===")
+    else:
+        _log("=== weekly_retrain done (3 ステップ完走) ===")
+    return rc
 
 
 if __name__ == "__main__":

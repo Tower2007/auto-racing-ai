@@ -210,8 +210,10 @@ def test_weekly_retrain_optional_step_failure_keeps_rc(monkeypatch):
     import scripts.weekly_retrain as wr
     calls = []
     monkeypatch.setattr(wr, "run_step", lambda *a, **k: calls.append(a[0]) or True)
-    monkeypatch.setattr(wr, "run_optional_step", lambda *a, **k: calls.append(a[0]) or False)
+    monkeypatch.setattr(wr, "run_optional_step", lambda *a, **k: calls.append(a[0]) or (False, "x"))
     monkeypatch.setattr(wr, "_log", lambda m: None)
+    # 試走入りが本番 (PRODUCTION_USE_TRIAL=True) のときの扱いは test_production_trial で検査する
+    monkeypatch.setattr(wr, "_trial_is_production", lambda: False)
     monkeypatch.setattr(sys, "argv", ["weekly_retrain.py"])
     assert wr.main() == 0
     # 任意ステップ (試走シャドー・全期間シャドー) は本番の後。失敗しても rc=0

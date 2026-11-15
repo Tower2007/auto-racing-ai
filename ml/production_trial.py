@@ -11,11 +11,13 @@
 - **切替**: `src/strategy_config.PRODUCTION_USE_TRIAL` (既定 False)。オフの間は推論で何もしない
   (`apply_trial_model` は入力をそのまま返す) ので、本番の予測値・EV・発注は従来と同じ。
 - **推論**: オンで、その R の試走が全車揃っている (trial_status == ok) ときだけ、試走入りモデル + その校正で
-  pred / pred_calib を置き換える。試走欠け・ファイル無し/破損・特徴量不足・予測例外は **R 単位で**
+  pred / pred_calib を置き換える。試走欠け・ファイル無し/破損・特徴量不足・予測例外・モデルの古さ
+  (学習日から TRIAL_MAX_AGE_DAYS 超、または学習日不明。2026-11-15) は **R 単位で**
   試走なしにフォールバックする (R の中でモデルを混ぜない)。どちらを使ったか・理由は frame.attrs に残し、
   daily_predict が購入処理の後に `data/model_used_preds.csv` へ記録する (既存 CSV の列は変えない)。
 - **週次再学習**: scripts/weekly_retrain.py の任意ステップ。失敗しても試走なし系統 (フォールバック) の
   学習・採用には影響しない。採用ゲート v3 は試走入り系統の現役 (production_trial_*) と比べる。
+  PRODUCTION_USE_TRIAL=True の間は、このステップの失敗を weekly_retrain が通知し終了コード 1 にする。
 
 pythonw 起動でも落ちないよう print は使わない。
 """
@@ -50,6 +52,21 @@ USED_FIELDS = ["race_date", "place_code", "race_no", "car_no", "model_used", "fa
 
 logger = logging.getLogger(__name__)
 _CACHE: dict = {}
+
+# 試走入りモデルの古さのガード (2026-11-15)。学習日 (meta の trained_at) からこの日数を超えたら、
+# 推論は試走なしへフォールバックする。15 日 = 週次再学習 (日曜 03:00) を 2 回続けて落とした状態。
+TRIAL_MAX_AGE_DAYS = 15
+
+
+def trial_model_age_days(meta: dict | None, now: dt.datetime | None = None) -> float | None:
+    """meta の trained_at からの経過日数。meta が無い・日付が無い/解釈できないなら None。"""
+    try:
+        ts = dt.datetime.fromisoformat(str((meta or {})["trained_at"]))
+        if ts.tzinfo is not None:
+            ts = ts.astimezone().replace(tzinfo=None)
+        return ((now or dt.datetime.now()) - ts).total_seconds() / 86400.0
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def use_trial_enabled() -> bool:
@@ -267,6 +284,16 @@ def apply_trial_model(feat: pd.DataFrame, align_features, *, enabled: bool | Non
             return feat
         feat.attrs["trial_pred"], feat.attrs["trial_calib"] = p, pc
         feat.attrs["trial_model_trained_at"] = meta.get("trained_at", "")
+        # 古さのガード: 週次再学習が続けて失敗しても、古い試走入りモデルで実弾を判定し続けない。
+        # 学習日が無い/解釈できないときも古さを保証できないので試走なしへ (記録用の試走入りの値は残す)。
+        age = trial_model_age_days(meta)
+        if age is None:
+            feat.attrs["fallback_reason"] = f"試走入りモデルの学習日が不明 (trained_at={meta.get('trained_at')!r})"[:200]
+            return feat
+        if age > TRIAL_MAX_AGE_DAYS:
+            feat.attrs["fallback_reason"] = (f"試走入りモデルが古い (学習 {str(meta.get('trained_at'))[:10]}、"
+                                             f"{age:.1f} 日 > {TRIAL_MAX_AGE_DAYS} 日)")
+            return feat
         if status != "ok":
             feat.attrs["fallback_reason"] = f"試走が揃っていない ({status})"
             return feat
@@ -565,15 +592,28 @@ def buy_compare_lines(bc: dict | None = None) -> list[str]:
         return [f"買い候補の並行比較: 集計失敗 ({type(e).__name__})"]
 
 
+def _trained_note() -> str:
+    """週次メール用: 試走入りモデルの学習日と経過日数 (しきい値超えならフォールバック中と明記)。"""
+    meta = _load_meta()
+    age = trial_model_age_days(meta)
+    if age is None:
+        return "試走入りモデル学習日不明 (試走なしへフォールバック中)"
+    s = f"試走入りモデル学習日 {str(meta['trained_at'])[:10]} (経過 {int(age)} 日)"
+    if age > TRIAL_MAX_AGE_DAYS:
+        s += f" ※{TRIAL_MAX_AGE_DAYS} 日超のため試走なしへフォールバック中 — 週次再学習を確認"
+    return s
+
+
 def weekly_lines(res: dict | None = None, buy: dict | None = None) -> list[str]:
     try:
         if not use_trial_enabled():
             return ["本番モデル = 試走なし (PRODUCTION_USE_TRIAL=False。試走入り系統は学習のみ)"]
         run_buy = res is None or buy is not None   # res を直接渡す呼び方 (テスト) では並行比較を足さない
         res = res if res is not None else evaluate()
+        note = _trained_note()
         if not res.get("n_races"):
-            return ["本番モデル = 試走入り (PRODUCTION_USE_TRIAL=True)、記録はまだありません"]
-        s = (f"本番モデル = 試走入り ({res['date_min']}〜{res['date_max']}: {res['n_races']} R 中 "
+            return [f"本番モデル = 試走入り (PRODUCTION_USE_TRIAL=True、{note})、記録はまだありません"]
+        s = (f"本番モデル = 試走入り ({note}。{res['date_min']}〜{res['date_max']}: {res['n_races']} R 中 "
              f"試走入り {res['n_trial']} R・フォールバック {res['n_fallback']} R)")
         if res.get("n_eval_races"):
             s += (f" / 同じ {res['n_eval_races']} R の 3 着内 logloss (校正後) 試走入り {res['ll_trial']:.4f}"

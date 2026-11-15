@@ -61,7 +61,9 @@ def trial_files(tmp_path, monkeypatch):
     b.save_model(str(mp))
     cp.write_bytes(pickle.dumps(_Iso()))
     jp.write_text(json.dumps({"feature_columns": ["trial_run_time", "win_odds"],
-                              "trained_at": "2026-11-14T00:00:00"}), encoding="utf-8")
+                              # 古さのガード (TRIAL_MAX_AGE_DAYS) に掛からないよう実行日基準で作る
+                              "trained_at": (pd.Timestamp.now() - pd.Timedelta(days=1))
+                              .isoformat(timespec="seconds")}), encoding="utf-8")
     monkeypatch.setattr(pt, "MODEL_PATH", mp)
     monkeypatch.setattr(pt, "CALIB_PATH", cp)
     monkeypatch.setattr(pt, "META_PATH", jp)
@@ -177,22 +179,149 @@ def test_record_used_never_raises(tmp_path, trial_files):
     assert r["status"].startswith("record_failed")
 
 
-def test_weekly_retrain_isolation(monkeypatch):
+def _wr_setup(monkeypatch, *, trial_prod: bool, fail: set):
     import scripts.weekly_retrain as wr
-    # 試走入り (任意) の失敗は rc=0 のまま、試走なし系統の必須ステップは全部走る
-    calls = []
+    calls, notified = [], []
     monkeypatch.setattr(wr, "run_step", lambda m, *a, **k: calls.append(m) or True)
-    monkeypatch.setattr(wr, "run_optional_step", lambda m, *a, **k: calls.append(m) or (m != "ml.production_trial"))
+    monkeypatch.setattr(wr, "run_optional_step",
+                        lambda m, *a, **k: calls.append(m) or ((False, f"{m} boom") if m in fail else (True, "")))
     monkeypatch.setattr(wr, "_log", lambda m: None)
+    monkeypatch.setattr(wr, "_trial_is_production", lambda: trial_prod)
     monkeypatch.setattr(sys, "argv", ["weekly_retrain.py"])
+    import gmail_notify
+    monkeypatch.setattr(gmail_notify, "send_email", lambda **kw: notified.append(kw))
+    return wr, calls, notified
+
+
+def test_weekly_retrain_trial_failure_silent_when_flag_off(monkeypatch):
+    # PRODUCTION_USE_TRIAL=False: 試走入り (任意) の失敗は rc=0・通知なし (従来どおり)
+    wr, calls, notified = _wr_setup(monkeypatch, trial_prod=False, fail={"ml.production_trial"})
     assert wr.main() == 0
+    assert notified == []
     assert calls.index("ml.train_production") < calls.index("ml.production_trial")
     assert "ml.production_trial" not in [m for m, *_ in wr.STEPS]
-    # 試走なし系統 (必須) が失敗したら全体が失敗、試走入りも走らない
-    calls.clear()
+    assert {"ml.shadow_trial", "ml.shadow_full"} <= set(calls)
+
+
+def test_weekly_retrain_trial_failure_notifies_when_flag_on(monkeypatch):
+    # PRODUCTION_USE_TRIAL=True: 失敗は通知 (件名で分かる) + rc=1、残りの任意ステップも走る
+    wr, calls, notified = _wr_setup(monkeypatch, trial_prod=True, fail={"ml.production_trial"})
+    assert wr.main() == 1
+    assert len(notified) == 1
+    assert "試走入りモデルの再学習 失敗" in notified[0]["subject"]
+    assert "ml.production_trial boom" in notified[0]["body"]
+    assert {"ml.train_production", "ml.shadow_trial", "ml.shadow_full"} <= set(calls)
+
+
+def test_weekly_retrain_flag_on_success_or_other_shadow_failure(monkeypatch):
+    # 試走入りが成功していれば rc=0・通知なし。シャドー (記録のみ) の失敗は従来どおり無通知
+    wr, _calls, notified = _wr_setup(monkeypatch, trial_prod=True, fail={"ml.shadow_trial"})
+    assert wr.main() == 0 and notified == []
+
+
+def test_weekly_retrain_required_failure_unchanged(monkeypatch):
+    # 試走なし系統 (必須) が失敗したら全体が失敗、試走入りも走らない (従来どおり)
+    wr, calls, _n = _wr_setup(monkeypatch, trial_prod=True, fail=set())
     monkeypatch.setattr(wr, "run_step", lambda m, *a, **k: calls.append(m) or (m != "ml.train_production"))
     assert wr.main() == 1
     assert "ml.production_trial" not in calls
+
+
+def test_weekly_retrain_root_on_sys_path():
+    # タスクは scripts/ を sys.path[0] にして起動する。ルート直下の gmail_notify / src が import できること
+    import scripts.weekly_retrain as wr
+    assert str(wr.ROOT) in sys.path
+    from scripts.weekly_retrain import _trial_is_production
+    from src import strategy_config as sc
+    assert _trial_is_production() is bool(sc.PRODUCTION_USE_TRIAL)
+
+
+# ---------------------------------------------------------------- 試走入りモデルの古さのガード (2026-11-15)
+def _set_trained_at(jp, value):
+    meta = json.loads(jp.read_text(encoding="utf-8"))
+    if value is None:
+        meta.pop("trained_at", None)
+    else:
+        meta["trained_at"] = value
+    jp.write_text(json.dumps(meta), encoding="utf-8")
+    pt._CACHE.clear()
+
+
+def test_stale_trial_model_falls_back(trial_files):
+    _mp, _cp, jp = trial_files
+    old = (pd.Timestamp.now() - pd.Timedelta(days=pt.TRIAL_MAX_AGE_DAYS + 1)).isoformat(timespec="seconds")
+    _set_trained_at(jp, old)
+    f = _race()
+    before = f.copy()
+    out = pt.apply_trial_model(f, _align, enabled=True)
+    assert out.attrs["model_used"] == "notrial"
+    assert out.attrs["fallback_reason"].startswith("試走入りモデルが古い")
+    assert f"{pt.TRIAL_MAX_AGE_DAYS}" in out.attrs["fallback_reason"]
+    pd.testing.assert_frame_equal(out[["pred", "pred_calib"]], before[["pred", "pred_calib"]])
+    assert "trial_pred" in out.attrs                     # 記録用に試走入りの値は残す
+    assert out.attrs["trial_model_trained_at"] == old
+
+
+def test_fresh_trial_model_same_as_before(trial_files):
+    # しきい値ちょうど手前 (15 日未満) は従来どおり試走入りを使う
+    _mp, _cp, jp = trial_files
+    _set_trained_at(jp, (pd.Timestamp.now() - pd.Timedelta(days=pt.TRIAL_MAX_AGE_DAYS - 0.5))
+                    .isoformat(timespec="seconds"))
+    out = pt.apply_trial_model(_race(), _align, enabled=True)
+    assert out.attrs["model_used"] == "trial" and out.attrs["fallback_reason"] == ""
+
+
+def test_fresh_model_result_identical_to_unguarded(trial_files, monkeypatch):
+    # 新しいモデルなら、ガードを無効にした場合と予測値・attrs が完全に同じ
+    a = pt.apply_trial_model(_race(), _align, enabled=True)
+    monkeypatch.setattr(pt, "TRIAL_MAX_AGE_DAYS", 10 ** 6)
+    pt._CACHE.clear()
+    b = pt.apply_trial_model(_race(), _align, enabled=True)
+    pd.testing.assert_frame_equal(a, b)
+    assert a.attrs["model_used"] == b.attrs["model_used"] == "trial"
+
+
+@pytest.mark.parametrize("value", [None, "", "not-a-date", 12345])
+def test_trial_meta_without_valid_date_falls_back(trial_files, value):
+    # 学習日が無い・解釈できない → 古さを保証できないので試走なしへ (既存の「不正なら試走なし」に合わせる)
+    _mp, _cp, jp = trial_files
+    _set_trained_at(jp, value)
+    out = pt.apply_trial_model(_race(), _align, enabled=True)
+    assert out.attrs["model_used"] == "notrial"
+    assert out.attrs["fallback_reason"].startswith("試走入りモデルの学習日が不明")
+
+
+def test_trial_meta_unreadable_falls_back(trial_files):
+    _mp, _cp, jp = trial_files
+    jp.write_text("{broken json", encoding="utf-8")
+    pt._CACHE.clear()
+    f = _race()
+    before = f.copy()
+    out = pt.apply_trial_model(f, _align, enabled=True)
+    assert out.attrs["model_used"] == "notrial" and out.attrs["fallback_reason"].startswith("例外")
+    pd.testing.assert_frame_equal(out[["pred", "pred_calib"]], before[["pred", "pred_calib"]])
+
+
+def test_trial_model_age_days():
+    now = pd.Timestamp("2026-11-30T12:00:00").to_pydatetime()
+    assert pt.trial_model_age_days({"trained_at": "2026-11-15T03:07:35"}, now=now) == pytest.approx(15.37, abs=0.01)
+    assert pt.trial_model_age_days({"trained_at": "bad"}, now=now) is None
+    assert pt.trial_model_age_days(None, now=now) is None
+
+
+def test_weekly_lines_show_trial_trained_date(trial_files, monkeypatch):
+    _mp, _cp, jp = trial_files
+    monkeypatch.setattr(pt, "use_trial_enabled", lambda: True)
+    ev = {"n_races": 3, "n_trial": 2, "n_fallback": 1, "date_min": "2026-11-14", "date_max": "2026-11-15"}
+    _set_trained_at(jp, (pd.Timestamp.now() - pd.Timedelta(days=3)).isoformat(timespec="seconds"))
+    line = pt.weekly_lines(ev)[0]
+    assert "試走入りモデル学習日" in line and "経過 3 日" in line and "フォールバック中" not in line
+    _set_trained_at(jp, (pd.Timestamp.now() - pd.Timedelta(days=20)).isoformat(timespec="seconds"))
+    line = pt.weekly_lines(ev)[0]
+    assert "経過 20 日" in line and "試走なしへフォールバック中" in line
+    _set_trained_at(jp, None)
+    assert "学習日不明" in pt.weekly_lines(ev)[0]
+    assert "学習日不明" in pt.weekly_lines({"n_races": 0})[0]
 
 
 def test_daily_predict_wiring():
