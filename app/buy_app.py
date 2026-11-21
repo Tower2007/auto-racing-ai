@@ -458,7 +458,11 @@ if st.button("✅ 購入する", type="primary", width="stretch"):
                 encoding="utf-8", errors="replace", timeout=180,
             )
         except subprocess.TimeoutExpired:
-            st.error("❌ タイムアウト (>180s)")
+            # 途中で打ち切ったため、「投票する」を押した後だった可能性が残る (2026-11-21)
+            st.error(
+                "❌ タイムアウト (>180s)。投票が成立している可能性があります。"
+                "公式の投票履歴で成立有無を確認し、成立していた場合は買い直さないでください。"
+            )
             if not dry_run:
                 bt.mark_failed(payload, sig=sig, note="timeout >180s")
             st.stop()

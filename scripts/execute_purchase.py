@@ -180,15 +180,21 @@ FAILURE_KEYWORDS = (
 )
 
 
-def _run_auto_login() -> str:
+def _run_auto_login(check_url: str | None = None) -> str:
     """auto_login_autorace.py を subprocess で実行し、結果を返す。
 
     セッション切れ時の自動復旧用 (2026-05-26 導入)。
     execute_buy() 内から asyncio.to_thread() 経由で呼ばれる。
+    check_url (セッション切れを検出した投票ページ) を渡すと、auto_login 側も同じ
+    ページでログイン要否・成否を判定する (2026-11-21。トップページのボタン有無での
+    判定が「ログイン済み」と誤り、何もせず正常終了していた)。
     """
     import subprocess as _sp
+    cmd = [sys.executable, str(ROOT / "scripts" / "auto_login_autorace.py")]
+    if check_url:
+        cmd += ["--check-url", check_url]
     result = _sp.run(
-        [sys.executable, str(ROOT / "scripts" / "auto_login_autorace.py")],
+        cmd,
         cwd=str(ROOT),
         capture_output=True, text=True,
         encoding="utf-8", errors="replace",
@@ -430,7 +436,7 @@ async def execute_buy(
 
                 try:
                     login_result = await asyncio.to_thread(
-                        _run_auto_login
+                        _run_auto_login, check_url
                     )
                     print(
                         f"[execute_purchase] auto_login 結果: {login_result}",

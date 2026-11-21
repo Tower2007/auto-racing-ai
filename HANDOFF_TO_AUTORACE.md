@@ -14,7 +14,7 @@
 ## 1. ユーザー情報(共通)
 
 - **GitHub**: `Tower2007`(認証は `gh` CLI 経由)
-- **Email**: `no28akira2007@gmail.com`
+- **Email**: `your-address@gmail.com`
 - **OS**: Windows 11(自宅PC + ノートPC の2台運用)
 - **Python**: 3.13
 - **Shell**: PowerShell 7+ / bash

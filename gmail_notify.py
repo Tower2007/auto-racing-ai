@@ -2,9 +2,9 @@
 Gmail SMTP 送信モジュール
 -----------------------------------------------------------------------
 boat-racing-ai 版から移植。.env に以下を設定:
-  GMAIL_USER=no28akira2007@gmail.com
+  GMAIL_USER=your-address@gmail.com
   GMAIL_APP_PASSWORD=xxxx xxxx xxxx xxxx
-  MAIL_TO=no28akira2007@gmail.com,other@example.com
+  MAIL_TO=your-address@gmail.com,other@example.com
 
 使い方:
   from gmail_notify import send_email

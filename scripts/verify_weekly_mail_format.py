@@ -35,7 +35,7 @@ def fake_send_email(subject, body, html=None, recipients=None, attachments=None)
     captured["subject"] = subject
     captured["body"] = body
     captured["html"] = html or ""
-    print(f"[mail] sent to ['no28akira2007@gmail.com']  subject={subject}")
+    print(f"[mail] sent to ['your-address@gmail.com']  subject={subject}")
 
 
 import weekly_status  # noqa: E402

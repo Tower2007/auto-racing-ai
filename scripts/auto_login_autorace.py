@@ -52,8 +52,35 @@ LOGIN_URL = "https://vote.autorace.jp/login"
 HOME_URL_PREFIX = "https://vote.autorace.jp"
 
 
-async def _login_with_playwright(account: dict, headless: bool = False) -> str:
+def is_login_redirect(url: str) -> bool:
+    """開いた結果の URL がログイン画面なら True (= セッションなし)。
+
+    execute_purchase.py の判定 (`"/login" in page.url`) と同じ。保護ページを開いて
+    ログイン画面へ飛ばされるかを見るので、画面の描画タイミングに左右されない。
+    """
+    return "/login" in (url or "")
+
+
+def validate_check_url(check_url: str | None) -> str | None:
+    """--check-url は投票サイト内の URL だけ受け付ける (それ以外は ValueError)。"""
+    if not check_url:
+        return None
+    if not check_url.startswith(HOME_URL_PREFIX + "/"):
+        raise ValueError(
+            f"check_url は {HOME_URL_PREFIX}/ で始まる必要があります: {check_url!r}")
+    return check_url
+
+
+async def _login_with_playwright(account: dict, headless: bool = False,
+                                 check_url: str | None = None) -> str:
     """Playwright で login し cookie 文字列を返す。
+
+    check_url (投票ページなど、ログインが要るページ) を渡すと、ログイン要否と
+    ログイン後の成否を「そのページを開いてログイン画面へ飛ばされるか」で判定する
+    (2026-11-21)。渡さない場合は従来どおりトップページのログインボタンの有無で判定。
+    従来の判定は、トップページがスクリプトで後から描画されるため、ボタンが出る前に
+    「ログイン済み」と誤判定して何も入力せず正常終了することがある
+    (2026-08-19 / 11-17 の「auto_login 実行後もセッション切れ」)。
 
     Returns:
         "name1=value1; name2=value2; ..." 形式の Cookie ヘッダ文字列
@@ -96,22 +123,31 @@ async def _login_with_playwright(account: dict, headless: bool = False) -> str:
         cookie_str = ""
 
         try:
-            # まず home ページに行ってログイン状態を確認
-            await page.goto(HOME_URL_PREFIX + "/", wait_until="domcontentloaded",
-                            timeout=30000)
-            await asyncio.sleep(2)
-
-            # ログイン状態判定: ログインフォーム / ログインボタンが見えるか
             need_login = False
-            try:
-                # ログインボタンが見えれば未ログイン
-                login_link = page.locator(
-                    'a:has-text("ログイン"), button:has-text("ログイン")'
-                ).first
-                if await login_link.count() > 0 and await login_link.is_visible():
+            if check_url:
+                # 保護ページを開き、ログイン画面へ飛ばされるかで判定 (発注側と同じ)
+                await page.goto(check_url, wait_until="domcontentloaded",
+                                timeout=30000)
+                await asyncio.sleep(2)
+                need_login = is_login_redirect(page.url)
+                print(f"[auto_login] 保護ページで判定: need_login={need_login} "
+                      f"(URL: {page.url})", file=sys.stderr)
+            else:
+                # まず home ページに行ってログイン状態を確認
+                await page.goto(HOME_URL_PREFIX + "/", wait_until="domcontentloaded",
+                                timeout=30000)
+                await asyncio.sleep(2)
+
+                # ログイン状態判定: ログインフォーム / ログインボタンが見えるか
+                try:
+                    # ログインボタンが見えれば未ログイン
+                    login_link = page.locator(
+                        'a:has-text("ログイン"), button:has-text("ログイン")'
+                    ).first
+                    if await login_link.count() > 0 and await login_link.is_visible():
+                        need_login = True
+                except Exception:
                     need_login = True
-            except Exception:
-                need_login = True
 
             if need_login:
                 print(f"[auto_login] ログインが必要 (current URL: {page.url})",
@@ -234,6 +270,20 @@ async def _login_with_playwright(account: dict, headless: bool = False) -> str:
                         "ID/PW 誤り or CAPTCHA / 2FA 発動の可能性。"
                     )
                 print(f"[auto_login] login 完了: {page.url}", file=sys.stderr)
+
+                if check_url:
+                    # ログイン後に同じ保護ページが開けるかまで確かめる。開けなければ
+                    # 失敗として終了する (正常終了して呼び出し側を誤らせない)
+                    await page.goto(check_url, wait_until="domcontentloaded",
+                                    timeout=30000)
+                    await asyncio.sleep(2)
+                    if is_login_redirect(page.url):
+                        raise RuntimeError(
+                            "ログイン操作は通ったが、保護ページを開くとログイン画面へ"
+                            f"戻される: {page.url}"
+                        )
+                    print(f"[auto_login] 保護ページの表示を確認: {page.url}",
+                          file=sys.stderr)
             else:
                 print(f"[auto_login] 既にログイン済 (URL: {page.url})",
                       file=sys.stderr)
@@ -262,8 +312,12 @@ async def _login_with_playwright(account: dict, headless: bool = False) -> str:
     return cookie_str
 
 
-def login_and_get_cookie() -> str:
-    """同期 wrapper。fetch_order_history.py から import される想定。"""
+def login_and_get_cookie(check_url: str | None = None) -> str:
+    """同期 wrapper。fetch_order_history.py から import される想定。
+
+    check_url: ログイン要否・成否の判定に使う保護ページ (execute_purchase が渡す)。
+    """
+    check_url = validate_check_url(check_url)
     if not ACCOUNTS_PATH.exists():
         raise FileNotFoundError(
             f"{ACCOUNTS_PATH} が無い。\n"
@@ -277,7 +331,8 @@ def login_and_get_cookie() -> str:
         raise RuntimeError("accounts.json に 'accounts' が無い")
     account = accounts[0]  # vote.autorace.jp は 1 ユーザー想定
     headless = config.get("headless", False)
-    return asyncio.run(_login_with_playwright(account, headless=headless))
+    return asyncio.run(_login_with_playwright(account, headless=headless,
+                                              check_url=check_url))
 
 
 def main() -> None:
@@ -286,7 +341,12 @@ def main() -> None:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
-    cookie = login_and_get_cookie()
+    import argparse
+    ap = argparse.ArgumentParser(description="vote.autorace.jp 自動ログイン")
+    ap.add_argument("--check-url", default=None,
+                    help="ログイン要否・成否の判定に使う保護ページ (投票ページなど)")
+    args = ap.parse_args()
+    cookie = login_and_get_cookie(check_url=args.check_url)
     # cookie 全体は秘匿性高いので長さだけ stdout、cookie 値は stderr
     print(f"OK: cookie 取得 ({len(cookie)} bytes)")
     print(f"[debug] cookie (head): {cookie[:80]}...", file=sys.stderr)

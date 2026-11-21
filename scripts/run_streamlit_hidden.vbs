@@ -36,7 +36,7 @@ On Error GoTo 0
 
 cmd = "cmd /c chcp 65001 >nul && cd /d """ & proj & """ && " & _
       "python -m streamlit run app\streamlit_app.py " & _
-      "--server.port 8501 --server.headless true " & _
+      "--server.address localhost --server.port 8501 --server.headless true " & _
       ">> data\streamlit.log 2>&1"
 ' 0 = hidden window, False = don't wait (streamlit runs indefinitely)
 sh.Run cmd, 0, False
